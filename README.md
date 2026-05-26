@@ -9,6 +9,7 @@ No cloud account is used. No data is sent off the machine. The app records local
 - Automatic activity timeline from the active app and window title.
 - Local mapping for apps, websites, files, and project names visible in titles.
 - Focus mode with Pomodoro timer.
+- Pause and resume for active focus sessions.
 - Optional focus targets, such as `Code`, `Pages`, `github.com`, `https://claude.ai/chat`, or a project name.
 - Distraction detection during focus sessions.
 - User-editable productive, distracting, and blocked keyword rules, including adding blocks from the dashboard.

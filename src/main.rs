@@ -37,6 +37,8 @@ struct FocusSession {
     started_at: i64,
     duration_minutes: u64,
     break_minutes: u64,
+    paused_at: Option<i64>,
+    paused_total_seconds: i64,
 }
 
 #[derive(Default)]
@@ -196,7 +198,10 @@ fn focus_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<()> 
         thread::sleep(Duration::from_secs(10));
         let focus = state.lock().ok().and_then(|s| s.focus.clone());
         if let Some(session) = focus {
-            let elapsed = now() - session.started_at;
+            if session.paused_at.is_some() {
+                continue;
+            }
+            let elapsed = focus_elapsed_seconds(&session, now());
             let target = (session.duration_minutes * 60) as i64;
             if elapsed >= target {
                 notify(
@@ -228,6 +233,8 @@ fn start_focus(
         started_at: now(),
         duration_minutes,
         break_minutes,
+        paused_at: None,
+        paused_total_seconds: 0,
     };
     save_focus(&data_dir, &session)?;
     let target_note = if session.target.trim().is_empty() {
@@ -254,6 +261,14 @@ fn detect_distraction(
     };
 
     let focused = guard.focus.is_some();
+    let paused = guard
+        .focus
+        .as_ref()
+        .is_some_and(|focus| focus.paused_at.is_some());
+    if paused {
+        return Ok(());
+    }
+
     let distracting = sample.category == "distracting" || sample.category == "blocked";
     let enough_time = sample.timestamp - guard.last_distraction_at >= DISTRACTION_SECONDS;
     let focus_mismatch = guard
@@ -315,6 +330,9 @@ fn apply_focus_productivity_gate(focus: &Option<FocusSession>, sample: &mut Acti
     let Some(focus) = focus else {
         return;
     };
+    if focus.paused_at.is_some() {
+        return;
+    }
     if focus_targets(focus).is_empty() {
         return;
     }
@@ -324,6 +342,11 @@ fn apply_focus_productivity_gate(focus: &Option<FocusSession>, sample: &mut Acti
     } else if sample.category == "productive" {
         sample.category = "neutral".into();
     }
+}
+
+fn focus_elapsed_seconds(focus: &FocusSession, at: i64) -> i64 {
+    let active_until = focus.paused_at.unwrap_or(at);
+    (active_until - focus.started_at - focus.paused_total_seconds).max(0)
 }
 
 fn focus_targets(focus: &FocusSession) -> Vec<String> {
@@ -573,6 +596,8 @@ fn handle_http(
             started_at: now(),
             duration_minutes: minutes,
             break_minutes: 5,
+            paused_at: None,
+            paused_total_seconds: 0,
         };
         save_focus(&data_dir, &session)?;
         if let Ok(mut state) = state.lock() {
@@ -587,6 +612,32 @@ fn handle_http(
             "Focus started",
             &format!("{} minutes: {}{}", minutes, session.task, target_note),
         );
+        write_response(&mut stream, "application/json", "{\"ok\":true}")?;
+    } else if path.starts_with("/api/focus/pause") {
+        let updated = {
+            let mut guard = state
+                .lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "state lock poisoned"))?;
+            if let Some(mut focus) = guard.focus.clone() {
+                let current = now();
+                if let Some(paused_at) = focus.paused_at {
+                    focus.paused_total_seconds += current - paused_at;
+                    focus.paused_at = None;
+                    notify("Focus resumed", &focus.task);
+                } else {
+                    focus.paused_at = Some(current);
+                    notify("Focus paused", &focus.task);
+                }
+                guard.focus = Some(focus.clone());
+                Some(focus)
+            } else {
+                None
+            }
+        };
+
+        if let Some(focus) = updated {
+            save_focus(&data_dir, &focus)?;
+        }
         write_response(&mut stream, "application/json", "{\"ok\":true}")?;
     } else if path.starts_with("/api/focus/stop") {
         clear_focus(&data_dir)?;
@@ -770,13 +821,19 @@ fn report_window_start(data_dir: &PathBuf) -> io::Result<i64> {
 
 fn state_json(focus: Option<FocusSession>) -> String {
     match focus {
-        Some(focus) => format!(
-            "{{\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{}}}}}",
-            json_escape(&focus.task),
-            json_escape(&focus.target),
-            focus.started_at,
-            focus.duration_minutes
-        ),
+        Some(focus) => {
+            let elapsed = focus_elapsed_seconds(&focus, now());
+            let remaining = ((focus.duration_minutes * 60) as i64 - elapsed).max(0);
+            format!(
+                "{{\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"paused\":{},\"remainingSeconds\":{}}}}}",
+                json_escape(&focus.task),
+                json_escape(&focus.target),
+                focus.started_at,
+                focus.duration_minutes,
+                focus.paused_at.is_some(),
+                remaining
+            )
+        }
         None => "{\"focus\":null}".into(),
     }
 }
@@ -852,6 +909,7 @@ button { cursor:pointer; font-weight:650; }
     <input id="target" placeholder="Focus apps/sites, comma separated" aria-label="Focus targets">
     <input id="minutes" type="number" min="1" max="180" value="25" aria-label="Minutes">
     <button onclick="startFocus()">Start focus</button>
+    <button id="pauseFocus" onclick="pauseFocus()" disabled>Pause</button>
     <button onclick="stopFocus()">Stop</button>
     <button onclick="resetReport()">Refresh</button>
   </section>
@@ -896,6 +954,7 @@ async function startFocus() {
   refresh();
 }
 async function stopFocus() { await fetch('/api/focus/stop'); refresh(); }
+async function pauseFocus() { await fetch('/api/focus/pause'); refresh(); }
 async function resetReport() {
   await fetch('/api/report/reset');
   refresh();
@@ -954,8 +1013,11 @@ async function refresh() {
       <div class="muted">${(r.topApps || []).slice(0, 2).map(app => escapeHtml(app.app)).join(', ')}</div>
     </div>`;
   }).join('') || '<div class="muted">No previous reports yet.</div>';
+  const pauseButton = document.querySelector('#pauseFocus');
+  pauseButton.disabled = !state.focus;
+  pauseButton.textContent = state.focus && state.focus.paused ? 'Resume' : 'Pause';
   document.querySelector('#focusState').textContent = state.focus
-    ? `Focus: ${state.focus.task}${state.focus.target ? ' in ' + state.focus.target : ''}`
+    ? `Focus: ${state.focus.task}${state.focus.target ? ' in ' + state.focus.target : ''}${state.focus.paused ? ' (paused)' : ''}`
     : 'No active focus session';
 }
 function escapeHtml(value) {
@@ -1043,15 +1105,21 @@ fn save_config(data_dir: &PathBuf, config: &Config) -> io::Result<()> {
 }
 
 fn save_focus(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<()> {
+    let paused_at = focus
+        .paused_at
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".into());
     fs::write(
         data_dir.join("focus.json"),
         format!(
-            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{}}}",
+            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{}}}",
             json_escape(&focus.task),
             json_escape(&focus.target),
             focus.started_at,
             focus.duration_minutes,
-            focus.break_minutes
+            focus.break_minutes,
+            paused_at,
+            focus.paused_total_seconds
         ),
     )
 }
@@ -1064,6 +1132,8 @@ fn load_focus(data_dir: &PathBuf) -> Option<FocusSession> {
         started_at: json_number(&value, "startedAt")?,
         duration_minutes: json_number(&value, "durationMinutes")? as u64,
         break_minutes: json_number(&value, "breakMinutes")? as u64,
+        paused_at: json_number(&value, "pausedAt"),
+        paused_total_seconds: json_number(&value, "pausedTotalSeconds").unwrap_or(0),
     })
 }
 
