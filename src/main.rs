@@ -874,6 +874,12 @@ main { max-width:1120px; margin:0 auto; padding:24px; display:grid; gap:18px; }
 .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
 input, button { border:1px solid var(--line); border-radius:6px; padding:9px 11px; background:var(--panel); color:var(--ink); }
 button { cursor:pointer; font-weight:650; }
+button:disabled { cursor:not-allowed; opacity:.55; }
+.focus-btn { transition: background .15s ease, border-color .15s ease, color .15s ease; }
+.focus-idle { border-color:var(--good); color:var(--good); }
+.focus-running { background:var(--good); border-color:var(--good); color:white; }
+.focus-paused { background:var(--warn); border-color:var(--warn); color:white; }
+.focus-stop-active { border-color:var(--bad); color:var(--bad); }
 .grid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; }
 .metric, .timeline, .apps, .explain, .history { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
 .metric strong { display:block; font-size:28px; }
@@ -908,9 +914,9 @@ button { cursor:pointer; font-weight:650; }
     <input id="task" value="Deep work" aria-label="Focus task">
     <input id="target" placeholder="Focus apps/sites, comma separated" aria-label="Focus targets">
     <input id="minutes" type="number" min="1" max="180" value="25" aria-label="Minutes">
-    <button onclick="startFocus()">Start focus</button>
-    <button id="pauseFocus" onclick="pauseFocus()" disabled>Pause</button>
-    <button onclick="stopFocus()">Stop</button>
+    <button id="startFocus" class="focus-btn focus-idle" onclick="startFocus()">Start focus</button>
+    <button id="pauseFocus" class="focus-btn" onclick="pauseFocus()" disabled>Pause</button>
+    <button id="stopFocus" class="focus-btn" onclick="stopFocus()" disabled>Stop</button>
     <button onclick="resetReport()">Refresh</button>
   </section>
   <section class="bar">
@@ -1013,12 +1019,24 @@ async function refresh() {
       <div class="muted">${(r.topApps || []).slice(0, 2).map(app => escapeHtml(app.app)).join(', ')}</div>
     </div>`;
   }).join('') || '<div class="muted">No previous reports yet.</div>';
-  const pauseButton = document.querySelector('#pauseFocus');
-  pauseButton.disabled = !state.focus;
-  pauseButton.textContent = state.focus && state.focus.paused ? 'Resume' : 'Pause';
+  updateFocusButtons(state.focus);
   document.querySelector('#focusState').textContent = state.focus
     ? `Focus: ${state.focus.task}${state.focus.target ? ' in ' + state.focus.target : ''}${state.focus.paused ? ' (paused)' : ''}`
     : 'No active focus session';
+}
+function updateFocusButtons(focus) {
+  const startButton = document.querySelector('#startFocus');
+  const pauseButton = document.querySelector('#pauseFocus');
+  const stopButton = document.querySelector('#stopFocus');
+  const running = Boolean(focus && !focus.paused);
+  const paused = Boolean(focus && focus.paused);
+  startButton.className = `focus-btn ${running ? 'focus-running' : 'focus-idle'}`;
+  startButton.textContent = running || paused ? 'Restart focus' : 'Start focus';
+  pauseButton.disabled = !focus;
+  pauseButton.className = `focus-btn ${paused ? 'focus-paused' : running ? 'focus-running' : ''}`;
+  pauseButton.textContent = paused ? 'Resume' : 'Pause';
+  stopButton.disabled = !focus;
+  stopButton.className = `focus-btn ${focus ? 'focus-stop-active' : ''}`;
 }
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
