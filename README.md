@@ -1,6 +1,6 @@
 # Local Focus
 
-Local Focus is a privacy-first Rust activity tracker for Windows, Linux, and macOS. It maps foreground apps, website-like window titles, files, projects, and laptop activity into a reviewable local timeline. It also includes Pomodoro-style focus sessions, distraction notifications, blocked keyword rules, and a local productivity score.
+Local Focus is a privacy-first Rust activity tracker for Windows, Linux, and macOS. It maps foreground apps, website-like window titles, files, projects, and laptop activity into a reviewable local timeline. It also includes Pomodoro-style focus sessions, OS-level distraction alerts, blocked keyword rules, and a local productivity score.
 
 No cloud account is used. No data is sent off the machine. The app records local JSONL files and serves a private dashboard on `127.0.0.1`.
 
@@ -75,7 +75,7 @@ local-focus report
 local-focus data-dir
 ```
 
-When focus targets are set, Local Focus checks the active app, window title, and detected source. Separate multiple allowed apps, sites, or projects with commas. URL targets also match by domain, so `https://claude.ai/chat` can match activity reported as `claude.ai`. During targeted focus, only matching activity counts as Productive time; productive-keyword activity outside your focus targets is treated as Neutral. If the current activity no longer matches any target during focus mode, it sends a local notification.
+When focus targets are set, Local Focus checks the active app, window title, and detected source. Separate multiple allowed apps, sites, or projects with commas. URL targets also match by domain, so `https://claude.ai/chat` can match activity reported as `claude.ai`. During targeted focus, only matching activity counts as Productive time; every app or site outside your focus targets is tracked as Distracted. If the current activity no longer matches any target during focus mode, it sends an OS-level alert.
 
 ## Data
 
@@ -108,7 +108,7 @@ distracting=youtube,netflix,reddit,instagram,tiktok,x.com,twitter,facebook,game,
 blocked=netflix,steam
 ```
 
-The current app does notification-based blocking. It warns during focus mode when a distracting or blocked activity is detected. Use the dashboard's block field to add an app, site, or keyword to `blocked=`. Hard network or app blocking can be added later through OS-specific integrations, but this first version stays conservative and transparent.
+The current app does alert-based blocking. It warns during focus mode when a distracting or blocked activity is detected. Use the dashboard's block field to add an app, site, or keyword to `blocked=`. Hard network or app blocking can be added later through OS-specific integrations, but this first version stays conservative and transparent.
 
 ## Build Release Binaries
 

@@ -206,7 +206,7 @@ fn focus_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<()> 
             let elapsed = focus_elapsed_seconds(&session, now());
             let target = (session.duration_minutes * 60) as i64;
             if elapsed >= target {
-                notify(
+                os_alert(
                     "Focus complete",
                     &format!(
                         "{} is done. Take a {} minute break.",
@@ -271,7 +271,7 @@ fn detect_distraction(
         return Ok(());
     }
 
-    let distracting = sample.category == "distracting" || sample.category == "blocked";
+    let distracting = sample.category == "distracting";
     let enough_time = sample.timestamp - guard.last_distraction_at >= DISTRACTION_SECONDS;
     let focus_mismatch = guard
         .focus
@@ -355,7 +355,9 @@ fn apply_focus_productivity_gate(focus: &Option<FocusSession>, sample: &mut Acti
     if matches_focus_target(focus, sample) {
         sample.category = "productive".into();
     } else if sample.category == "productive" {
-        sample.category = "neutral".into();
+        sample.category = "distracting".into();
+    } else {
+        sample.category = "distracting".into();
     }
 }
 
@@ -541,7 +543,7 @@ fn source_from_title(title: &str) -> String {
 fn classify(config: &Config, app: &str, title: &str) -> String {
     let haystack = format!("{} {}", app, title).to_lowercase();
     if config.blocked_keywords.iter().any(|k| haystack.contains(k)) {
-        return "blocked".into();
+        return "distracting".into();
     }
     if config
         .distracting_keywords
@@ -557,7 +559,7 @@ fn classify(config: &Config, app: &str, title: &str) -> String {
     {
         return "productive".into();
     }
-    "neutral".into()
+    "distracting".into()
 }
 
 fn append_sample(data_dir: &PathBuf, sample: &ActivitySample) -> io::Result<()> {
@@ -731,8 +733,6 @@ fn handle_http(
         write_response(&mut stream, "application/json", &report_history_json(&data_dir)?)?;
     } else if path == "/api/report" {
         write_response(&mut stream, "application/json", &report_json(&data_dir)?)?;
-    } else if path == "/api/events" {
-        write_response(&mut stream, "application/json", &events_json(&data_dir)?)?;
     } else if path == "/api/state" {
         let focus = state.lock().ok().and_then(|s| s.focus.clone());
         write_response(&mut stream, "application/json", &state_json(focus))?;
@@ -795,11 +795,11 @@ fn report_json(data_dir: &PathBuf) -> io::Result<String> {
     let recent: Vec<_> = samples.into_iter().filter(|s| s.timestamp >= since).collect();
     let total = recent.len().max(1) as f64;
     let productive = recent.iter().filter(|s| s.category == "productive").count() as f64;
-    let distracting = recent.iter().filter(|s| s.category == "distracting").count() as f64;
-    let blocked = recent.iter().filter(|s| s.category == "blocked").count() as f64;
-    let neutral = recent.iter().filter(|s| s.category == "neutral").count() as f64;
-    let score = ((productive * 100.0 + neutral * 50.0 - distracting * 60.0 - blocked * 80.0)
-        / total)
+    let distracting = recent
+        .iter()
+        .filter(|s| s.category != "productive")
+        .count() as f64;
+    let score = ((productive * 100.0 - distracting * 40.0) / total)
         .clamp(0.0, 100.0)
         .round();
 
@@ -827,12 +827,10 @@ fn report_json(data_dir: &PathBuf) -> io::Result<String> {
         .join(",");
 
     Ok(format!(
-        "{{\"score\":{},\"productiveMinutes\":{},\"neutralMinutes\":{},\"distractingMinutes\":{},\"blockedMinutes\":{},\"topApps\":[{}]}}",
+        "{{\"score\":{},\"productiveMinutes\":{},\"distractingMinutes\":{},\"topApps\":[{}]}}",
         score as u64,
         productive as u64 * SAMPLE_SECONDS / 60,
-        neutral as u64 * SAMPLE_SECONDS / 60,
         distracting as u64 * SAMPLE_SECONDS / 60,
-        blocked as u64 * SAMPLE_SECONDS / 60,
         app_json
     ))
 }
@@ -880,25 +878,6 @@ fn report_window_start(data_dir: &PathBuf) -> io::Result<i64> {
     Ok(value.trim().parse().unwrap_or(0))
 }
 
-fn events_json(data_dir: &PathBuf) -> io::Result<String> {
-    let path = data_dir.join("events.jsonl");
-    if !path.exists() {
-        return Ok("[]".into());
-    }
-
-    let reader = BufReader::new(File::open(path)?);
-    let mut lines = reader
-        .lines()
-        .map_while(Result::ok)
-        .filter(|line| {
-            line.contains("\"focus_target_mismatch\"") || line.contains("\"distraction_alert\"")
-        })
-        .collect::<Vec<_>>();
-    lines.reverse();
-    lines.truncate(10);
-    Ok(format!("[{}]", lines.join(",")))
-}
-
 fn state_json(focus: Option<FocusSession>) -> String {
     match focus {
         Some(focus) => {
@@ -919,6 +898,11 @@ fn state_json(focus: Option<FocusSession>) -> String {
 }
 
 fn segment_json(sample: &ActivitySample, start: i64, end: i64) -> String {
+    let category = if sample.category == "productive" {
+        "productive"
+    } else {
+        "distracting"
+    };
     format!(
         "{{\"start\":{},\"end\":{},\"durationSeconds\":{},\"app\":\"{}\",\"title\":\"{}\",\"source\":\"{}\",\"category\":\"{}\"}}",
         start,
@@ -927,7 +911,7 @@ fn segment_json(sample: &ActivitySample, start: i64, end: i64) -> String {
         json_escape(&sample.app),
         json_escape(&sample.title),
         json_escape(&sample.source),
-        json_escape(&sample.category)
+        category
     )
 }
 
@@ -955,9 +939,6 @@ main { max-width:1120px; margin:0 auto; padding:24px; display:grid; gap:18px; }
 input, button { border:1px solid var(--line); border-radius:6px; padding:9px 11px; background:var(--panel); color:var(--ink); }
 button { cursor:pointer; font-weight:650; }
 button:disabled { cursor:not-allowed; opacity:.55; }
-.alert { display:none; border:1px solid var(--bad); background:color-mix(in srgb, var(--bad) 12%, var(--panel)); color:var(--ink); border-radius:8px; padding:14px 16px; }
-.alert.show { display:block; }
-.alert strong { display:block; margin-bottom:4px; color:var(--bad); }
 .source-toggle { display:inline; max-width:100%; padding:0; border:0; background:transparent; color:var(--ink); font:inherit; font-weight:500; text-align:left; overflow-wrap:anywhere; }
 .source-toggle:hover { text-decoration:underline; }
 .focus-btn { transition: background .15s ease, border-color .15s ease, color .15s ease; }
@@ -983,8 +964,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .item { display:grid; grid-template-columns:120px 1fr 96px; gap:12px; align-items:start; border-top:1px solid var(--line); padding-top:10px; }
 .tag { width:max-content; border-radius:999px; padding:2px 8px; font-size:12px; }
 .productive { color:var(--good); background:color-mix(in srgb, var(--good) 15%, transparent); }
-.neutral { color:var(--muted); background:color-mix(in srgb, var(--muted) 14%, transparent); }
-.distracting, .blocked { color:var(--bad); background:color-mix(in srgb, var(--bad) 14%, transparent); }
+.distracting { color:var(--bad); background:color-mix(in srgb, var(--bad) 14%, transparent); }
 .two { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
 @media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid { grid-template-columns:1fr; display:grid; } header { align-items:start; } }
 </style>
@@ -995,7 +975,6 @@ button:disabled { cursor:not-allowed; opacity:.55; }
   <div id="focusState" class="muted"></div>
 </header>
 <main>
-  <section class="alert" id="alertPanel"></section>
   <section class="bar">
     <input id="task" value="Deep work" aria-label="Focus task">
     <input id="target" placeholder="Focus apps/sites, comma separated" aria-label="Focus targets">
@@ -1015,11 +994,10 @@ button:disabled { cursor:not-allowed; opacity:.55; }
   <section class="explain" id="explainPanel">
     <h2>Report meaning</h2>
     <div class="explain-grid">
-      <div><h3>Score</h3><p>0 to 100 estimate from the last 24 hours. Productive time raises it, neutral time helps a little, distracting and blocked time lower it.</p></div>
+      <div><h3>Score</h3><p>0 to 100 estimate from the last 24 hours. Productive time raises it, distracted time lowers it.</p></div>
       <div><h3>Productive</h3><p>During a targeted focus session, only activity matching one of your focus apps or sites counts here. Outside targeted focus, productive keywords are used.</p></div>
-      <div><h3>Neutral</h3><p>Activity that does not clearly match productive, distracting, or blocked rules. Productive-keyword activity outside your focus targets is neutral during targeted focus.</p></div>
-      <div><h3>Distracted</h3><p>Activity matching distracting keywords, like social feeds, video sites, games, or other configured distractions.</p></div>
-      <div><h3>Blocked</h3><p>Activity matching keywords you explicitly added to the block list from this dashboard or config file.</p></div>
+      <div><h3>Distracted</h3><p>Any activity that is not productive. During targeted focus, every app or site outside your focus list is tracked here.</p></div>
+      <div><h3>Blocked</h3><p>Blocked keywords are treated as distracted activity and can still trigger OS-level warnings.</p></div>
     </div>
   </section>
   <section class="grid" id="metrics"></section>
@@ -1036,7 +1014,6 @@ button:disabled { cursor:not-allowed; opacity:.55; }
   </section>
 </main>
 <script>
-let lastAlertTimestamp = 0;
 const focusDraftKey = 'local-focus-draft';
 const fmtTime = seconds => new Date(seconds * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 const minutes = seconds => Math.max(1, Math.round(seconds / 60));
@@ -1095,19 +1072,16 @@ function toggleHistory() {
   button.textContent = open ? 'Hide previous reports' : 'Previous reports';
 }
 async function refresh() {
-  const [timeline, report, state, history, events] = await Promise.all([
+  const [timeline, report, state, history] = await Promise.all([
     fetch('/api/timeline').then(r => r.json()),
     fetch('/api/report').then(r => r.json()),
     fetch('/api/state').then(r => r.json()),
-    fetch('/api/report/history').then(r => r.json()),
-    fetch('/api/events').then(r => r.json())
+    fetch('/api/report/history').then(r => r.json())
   ]);
-  updateAlert(events);
   document.querySelector('#metrics').innerHTML = `
     <div class="metric"><span class="muted">Score</span><strong>${report.score}</strong></div>
     <div class="metric"><span class="muted">Productive</span><strong>${report.productiveMinutes}m</strong></div>
-    <div class="metric"><span class="muted">Neutral</span><strong>${report.neutralMinutes}m</strong></div>
-    <div class="metric"><span class="muted">Distracted</span><strong>${report.distractingMinutes + report.blockedMinutes}m</strong></div>`;
+    <div class="metric"><span class="muted">Distracted</span><strong>${report.distractingMinutes}m</strong></div>`;
   document.querySelector('#timeline').innerHTML = timeline.slice(-80).reverse().map((item, index) => `
     <div class="item">
       <div class="muted">${fmtTime(item.start)}<br>${minutes(item.durationSeconds)} min</div>
@@ -1122,8 +1096,7 @@ async function refresh() {
       <div class="history-grid">
         <div><h3>Score</h3><p>${r.score}</p></div>
         <div><h3>Productive</h3><p>${r.productiveMinutes}m</p></div>
-        <div><h3>Neutral</h3><p>${r.neutralMinutes}m</p></div>
-        <div><h3>Distracted</h3><p>${r.distractingMinutes + r.blockedMinutes}m</p></div>
+        <div><h3>Distracted</h3><p>${r.distractingMinutes}m</p></div>
       </div>
       <div class="muted">${(r.topApps || []).slice(0, 2).map(app => escapeHtml(`${app.app}${app.source ? ' - ' + app.source : ''}`)).join(', ')}</div>
     </div>`;
@@ -1132,7 +1105,7 @@ async function refresh() {
   seedFocusInputsFromActiveSession(state.focus);
   document.querySelector('#focusState').textContent = state.focus
     ? `Focus: ${state.focus.task}${state.focus.target ? ' in ' + state.focus.target : ''}${state.focus.paused ? ' (paused)' : ''}`
-    : 'No active focus session';
+    : 'No active focus session - alerts off';
 }
 function seedFocusInputsFromActiveSession(focus) {
   if (!focus) return;
@@ -1157,23 +1130,6 @@ function updateFocusButtons(focus) {
   pauseButton.textContent = paused ? 'Resume' : 'Pause';
   stopButton.disabled = !focus;
   stopButton.className = `focus-btn ${focus ? 'focus-stop-active' : ''}`;
-}
-function updateAlert(events) {
-  const panel = document.querySelector('#alertPanel');
-  const latest = (events || [])[0];
-  if (!latest || Date.now() / 1000 - latest.timestamp > 10 * 60) {
-    panel.classList.remove('show');
-    panel.innerHTML = '';
-    return;
-  }
-  panel.classList.add('show');
-  panel.innerHTML = `<strong>${latest.kind === 'distraction_alert' ? 'Distraction warning' : 'Focus warning'}</strong><div>${escapeHtml(latest.message)}</div><div class="muted">${new Date(latest.timestamp * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</div>`;
-  if (latest.timestamp > lastAlertTimestamp) {
-    lastAlertTimestamp = latest.timestamp;
-    if (document.hidden) {
-      window.alert(latest.message);
-    }
-  }
 }
 function sourceMarkup(source, index) {
   const shortSource = shortenSource(source);
