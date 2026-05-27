@@ -297,7 +297,7 @@ fn detect_distraction(
                 "You have been outside your focus apps/sites for over 1 minute. Allowed: '{}'. Current activity: {}",
                 focus.target, sample.app
             );
-            notify("Focus warning", &message);
+            os_alert("Focus warning", &message);
             guard.last_focus_mismatch_at = sample.timestamp;
             append_event(data_dir, "focus_target_mismatch", &message)?;
         }
@@ -731,6 +731,8 @@ fn handle_http(
         write_response(&mut stream, "application/json", &report_history_json(&data_dir)?)?;
     } else if path == "/api/report" {
         write_response(&mut stream, "application/json", &report_json(&data_dir)?)?;
+    } else if path == "/api/events" {
+        write_response(&mut stream, "application/json", &events_json(&data_dir)?)?;
     } else if path == "/api/state" {
         let focus = state.lock().ok().and_then(|s| s.focus.clone());
         write_response(&mut stream, "application/json", &state_json(focus))?;
@@ -878,6 +880,25 @@ fn report_window_start(data_dir: &PathBuf) -> io::Result<i64> {
     Ok(value.trim().parse().unwrap_or(0))
 }
 
+fn events_json(data_dir: &PathBuf) -> io::Result<String> {
+    let path = data_dir.join("events.jsonl");
+    if !path.exists() {
+        return Ok("[]".into());
+    }
+
+    let reader = BufReader::new(File::open(path)?);
+    let mut lines = reader
+        .lines()
+        .map_while(Result::ok)
+        .filter(|line| {
+            line.contains("\"focus_target_mismatch\"") || line.contains("\"distraction_alert\"")
+        })
+        .collect::<Vec<_>>();
+    lines.reverse();
+    lines.truncate(10);
+    Ok(format!("[{}]", lines.join(",")))
+}
+
 fn state_json(focus: Option<FocusSession>) -> String {
     match focus {
         Some(focus) => {
@@ -934,6 +955,9 @@ main { max-width:1120px; margin:0 auto; padding:24px; display:grid; gap:18px; }
 input, button { border:1px solid var(--line); border-radius:6px; padding:9px 11px; background:var(--panel); color:var(--ink); }
 button { cursor:pointer; font-weight:650; }
 button:disabled { cursor:not-allowed; opacity:.55; }
+.alert { display:none; border:1px solid var(--bad); background:color-mix(in srgb, var(--bad) 12%, var(--panel)); color:var(--ink); border-radius:8px; padding:14px 16px; }
+.alert.show { display:block; }
+.alert strong { display:block; margin-bottom:4px; color:var(--bad); }
 .source-toggle { display:inline; max-width:100%; padding:0; border:0; background:transparent; color:var(--ink); font:inherit; font-weight:500; text-align:left; overflow-wrap:anywhere; }
 .source-toggle:hover { text-decoration:underline; }
 .focus-btn { transition: background .15s ease, border-color .15s ease, color .15s ease; }
@@ -971,6 +995,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
   <div id="focusState" class="muted"></div>
 </header>
 <main>
+  <section class="alert" id="alertPanel"></section>
   <section class="bar">
     <input id="task" value="Deep work" aria-label="Focus task">
     <input id="target" placeholder="Focus apps/sites, comma separated" aria-label="Focus targets">
@@ -1011,6 +1036,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
   </section>
 </main>
 <script>
+let lastAlertTimestamp = 0;
 const fmtTime = seconds => new Date(seconds * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 const minutes = seconds => Math.max(1, Math.round(seconds / 60));
 async function startFocus() {
@@ -1049,12 +1075,14 @@ function toggleHistory() {
   button.textContent = open ? 'Hide previous reports' : 'Previous reports';
 }
 async function refresh() {
-  const [timeline, report, state, history] = await Promise.all([
+  const [timeline, report, state, history, events] = await Promise.all([
     fetch('/api/timeline').then(r => r.json()),
     fetch('/api/report').then(r => r.json()),
     fetch('/api/state').then(r => r.json()),
-    fetch('/api/report/history').then(r => r.json())
+    fetch('/api/report/history').then(r => r.json()),
+    fetch('/api/events').then(r => r.json())
   ]);
+  updateAlert(events);
   document.querySelector('#metrics').innerHTML = `
     <div class="metric"><span class="muted">Score</span><strong>${report.score}</strong></div>
     <div class="metric"><span class="muted">Productive</span><strong>${report.productiveMinutes}m</strong></div>
@@ -1098,6 +1126,23 @@ function updateFocusButtons(focus) {
   pauseButton.textContent = paused ? 'Resume' : 'Pause';
   stopButton.disabled = !focus;
   stopButton.className = `focus-btn ${focus ? 'focus-stop-active' : ''}`;
+}
+function updateAlert(events) {
+  const panel = document.querySelector('#alertPanel');
+  const latest = (events || [])[0];
+  if (!latest || Date.now() / 1000 - latest.timestamp > 10 * 60) {
+    panel.classList.remove('show');
+    panel.innerHTML = '';
+    return;
+  }
+  panel.classList.add('show');
+  panel.innerHTML = `<strong>${latest.kind === 'distraction_alert' ? 'Distraction warning' : 'Focus warning'}</strong><div>${escapeHtml(latest.message)}</div><div class="muted">${new Date(latest.timestamp * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</div>`;
+  if (latest.timestamp > lastAlertTimestamp) {
+    lastAlertTimestamp = latest.timestamp;
+    if (document.hidden) {
+      window.alert(latest.message);
+    }
+  }
 }
 function sourceMarkup(source, index) {
   const shortSource = shortenSource(source);
@@ -1289,6 +1334,49 @@ fn notify(title: &str, message: &str) {
     let _ = Command::new("notify-send").arg(title).arg(message).output();
 }
 
+fn os_alert(title: &str, message: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let alert_title = format!("FOCUS WARNING - {}", title.to_uppercase());
+        let script = format!(
+            "display dialog \"{}\" with title \"{}\" buttons {{\"BACK TO FOCUS\"}} default button \"BACK TO FOCUS\" with icon caution giving up after 30",
+            apple_escape(message),
+            apple_escape(&alert_title)
+        );
+        let _ = Command::new("osascript").arg("-e").arg(script).spawn();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let alert_title = format!("FOCUS WARNING - {}", title.to_uppercase());
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             [System.Windows.Forms.MessageBox]::Show('{}', '{}', 'OK', 'Warning')",
+            ps_escape(message),
+            ps_escape(&alert_title)
+        );
+        let _ = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .spawn();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let alert_title = format!("FOCUS WARNING - {}", title.to_uppercase());
+        let script = format!(
+            "if command -v zenity >/dev/null 2>&1; then zenity --warning --width=560 --height=180 --title='{}' --text='{}'; else notify-send -u critical -a 'Local Focus' '{}' '{}'; fi",
+            shell_escape(&alert_title),
+            shell_escape(message),
+            shell_escape(&alert_title),
+            shell_escape(message)
+        );
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .spawn();
+    }
+}
+
 fn parse_query(query: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for pair in query.split('&') {
@@ -1391,6 +1479,11 @@ fn apple_escape(value: &str) -> String {
 #[cfg(target_os = "windows")]
 fn ps_escape(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+#[cfg(target_os = "linux")]
+fn shell_escape(value: &str) -> String {
+    value.replace('\'', "'\"'\"'")
 }
 
 fn print_help() {
