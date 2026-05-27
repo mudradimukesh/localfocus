@@ -6,7 +6,7 @@ No cloud account is used. No data is sent off the machine. The app records local
 
 ## Features
 
-- Automatic activity timeline from the active app and window title.
+- Automatic activity timeline from the active app, window title, and browser URL when available.
 - Local mapping for apps, websites, files, and project names visible in titles.
 - Focus mode with Pomodoro timer.
 - Pause and resume for active focus sessions.
@@ -40,7 +40,7 @@ Optional run-at-login helpers are in `scripts/`.
 
 ## Platform Notes
 
-macOS uses AppleScript to read the frontmost app and window title. The first run may ask for Accessibility or Automation permission.
+macOS uses AppleScript to read the frontmost app, window title, and active browser tab URL for supported browsers such as Safari, Chrome, Brave, Edge, and Arc. The first run may ask for Accessibility or Automation permission.
 
 Linux uses `xdotool`, `xprop`, and `notify-send` when available:
 

@@ -176,13 +176,12 @@ fn tracking_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<(
             .lock()
             .map(|s| (s.config.clone(), s.focus.clone()))
             .unwrap_or_default();
-        let source = source_from_title(&raw.1);
         let category = classify(&config, &raw.0, &raw.1);
         let mut sample = ActivitySample {
             timestamp: now(),
             app: raw.0,
             title: raw.1,
-            source,
+            source: raw.2,
             category,
         };
         apply_focus_productivity_gate(&focus, &mut sample);
@@ -381,12 +380,18 @@ fn domain_from_url(value: &str) -> Option<String> {
         .filter(|domain| !domain.is_empty())
 }
 
-fn foreground_activity() -> (String, String) {
-    platform_foreground_activity().unwrap_or_else(|| ("Unknown".into(), "Unknown activity".into()))
+fn foreground_activity() -> (String, String, String) {
+    platform_foreground_activity().unwrap_or_else(|| {
+        (
+            "Unknown".into(),
+            "Unknown activity".into(),
+            "local".into(),
+        )
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn platform_foreground_activity() -> Option<(String, String)> {
+fn platform_foreground_activity() -> Option<(String, String, String)> {
     let script = r#"tell application "System Events"
 set frontApp to name of first application process whose frontmost is true
 end tell
@@ -397,14 +402,22 @@ on error
 set windowTitle to frontApp
 end try
 end tell
-return frontApp & "||" & windowTitle"#;
+set activeUrl to ""
+try
+if frontApp is "Safari" then
+tell application "Safari" to set activeUrl to URL of current tab of front window
+else if frontApp is "Google Chrome" or frontApp is "Brave Browser" or frontApp is "Microsoft Edge" or frontApp is "Arc" then
+tell application frontApp to set activeUrl to URL of active tab of front window
+end if
+end try
+return frontApp & "||" & windowTitle & "||" & activeUrl"#;
 
     let output = Command::new("osascript").arg("-e").arg(script).output().ok()?;
-    parse_pair(&String::from_utf8_lossy(&output.stdout))
+    parse_activity(&String::from_utf8_lossy(&output.stdout))
 }
 
 #[cfg(target_os = "windows")]
-fn platform_foreground_activity() -> Option<(String, String)> {
+fn platform_foreground_activity() -> Option<(String, String, String)> {
     let script = r#"
 Add-Type @"
 using System;
@@ -425,11 +438,11 @@ $p = Get-Process | Where-Object {$_.MainWindowHandle -eq $handle} | Select-Objec
         .args(["-NoProfile", "-Command", script])
         .output()
         .ok()?;
-    parse_pair(&String::from_utf8_lossy(&output.stdout))
+    parse_activity(&String::from_utf8_lossy(&output.stdout))
 }
 
 #[cfg(target_os = "linux")]
-fn platform_foreground_activity() -> Option<(String, String)> {
+fn platform_foreground_activity() -> Option<(String, String, String)> {
     let window_id = Command::new("sh")
         .arg("-c")
         .arg("xdotool getactivewindow 2>/dev/null")
@@ -453,22 +466,27 @@ fn platform_foreground_activity() -> Option<(String, String)> {
         .output()
         .ok()?;
 
-    Some((
-        clean(&String::from_utf8_lossy(&app.stdout)),
-        clean(&String::from_utf8_lossy(&title.stdout)),
-    ))
+    let app = clean(&String::from_utf8_lossy(&app.stdout));
+    let title = clean(&String::from_utf8_lossy(&title.stdout));
+    let source = source_from_title(&title);
+    Some((app, title, source))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-fn platform_foreground_activity() -> Option<(String, String)> {
+fn platform_foreground_activity() -> Option<(String, String, String)> {
     None
 }
 
-fn parse_pair(value: &str) -> Option<(String, String)> {
-    let mut parts = value.trim().splitn(2, "||");
+fn parse_activity(value: &str) -> Option<(String, String, String)> {
+    let mut parts = value.trim().splitn(3, "||");
     let app = clean(parts.next()?);
     let title = clean(parts.next().unwrap_or(""));
-    Some((app, title))
+    let source = parts
+        .next()
+        .map(clean)
+        .filter(|value| value != "Unknown")
+        .unwrap_or_else(|| source_from_title(&title));
+    Some((app, title, source))
 }
 
 fn source_from_title(title: &str) -> String {
@@ -746,19 +764,22 @@ fn report_json(data_dir: &PathBuf) -> io::Result<String> {
         .clamp(0.0, 100.0)
         .round();
 
-    let mut app_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut app_counts: BTreeMap<(String, String), usize> = BTreeMap::new();
     for sample in &recent {
-        *app_counts.entry(sample.app.clone()).or_default() += 1;
+        *app_counts
+            .entry((sample.app.clone(), sample.source.clone()))
+            .or_default() += 1;
     }
     let mut apps: Vec<_> = app_counts.into_iter().collect();
     apps.sort_by(|a, b| b.1.cmp(&a.1));
     let app_json = apps
         .into_iter()
         .take(10)
-        .map(|(app, count)| {
+        .map(|((app, source), count)| {
             format!(
-                "{{\"app\":\"{}\",\"minutes\":{}}}",
+                "{{\"app\":\"{}\",\"source\":\"{}\",\"minutes\":{}}}",
                 json_escape(&app),
+                json_escape(&source),
                 count as u64 * SAMPLE_SECONDS / 60
             )
         })
@@ -946,7 +967,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
   </section>
   <section class="two">
     <section class="timeline"><h2>Timeline</h2><div id="timeline"></div></section>
-    <section class="apps"><h2>Top apps</h2><div id="apps"></div></section>
+    <section class="apps"><h2>Top apps and URLs</h2><div id="apps"></div></section>
   </section>
 </main>
 <script>
@@ -1005,7 +1026,7 @@ async function refresh() {
       <div><strong>${escapeHtml(item.app)}</strong><div>${escapeHtml(item.title)}</div><div class="muted">${escapeHtml(item.source)}</div></div>
       <div class="tag ${item.category}">${item.category}</div>
     </div>`).join('') || '<div class="muted">No activity yet.</div>';
-  document.querySelector('#apps').innerHTML = report.topApps.map(app => `<p><strong>${escapeHtml(app.app)}</strong><br><span class="muted">${app.minutes} min</span></p>`).join('') || '<div class="muted">No apps yet.</div>';
+  document.querySelector('#apps').innerHTML = report.topApps.map(app => `<p><strong>${escapeHtml(app.app)}</strong><br><span>${escapeHtml(app.source || 'local')}</span><br><span class="muted">${app.minutes} min</span></p>`).join('') || '<div class="muted">No apps yet.</div>';
   document.querySelector('#historyList').innerHTML = history.map(item => {
     const r = item.report;
     return `<div class="item">
@@ -1016,7 +1037,7 @@ async function refresh() {
         <div><h3>Neutral</h3><p>${r.neutralMinutes}m</p></div>
         <div><h3>Distracted</h3><p>${r.distractingMinutes + r.blockedMinutes}m</p></div>
       </div>
-      <div class="muted">${(r.topApps || []).slice(0, 2).map(app => escapeHtml(app.app)).join(', ')}</div>
+      <div class="muted">${(r.topApps || []).slice(0, 2).map(app => escapeHtml(`${app.app}${app.source ? ' - ' + app.source : ''}`)).join(', ')}</div>
     </div>`;
   }).join('') || '<div class="muted">No previous reports yet.</div>';
   updateFocusButtons(state.focus);
