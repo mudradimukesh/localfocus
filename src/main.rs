@@ -318,9 +318,7 @@ fn detect_distraction(
                 sample.app
             );
             if focus.alert_action == "switch" && !focus.redirect_app.trim().is_empty() {
-                if activate_app(&focus.redirect_app).is_err() {
-                    os_alert("Focus warning", &message);
-                }
+                os_alert_then_activate("Focus warning", &message, &focus.redirect_app);
             } else {
                 os_alert("Focus warning", &message);
             }
@@ -1809,6 +1807,67 @@ fn os_alert(title: &str, message: &str) {
             .arg("-c")
             .arg(script)
             .spawn();
+    }
+}
+
+fn os_alert_then_activate(title: &str, message: &str, app_name: &str) {
+    let title = title.to_string();
+    let message = message.to_string();
+    let app_name = app_name.trim().to_string();
+    thread::spawn(move || {
+        let acknowledged = os_alert_blocking(&title, &message);
+        if acknowledged {
+            let _ = activate_app(&app_name);
+        }
+    });
+}
+
+fn os_alert_blocking(title: &str, message: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let alert_title = format!("FOCUS WARNING - {}", title.to_uppercase());
+        let script = format!(
+            "display dialog \"{}\" with title \"{}\" buttons {{\"OK\"}} default button \"OK\" with icon caution",
+            apple_escape(message),
+            apple_escape(&alert_title)
+        );
+        return Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .status()
+            .is_ok_and(|status| status.success());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let alert_title = format!("FOCUS WARNING - {}", title.to_uppercase());
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             [System.Windows.Forms.MessageBox]::Show('{}', '{}', 'OK', 'Warning')",
+            ps_escape(message),
+            ps_escape(&alert_title)
+        );
+        return Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .status()
+            .is_ok_and(|status| status.success());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let alert_title = format!("FOCUS WARNING - {}", title.to_uppercase());
+        let script = format!(
+            "if command -v zenity >/dev/null 2>&1; then zenity --warning --width=560 --height=180 --title='{}' --text='{}'; else notify-send -u critical -a 'Local Focus' '{}' '{}'; fi",
+            shell_escape(&alert_title),
+            shell_escape(message),
+            shell_escape(&alert_title),
+            shell_escape(message)
+        );
+        return Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .status()
+            .is_ok_and(|status| status.success());
     }
 }
 
