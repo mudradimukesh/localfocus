@@ -1037,9 +1037,11 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 </main>
 <script>
 let lastAlertTimestamp = 0;
+const focusDraftKey = 'local-focus-draft';
 const fmtTime = seconds => new Date(seconds * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 const minutes = seconds => Math.max(1, Math.round(seconds / 60));
 async function startFocus() {
+  saveFocusDraft();
   const task = encodeURIComponent(document.querySelector('#task').value || 'Focus session');
   const target = encodeURIComponent(document.querySelector('#target').value || '');
   const mins = encodeURIComponent(document.querySelector('#minutes').value || '25');
@@ -1059,6 +1061,24 @@ async function addBlock() {
   await fetch(`/api/block/add?keyword=${keyword}`);
   input.value = '';
   refresh();
+}
+function saveFocusDraft() {
+  localStorage.setItem(focusDraftKey, JSON.stringify({
+    task: document.querySelector('#task').value,
+    target: document.querySelector('#target').value,
+    minutes: document.querySelector('#minutes').value
+  }));
+}
+function restoreFocusDraft() {
+  try {
+    const draft = JSON.parse(localStorage.getItem(focusDraftKey) || '{}');
+    if (draft.task) document.querySelector('#task').value = draft.task;
+    if (draft.target) document.querySelector('#target').value = draft.target;
+    if (draft.minutes) document.querySelector('#minutes').value = draft.minutes;
+  } catch {}
+  ['#task', '#target', '#minutes'].forEach(selector => {
+    document.querySelector(selector).addEventListener('input', saveFocusDraft);
+  });
 }
 function toggleExplain() {
   const panel = document.querySelector('#explainPanel');
@@ -1109,9 +1129,20 @@ async function refresh() {
     </div>`;
   }).join('') || '<div class="muted">No previous reports yet.</div>';
   updateFocusButtons(state.focus);
+  seedFocusInputsFromActiveSession(state.focus);
   document.querySelector('#focusState').textContent = state.focus
     ? `Focus: ${state.focus.task}${state.focus.target ? ' in ' + state.focus.target : ''}${state.focus.paused ? ' (paused)' : ''}`
     : 'No active focus session';
+}
+function seedFocusInputsFromActiveSession(focus) {
+  if (!focus) return;
+  const targetInput = document.querySelector('#target');
+  const taskInput = document.querySelector('#task');
+  const minutesInput = document.querySelector('#minutes');
+  if (!targetInput.value && focus.target) targetInput.value = focus.target;
+  if (!taskInput.value && focus.task) taskInput.value = focus.task;
+  if (!minutesInput.value && focus.durationMinutes) minutesInput.value = focus.durationMinutes;
+  saveFocusDraft();
 }
 function updateFocusButtons(focus) {
   const startButton = document.querySelector('#startFocus');
@@ -1176,6 +1207,7 @@ function formatDuration(seconds) {
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
 }
+restoreFocusDraft();
 refresh();
 setInterval(refresh, 10000);
 </script>
