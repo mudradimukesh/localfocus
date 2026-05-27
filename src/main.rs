@@ -209,13 +209,16 @@ fn focus_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<()> 
                 os_alert(
                     "Focus complete",
                     &format!(
-                        "{} is done. Take a {} minute break.",
+                        "{} is done. Take a {} minute break. Focus monitoring is paused until you resume or restart.",
                         session.task, session.break_minutes
                     ),
                 );
-                clear_focus(&data_dir)?;
+                let mut completed = session.clone();
+                completed.paused_at = Some(now());
+                save_focus(&data_dir, &completed)?;
                 if let Ok(mut state) = state.lock() {
-                    state.focus = None;
+                    state.focus = Some(completed);
+                    state.focus_mismatch_started_at = None;
                 }
             }
         }
@@ -312,7 +315,7 @@ fn detect_distraction(
             .map(|f| f.task.clone())
             .unwrap_or_else(|| "your task".into());
         let message = format!("You are in focus mode for {task}. Current activity: {}", sample.app);
-        notify("Possible distraction", &message);
+        os_alert("Distraction warning", &message);
         guard.last_distraction_at = sample.timestamp;
         append_event(data_dir, "distraction_alert", &message)?;
     }
