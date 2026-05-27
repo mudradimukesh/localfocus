@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const APP_NAME: &str = "local-focus";
 const SAMPLE_SECONDS: u64 = 5;
 const DISTRACTION_SECONDS: i64 = 90;
-const FOCUS_MISMATCH_SECONDS: i64 = 45;
+const FOCUS_MISMATCH_SECONDS: i64 = 60;
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -47,6 +47,7 @@ struct AppState {
     focus: Option<FocusSession>,
     last_distraction_at: i64,
     last_focus_mismatch_at: i64,
+    focus_mismatch_started_at: Option<i64>,
 }
 
 impl Default for Config {
@@ -115,6 +116,7 @@ fn run_app(data_dir: PathBuf) -> io::Result<()> {
         focus: load_focus(&data_dir),
         last_distraction_at: 0,
         last_focus_mismatch_at: 0,
+        focus_mismatch_started_at: None,
     }));
 
     {
@@ -165,6 +167,7 @@ fn run_tracker(data_dir: PathBuf) -> io::Result<()> {
         focus: load_focus(&data_dir),
         last_distraction_at: 0,
         last_focus_mismatch_at: 0,
+        focus_mismatch_started_at: None,
     }));
     tracking_loop(data_dir, state)
 }
@@ -275,18 +278,31 @@ fn detect_distraction(
         .as_ref()
         .filter(|focus| !focus_targets(focus).is_empty())
         .is_some_and(|focus| !matches_focus_target(focus, sample));
-    let focus_mismatch_enough_time =
-        sample.timestamp - guard.last_focus_mismatch_at >= FOCUS_MISMATCH_SECONDS;
 
-    if focused && focus_mismatch && focus_mismatch_enough_time {
-        let focus = guard.focus.as_ref().expect("focus checked above");
-        let message = format!(
-            "Allowed focus targets: '{}'. Current activity: {}",
-            focus.target, sample.app
-        );
-        notify("Wrong focus app", &message);
-        guard.last_focus_mismatch_at = sample.timestamp;
-        append_event(data_dir, "focus_target_mismatch", &message)?;
+    if focused && focus_mismatch {
+        let mismatch_started_at = match guard.focus_mismatch_started_at {
+            Some(started_at) => started_at,
+            None => {
+                guard.focus_mismatch_started_at = Some(sample.timestamp);
+                sample.timestamp
+            }
+        };
+        let mismatch_duration = sample.timestamp - mismatch_started_at;
+        let alert_cooldown_passed =
+            sample.timestamp - guard.last_focus_mismatch_at >= FOCUS_MISMATCH_SECONDS;
+
+        if mismatch_duration >= FOCUS_MISMATCH_SECONDS && alert_cooldown_passed {
+            let focus = guard.focus.as_ref().expect("focus checked above");
+            let message = format!(
+                "You have been outside your focus apps/sites for over 1 minute. Allowed: '{}'. Current activity: {}",
+                focus.target, sample.app
+            );
+            notify("Focus warning", &message);
+            guard.last_focus_mismatch_at = sample.timestamp;
+            append_event(data_dir, "focus_target_mismatch", &message)?;
+        }
+    } else {
+        guard.focus_mismatch_started_at = None;
     }
 
     if focused && distracting && enough_time {
