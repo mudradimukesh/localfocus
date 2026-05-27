@@ -13,6 +13,7 @@ const APP_NAME: &str = "local-focus";
 const SAMPLE_SECONDS: u64 = 5;
 const DISTRACTION_SECONDS: i64 = 90;
 const FOCUS_MISMATCH_SECONDS: i64 = 60;
+const IDLE_SECONDS: u64 = 60;
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -189,6 +190,9 @@ fn tracking_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<(
             category,
         };
         apply_focus_productivity_gate(&focus, &mut sample);
+        if system_idle_seconds().is_some_and(|seconds| seconds >= IDLE_SECONDS) {
+            sample.category = "idle".into();
+        }
 
         append_sample(&data_dir, &sample)?;
         detect_distraction(&data_dir, &state, &sample)?;
@@ -363,6 +367,61 @@ fn apply_focus_productivity_gate(focus: &Option<FocusSession>, sample: &mut Acti
     } else {
         sample.category = "distracting".into();
     }
+}
+
+#[cfg(target_os = "macos")]
+fn system_idle_seconds() -> Option<u64> {
+    let output = Command::new("ioreg")
+        .args(["-c", "IOHIDSystem"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let marker = "\"HIDIdleTime\" = ";
+    let value = text
+        .lines()
+        .find_map(|line| line.split_once(marker).map(|(_, value)| value.trim()))?;
+    value.parse::<u64>().ok().map(|nanos| nanos / 1_000_000_000)
+}
+
+#[cfg(target_os = "windows")]
+fn system_idle_seconds() -> Option<u64> {
+    let script = r#"
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class IdleTime {
+  [StructLayout(LayoutKind.Sequential)]
+  struct LASTINPUTINFO {
+    public uint cbSize;
+    public uint dwTime;
+  }
+  [DllImport("user32.dll")]
+  static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+  public static uint Seconds() {
+    LASTINPUTINFO info = new LASTINPUTINFO();
+    info.cbSize = (uint)Marshal.SizeOf(info);
+    GetLastInputInfo(ref info);
+    return ((uint)Environment.TickCount - info.dwTime) / 1000;
+  }
+}
+'@
+[IdleTime]::Seconds()
+"#;
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn system_idle_seconds() -> Option<u64> {
+    let output = Command::new("xprintidle").output().ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|millis| millis / 1000)
 }
 
 fn focus_elapsed_seconds(focus: &FocusSession, at: i64) -> i64 {
@@ -812,11 +871,12 @@ fn report_json(data_dir: &PathBuf) -> io::Result<String> {
     let recent: Vec<_> = samples.into_iter().filter(|s| s.timestamp >= since).collect();
     let total = recent.len().max(1) as f64;
     let productive = recent.iter().filter(|s| s.category == "productive").count() as f64;
+    let idle = recent.iter().filter(|s| s.category == "idle").count() as f64;
     let distracting = recent
         .iter()
-        .filter(|s| s.category != "productive")
+        .filter(|s| s.category == "distracting")
         .count() as f64;
-    let score = ((productive * 100.0 - distracting * 40.0) / total)
+    let score = ((productive * 100.0 - distracting * 40.0 - idle * 10.0) / total)
         .clamp(0.0, 100.0)
         .round();
 
@@ -844,10 +904,11 @@ fn report_json(data_dir: &PathBuf) -> io::Result<String> {
         .join(",");
 
     Ok(format!(
-        "{{\"score\":{},\"productiveMinutes\":{},\"distractingMinutes\":{},\"topApps\":[{}]}}",
+        "{{\"score\":{},\"productiveMinutes\":{},\"distractingMinutes\":{},\"idleMinutes\":{},\"topApps\":[{}]}}",
         score as u64,
         productive as u64 * SAMPLE_SECONDS / 60,
         distracting as u64 * SAMPLE_SECONDS / 60,
+        idle as u64 * SAMPLE_SECONDS / 60,
         app_json
     ))
 }
@@ -867,11 +928,16 @@ fn focus_report_json(data_dir: &PathBuf, target_text: &str) -> io::Result<String
         .iter()
         .map(|target| (target.clone(), 0))
         .collect::<BTreeMap<_, _>>();
+    let mut target_idle_seconds: BTreeMap<String, u64> = targets
+        .iter()
+        .map(|target| (target.clone(), 0))
+        .collect::<BTreeMap<_, _>>();
     let mut outside_seconds = 0;
     let mut productive_seconds = 0;
     let mut distracting_seconds = 0;
+    let mut idle_seconds = 0;
     let mut distraction_counts: BTreeMap<(String, String), u64> = BTreeMap::new();
-    let mut hourly: BTreeMap<i64, (u64, u64)> = BTreeMap::new();
+    let mut hourly: BTreeMap<i64, (u64, u64, u64)> = BTreeMap::new();
 
     for sample in &recent {
         let seconds = SAMPLE_SECONDS;
@@ -880,6 +946,9 @@ fn focus_report_json(data_dir: &PathBuf, target_text: &str) -> io::Result<String
         if sample.category == "productive" {
             productive_seconds += seconds;
             entry.0 += seconds;
+        } else if sample.category == "idle" {
+            idle_seconds += seconds;
+            entry.2 += seconds;
         } else {
             distracting_seconds += seconds;
             entry.1 += seconds;
@@ -889,25 +958,40 @@ fn focus_report_json(data_dir: &PathBuf, target_text: &str) -> io::Result<String
             .iter()
             .find(|target| sample_matches_target_text(sample, target))
         {
-            *target_seconds.entry(target.clone()).or_default() += seconds;
+            if sample.category == "idle" {
+                *target_idle_seconds.entry(target.clone()).or_default() += seconds;
+            } else {
+                *target_seconds.entry(target.clone()).or_default() += seconds;
+            }
         } else {
-            outside_seconds += seconds;
-            *distraction_counts
-                .entry((sample.app.clone(), sample.source.clone()))
-                .or_default() += seconds;
+            if sample.category == "idle" {
+                idle_seconds += 0;
+            } else {
+                outside_seconds += seconds;
+                *distraction_counts
+                    .entry((sample.app.clone(), sample.source.clone()))
+                    .or_default() += seconds;
+            }
         }
     }
 
     let mut target_rows = target_seconds.into_iter().collect::<Vec<_>>();
-    target_rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    target_rows.sort_by(|a, b| {
+        let a_total = a.1 + target_idle_seconds.get(&a.0).copied().unwrap_or(0);
+        let b_total = b.1 + target_idle_seconds.get(&b.0).copied().unwrap_or(0);
+        b_total.cmp(&a_total).then_with(|| a.0.cmp(&b.0))
+    });
     let target_rows_json = target_rows
         .iter()
         .map(|(target, seconds)| {
+            let idle = target_idle_seconds.get(target).copied().unwrap_or(0);
             format!(
-                "{{\"target\":\"{}\",\"seconds\":{},\"minutes\":{}}}",
+                "{{\"target\":\"{}\",\"seconds\":{},\"idleSeconds\":{},\"minutes\":{},\"idleMinutes\":{}}}",
                 json_escape(target),
                 seconds,
-                seconds / 60
+                idle,
+                seconds / 60,
+                idle / 60
             )
         })
         .collect::<Vec<_>>()
@@ -932,17 +1016,17 @@ fn focus_report_json(data_dir: &PathBuf, target_text: &str) -> io::Result<String
 
     let hourly_json = hourly
         .into_iter()
-        .map(|(hour, (productive, distracting))| {
+        .map(|(hour, (productive, distracting, idle))| {
             format!(
-                "{{\"hour\":{},\"productiveSeconds\":{},\"distractingSeconds\":{}}}",
-                hour, productive, distracting
+                "{{\"hour\":{},\"productiveSeconds\":{},\"distractingSeconds\":{},\"idleSeconds\":{}}}",
+                hour, productive, distracting, idle
             )
         })
         .collect::<Vec<_>>()
         .join(",");
 
     let focused_seconds = target_rows.iter().map(|(_, seconds)| *seconds).sum::<u64>();
-    let total_seconds = focused_seconds + outside_seconds;
+    let total_seconds = focused_seconds + outside_seconds + idle_seconds;
     let focus_percent = if total_seconds == 0 {
         0
     } else {
@@ -951,19 +1035,22 @@ fn focus_report_json(data_dir: &PathBuf, target_text: &str) -> io::Result<String
     let score = if total_seconds == 0 {
         0
     } else {
-        ((productive_seconds as f64 * 100.0 - distracting_seconds as f64 * 40.0)
+        ((productive_seconds as f64 * 100.0
+            - distracting_seconds as f64 * 40.0
+            - idle_seconds as f64 * 10.0)
             / total_seconds as f64)
             .clamp(0.0, 100.0)
             .round() as u64
     };
 
     Ok(format!(
-        "{{\"windowStart\":{},\"generatedAt\":{},\"targets\":[{}],\"focusSeconds\":{},\"outsideSeconds\":{},\"productiveSeconds\":{},\"distractingSeconds\":{},\"focusPercent\":{},\"score\":{},\"targetBreakdown\":[{}],\"topDistractions\":[{}],\"hourly\":[{}]}}",
+        "{{\"windowStart\":{},\"generatedAt\":{},\"targets\":[{}],\"focusSeconds\":{},\"outsideSeconds\":{},\"idleSeconds\":{},\"productiveSeconds\":{},\"distractingSeconds\":{},\"focusPercent\":{},\"score\":{},\"targetBreakdown\":[{}],\"topDistractions\":[{}],\"hourly\":[{}]}}",
         since,
         now(),
         target_json,
         focused_seconds,
         outside_seconds,
+        idle_seconds,
         productive_seconds,
         distracting_seconds,
         focus_percent,
@@ -1059,10 +1146,10 @@ fn state_json(focus: Option<FocusSession>) -> String {
 }
 
 fn segment_json(sample: &ActivitySample, start: i64, end: i64) -> String {
-    let category = if sample.category == "productive" {
-        "productive"
-    } else {
-        "distracting"
+    let category = match sample.category.as_str() {
+        "productive" => "productive",
+        "idle" => "idle",
+        _ => "distracting",
     };
     format!(
         "{{\"start\":{},\"end\":{},\"durationSeconds\":{},\"app\":\"{}\",\"title\":\"{}\",\"source\":\"{}\",\"category\":\"{}\"}}",
@@ -1146,6 +1233,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .tag { width:max-content; border-radius:999px; padding:2px 8px; font-size:12px; }
 .productive { color:var(--good); background:color-mix(in srgb, var(--good) 15%, transparent); }
 .distracting { color:var(--bad); background:color-mix(in srgb, var(--bad) 14%, transparent); }
+.idle { color:var(--warn); background:color-mix(in srgb, var(--warn) 16%, transparent); }
 .two { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
 @media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row { grid-template-columns:1fr; display:grid; } header { align-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } }
 </style>
@@ -1179,6 +1267,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
       <div><h3>Score</h3><p>0 to 100 estimate from the last 24 hours. Productive time raises it, distracted time lowers it.</p></div>
       <div><h3>Productive</h3><p>During a targeted focus session, only activity matching one of your focus apps or sites counts here. Outside targeted focus, productive keywords are used.</p></div>
       <div><h3>Distracted</h3><p>Any activity that is not productive. During targeted focus, every app or site outside your focus list is tracked here.</p></div>
+      <div><h3>Idle</h3><p>If there is no keyboard or mouse input for 60 seconds, time is tracked as idle even when the focused app or website matches your focus list.</p></div>
       <div><h3>Blocked</h3><p>Blocked keywords are treated as distracted activity and can still trigger OS-level warnings.</p></div>
     </div>
   </section>
@@ -1275,15 +1364,15 @@ function renderFocusReport(report) {
   if (!report.targets.length) {
     return `<div><h2>Focus report</h2><p class="muted">Add one or more focus apps or websites first, then run the report.</p></div>`;
   }
-  const total = report.focusSeconds + report.outsideSeconds;
-  const maxTarget = Math.max(1, ...report.targetBreakdown.map(item => item.seconds));
-  const maxHour = Math.max(1, ...report.hourly.map(item => item.productiveSeconds + item.distractingSeconds));
+  const total = report.focusSeconds + report.outsideSeconds + report.idleSeconds;
+  const maxTarget = Math.max(1, ...report.targetBreakdown.map(item => item.seconds + (item.idleSeconds || 0)));
+  const maxHour = Math.max(1, ...report.hourly.map(item => item.productiveSeconds + item.distractingSeconds + (item.idleSeconds || 0)));
   const focusAngle = `${Math.max(0, Math.min(100, report.focusPercent))}%`;
   const targetBars = report.targetBreakdown.map(item => `
     <div class="bar-row">
       <div>${sourceMarkup(item.target, `focus-${escapeAttr(item.target)}`)}</div>
-      <div class="bar-track"><div class="bar-fill" style="width:${Math.max(2, item.seconds * 100 / maxTarget)}%"></div></div>
-      <div class="muted">${formatDuration(item.seconds)}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${Math.max(2, (item.seconds + (item.idleSeconds || 0)) * 100 / maxTarget)}%"></div></div>
+      <div class="muted">${formatDuration(item.seconds)} active${item.idleSeconds ? `<br>${formatDuration(item.idleSeconds)} idle` : ''}</div>
     </div>`).join('');
   const distractionRows = report.topDistractions.map((item, index) => `
     <div class="bar-row">
@@ -1295,9 +1384,11 @@ function renderFocusReport(report) {
   const hours = recentHours.map(item => {
     const productiveHeight = Math.max(2, item.productiveSeconds * 100 / maxHour);
     const distractingHeight = Math.max(2, item.distractingSeconds * 100 / maxHour);
+    const idleHeight = Math.max(2, (item.idleSeconds || 0) * 100 / maxHour);
     return `<div title="${fmtTime(item.hour)}">
       <div class="hour-bar">
         <div class="hour-good" style="height:${productiveHeight}%"></div>
+        <div style="background:var(--warn);border-radius:4px 4px 0 0;min-height:2px;height:${idleHeight}%"></div>
         <div class="hour-bad" style="height:${distractingHeight}%"></div>
       </div>
       <div class="muted" style="font-size:11px;text-align:center">${new Date(item.hour * 1000).toLocaleTimeString([], {hour:'numeric'})}</div>
@@ -1308,6 +1399,7 @@ function renderFocusReport(report) {
   const insights = [
     report.focusPercent >= 70 ? `Strong alignment: ${report.focusPercent}% of tracked time matched your focus list.` : `Focus drift is high: ${report.focusPercent}% of tracked time matched your focus list.`,
     bestTarget ? `Most time was spent on ${bestTarget.target}: ${formatDuration(bestTarget.seconds)}.` : 'No tracked time matched the current focus list yet.',
+    report.idleSeconds ? `Idle time was ${formatDuration(report.idleSeconds)}, including idle periods inside focus apps or websites.` : 'No idle time was detected in this report window.',
     mainDistraction ? `Largest outside-focus item: ${mainDistraction.app} for ${formatDuration(mainDistraction.seconds)}.` : 'No outside-focus distractions were detected.',
     total ? `Productivity score for this report is ${report.score}/100 across ${formatDuration(total)}.` : 'The report will get richer after more tracked activity.'
   ].map(text => `<p>${escapeHtml(text)}</p>`).join('');
@@ -1317,7 +1409,7 @@ function renderFocusReport(report) {
       <div class="report-card"><span class="muted">Focus score</span><strong>${report.score}</strong></div>
       <div class="report-card"><span class="muted">Matched focus list</span><strong>${formatDuration(report.focusSeconds)}</strong></div>
       <div class="report-card"><span class="muted">Outside focus</span><strong>${formatDuration(report.outsideSeconds)}</strong></div>
-      <div class="report-card"><span class="muted">Alignment</span><strong>${report.focusPercent}%</strong></div>
+      <div class="report-card"><span class="muted">Idle</span><strong>${formatDuration(report.idleSeconds)}</strong></div>
     </div>
     <div class="report-two">
       <div class="report-card"><h3>Time on focus apps and websites</h3>${targetBars || '<p class="muted">No target activity yet.</p>'}</div>
@@ -1342,7 +1434,8 @@ async function refresh() {
   document.querySelector('#metrics').innerHTML = `
     <div class="metric"><span class="muted">Score</span><strong>${report.score}</strong></div>
     <div class="metric"><span class="muted">Productive</span><strong>${report.productiveMinutes}m</strong></div>
-    <div class="metric"><span class="muted">Distracted</span><strong>${report.distractingMinutes}m</strong></div>`;
+    <div class="metric"><span class="muted">Distracted</span><strong>${report.distractingMinutes}m</strong></div>
+    <div class="metric"><span class="muted">Idle</span><strong>${report.idleMinutes || 0}m</strong></div>`;
   document.querySelector('#timeline').innerHTML = timeline.slice(-80).reverse().map((item, index) => `
     <div class="item">
       <div class="muted">${fmtTime(item.start)}<br>${minutes(item.durationSeconds)} min</div>
@@ -1358,6 +1451,7 @@ async function refresh() {
         <div><h3>Score</h3><p>${r.score}</p></div>
         <div><h3>Productive</h3><p>${r.productiveMinutes}m</p></div>
         <div><h3>Distracted</h3><p>${r.distractingMinutes}m</p></div>
+        <div><h3>Idle</h3><p>${r.idleMinutes || 0}m</p></div>
       </div>
       <div class="muted">${(r.topApps || []).slice(0, 2).map(app => escapeHtml(`${app.app}${app.source ? ' - ' + app.source : ''}`)).join(', ')}</div>
     </div>`;
