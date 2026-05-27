@@ -39,6 +39,7 @@ struct FocusSession {
     break_minutes: u64,
     paused_at: Option<i64>,
     paused_total_seconds: i64,
+    pomodoro_alerted_at: Option<i64>,
 }
 
 #[derive(Default)]
@@ -205,20 +206,19 @@ fn focus_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<()> 
             }
             let elapsed = focus_elapsed_seconds(&session, now());
             let target = (session.duration_minutes * 60) as i64;
-            if elapsed >= target {
+            if elapsed >= target && session.pomodoro_alerted_at.is_none() {
                 os_alert(
                     "Focus complete",
                     &format!(
-                        "{} is done. Take a {} minute break. Focus monitoring is paused until you resume or restart.",
+                        "{} Pomodoro is complete. Focus monitoring is still active until you Pause or Stop. Take a {} minute break when you are ready.",
                         session.task, session.break_minutes
                     ),
                 );
                 let mut completed = session.clone();
-                completed.paused_at = Some(now());
+                completed.pomodoro_alerted_at = Some(now());
                 save_focus(&data_dir, &completed)?;
                 if let Ok(mut state) = state.lock() {
                     state.focus = Some(completed);
-                    state.focus_mismatch_started_at = None;
                 }
             }
         }
@@ -240,6 +240,7 @@ fn start_focus(
         break_minutes,
         paused_at: None,
         paused_total_seconds: 0,
+        pomodoro_alerted_at: None,
     };
     save_focus(&data_dir, &session)?;
     let target_note = if session.target.trim().is_empty() {
@@ -658,6 +659,7 @@ fn handle_http(
             break_minutes: 5,
             paused_at: None,
             paused_total_seconds: 0,
+            pomodoro_alerted_at: None,
         };
         save_focus(&data_dir, &session)?;
         if let Ok(mut state) = state.lock() {
@@ -1256,17 +1258,22 @@ fn save_focus(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<()> {
         .paused_at
         .map(|value| value.to_string())
         .unwrap_or_else(|| "null".into());
+    let pomodoro_alerted_at = focus
+        .pomodoro_alerted_at
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".into());
     fs::write(
         data_dir.join("focus.json"),
         format!(
-            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{}}}",
+            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{}}}",
             json_escape(&focus.task),
             json_escape(&focus.target),
             focus.started_at,
             focus.duration_minutes,
             focus.break_minutes,
             paused_at,
-            focus.paused_total_seconds
+            focus.paused_total_seconds,
+            pomodoro_alerted_at
         ),
     )
 }
@@ -1281,6 +1288,7 @@ fn load_focus(data_dir: &PathBuf) -> Option<FocusSession> {
         break_minutes: json_number(&value, "breakMinutes")? as u64,
         paused_at: json_number(&value, "pausedAt"),
         paused_total_seconds: json_number(&value, "pausedTotalSeconds").unwrap_or(0),
+        pomodoro_alerted_at: json_number(&value, "pomodoroAlertedAt"),
     })
 }
 
