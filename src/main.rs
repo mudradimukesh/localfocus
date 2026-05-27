@@ -1814,6 +1814,32 @@ fn os_alert_then_activate(title: &str, message: &str, app_name: &str) {
     let title = title.to_string();
     let message = message.to_string();
     let app_name = app_name.trim().to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        thread::spawn(move || {
+            let alert_title = format!("FOCUS WARNING - {}", title.to_uppercase());
+            let script = format!(
+                "set targetApp to \"{}\"\n\
+                 display dialog \"{}\" with title \"{}\" buttons {{\"OK\"}} default button \"OK\" with icon caution\n\
+                 do shell script \"open -a \" & quoted form of targetApp\n\
+                 delay 0.4\n\
+                 try\n\
+                 \ttell application targetApp to activate\n\
+                 end try\n\
+                 try\n\
+                 \ttell application \"System Events\" to set frontmost of first process whose name is targetApp to true\n\
+                 end try",
+                apple_escape(&app_name),
+                apple_escape(&message),
+                apple_escape(&alert_title)
+            );
+            let _ = Command::new("osascript").arg("-e").arg(script).status();
+        });
+        return;
+    }
+
+    #[cfg(not(target_os = "macos"))]
     thread::spawn(move || {
         let acknowledged = os_alert_blocking(&title, &message);
         if acknowledged {
@@ -1822,22 +1848,8 @@ fn os_alert_then_activate(title: &str, message: &str, app_name: &str) {
     });
 }
 
+#[cfg(not(target_os = "macos"))]
 fn os_alert_blocking(title: &str, message: &str) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        let alert_title = format!("FOCUS WARNING - {}", title.to_uppercase());
-        let script = format!(
-            "display dialog \"{}\" with title \"{}\" buttons {{\"OK\"}} default button \"OK\" with icon caution",
-            apple_escape(message),
-            apple_escape(&alert_title)
-        );
-        return Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .status()
-            .is_ok_and(|status| status.success());
-    }
-
     #[cfg(target_os = "windows")]
     {
         let alert_title = format!("FOCUS WARNING - {}", title.to_uppercase());
@@ -1871,6 +1883,7 @@ fn os_alert_blocking(title: &str, message: &str) -> bool {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn activate_app(app_name: &str) -> io::Result<()> {
     let app_name = app_name.trim();
     if app_name.is_empty() {
