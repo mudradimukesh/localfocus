@@ -394,26 +394,47 @@ fn foreground_activity() -> (String, String, String) {
 fn platform_foreground_activity() -> Option<(String, String, String)> {
     let script = r#"tell application "System Events"
 set frontApp to name of first application process whose frontmost is true
-end tell
-tell application frontApp
 try
-set windowTitle to name of front window
+set windowTitle to name of front window of first application process whose frontmost is true
 on error
 set windowTitle to frontApp
 end try
 end tell
-set activeUrl to ""
-try
-if frontApp is "Safari" then
-tell application "Safari" to set activeUrl to URL of current tab of front window
-else if frontApp is "Google Chrome" or frontApp is "Brave Browser" or frontApp is "Microsoft Edge" or frontApp is "Arc" then
-tell application frontApp to set activeUrl to URL of active tab of front window
-end if
-end try
-return frontApp & "||" & windowTitle & "||" & activeUrl"#;
+return frontApp & "||" & windowTitle"#;
 
     let output = Command::new("osascript").arg("-e").arg(script).output().ok()?;
-    parse_activity(&String::from_utf8_lossy(&output.stdout))
+    let (app, title, fallback_source) = parse_activity(&String::from_utf8_lossy(&output.stdout))?;
+    let source = active_browser_url(&app).unwrap_or(fallback_source);
+    Some((app, title, source))
+}
+
+#[cfg(target_os = "macos")]
+fn active_browser_url(app: &str) -> Option<String> {
+    let script = match app {
+        "Safari" => r#"tell application "Safari" to get URL of current tab of front window"#,
+        "Google Chrome" => {
+            r#"tell application "Google Chrome" to get URL of active tab of front window"#
+        }
+        "Brave Browser" => {
+            r#"tell application "Brave Browser" to get URL of active tab of front window"#
+        }
+        "Microsoft Edge" => {
+            r#"tell application "Microsoft Edge" to get URL of active tab of front window"#
+        }
+        "Arc" => r#"tell application "Arc" to get URL of active tab of front window"#,
+        _ => return None,
+    };
+
+    let output = Command::new("osascript").arg("-e").arg(script).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = clean(&String::from_utf8_lossy(&output.stdout));
+    if url == "Unknown" {
+        None
+    } else {
+        Some(url)
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -777,9 +798,10 @@ fn report_json(data_dir: &PathBuf) -> io::Result<String> {
         .take(10)
         .map(|((app, source), count)| {
             format!(
-                "{{\"app\":\"{}\",\"source\":\"{}\",\"minutes\":{}}}",
+                "{{\"app\":\"{}\",\"source\":\"{}\",\"seconds\":{},\"minutes\":{}}}",
                 json_escape(&app),
                 json_escape(&source),
+                count as u64 * SAMPLE_SECONDS,
                 count as u64 * SAMPLE_SECONDS / 60
             )
         })
@@ -1026,7 +1048,7 @@ async function refresh() {
       <div><strong>${escapeHtml(item.app)}</strong><div>${escapeHtml(item.title)}</div><div class="muted">${escapeHtml(item.source)}</div></div>
       <div class="tag ${item.category}">${item.category}</div>
     </div>`).join('') || '<div class="muted">No activity yet.</div>';
-  document.querySelector('#apps').innerHTML = report.topApps.map(app => `<p><strong>${escapeHtml(app.app)}</strong><br><span>${escapeHtml(app.source || 'local')}</span><br><span class="muted">${app.minutes} min</span></p>`).join('') || '<div class="muted">No apps yet.</div>';
+  document.querySelector('#apps').innerHTML = report.topApps.map(app => `<p><strong>${escapeHtml(app.app)}</strong><br><span>${escapeHtml(app.source || 'local')}</span><br><span class="muted">${formatDuration(app.seconds || app.minutes * 60)}</span></p>`).join('') || '<div class="muted">No apps yet.</div>';
   document.querySelector('#historyList').innerHTML = history.map(item => {
     const r = item.report;
     return `<div class="item">
@@ -1058,6 +1080,13 @@ function updateFocusButtons(focus) {
   pauseButton.textContent = paused ? 'Resume' : 'Pause';
   stopButton.disabled = !focus;
   stopButton.className = `focus-btn ${focus ? 'focus-stop-active' : ''}`;
+}
+function formatDuration(seconds) {
+  if (!seconds) return '0s';
+  if (seconds < 60) return `${seconds}s`;
+  const mins = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return rest ? `${mins}m ${rest}s` : `${mins}m`;
 }
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
