@@ -918,6 +918,8 @@ main { max-width:1120px; margin:0 auto; padding:24px; display:grid; gap:18px; }
 input, button { border:1px solid var(--line); border-radius:6px; padding:9px 11px; background:var(--panel); color:var(--ink); }
 button { cursor:pointer; font-weight:650; }
 button:disabled { cursor:not-allowed; opacity:.55; }
+.source-toggle { display:inline; max-width:100%; padding:0; border:0; background:transparent; color:var(--ink); font:inherit; font-weight:500; text-align:left; overflow-wrap:anywhere; }
+.source-toggle:hover { text-decoration:underline; }
 .focus-btn { transition: background .15s ease, border-color .15s ease, color .15s ease; }
 .focus-idle { border-color:var(--good); color:var(--good); }
 .focus-running { background:var(--good); border-color:var(--good); color:white; }
@@ -1048,7 +1050,7 @@ async function refresh() {
       <div><strong>${escapeHtml(item.app)}</strong><div>${escapeHtml(item.title)}</div><div class="muted">${escapeHtml(item.source)}</div></div>
       <div class="tag ${item.category}">${item.category}</div>
     </div>`).join('') || '<div class="muted">No activity yet.</div>';
-  document.querySelector('#apps').innerHTML = report.topApps.map(app => `<p><strong>${escapeHtml(app.app)}</strong><br><span>${escapeHtml(app.source || 'local')}</span><br><span class="muted">${formatDuration(app.seconds || app.minutes * 60)}</span></p>`).join('') || '<div class="muted">No apps yet.</div>';
+  document.querySelector('#apps').innerHTML = report.topApps.map((app, index) => `<p><strong>${escapeHtml(app.app)}</strong><br>${sourceMarkup(app.source || 'local', index)}<br><span class="muted">${formatDuration(app.seconds || app.minutes * 60)}</span></p>`).join('') || '<div class="muted">No apps yet.</div>';
   document.querySelector('#historyList').innerHTML = history.map(item => {
     const r = item.report;
     return `<div class="item">
@@ -1080,6 +1082,28 @@ function updateFocusButtons(focus) {
   pauseButton.textContent = paused ? 'Resume' : 'Pause';
   stopButton.disabled = !focus;
   stopButton.className = `focus-btn ${focus ? 'focus-stop-active' : ''}`;
+}
+function sourceMarkup(source, index) {
+  const shortSource = shortenSource(source);
+  if (shortSource === source) return `<span>${escapeHtml(source)}</span>`;
+  return `<button class="source-toggle" data-full="${escapeHtml(source)}" data-short="${escapeHtml(shortSource)}" onclick="toggleSource(event, ${index})">${escapeHtml(shortSource)}</button>`;
+}
+function toggleSource(event) {
+  const button = event.currentTarget;
+  const showingFull = button.dataset.fullShown === 'true';
+  button.textContent = showingFull ? button.dataset.short : button.dataset.full;
+  button.dataset.fullShown = showingFull ? 'false' : 'true';
+}
+function shortenSource(source) {
+  if (!/^https?:\/\//i.test(source)) return source;
+  try {
+    const url = new URL(source);
+    const parts = url.pathname.split('/').filter(Boolean);
+    const path = parts.length ? `/${parts[0]}/` : '/';
+    return `${url.protocol}//${url.host}${path}`;
+  } catch {
+    return source;
+  }
 }
 function formatDuration(seconds) {
   if (!seconds) return '0s';
