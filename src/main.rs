@@ -1044,10 +1044,10 @@ async function refresh() {
     <div class="metric"><span class="muted">Productive</span><strong>${report.productiveMinutes}m</strong></div>
     <div class="metric"><span class="muted">Neutral</span><strong>${report.neutralMinutes}m</strong></div>
     <div class="metric"><span class="muted">Distracted</span><strong>${report.distractingMinutes + report.blockedMinutes}m</strong></div>`;
-  document.querySelector('#timeline').innerHTML = timeline.slice(-80).reverse().map(item => `
+  document.querySelector('#timeline').innerHTML = timeline.slice(-80).reverse().map((item, index) => `
     <div class="item">
       <div class="muted">${fmtTime(item.start)}<br>${minutes(item.durationSeconds)} min</div>
-      <div><strong>${escapeHtml(item.app)}</strong><div>${escapeHtml(item.title)}</div><div class="muted">${escapeHtml(item.source)}</div></div>
+      <div><strong>${escapeHtml(item.app)}</strong><div>${escapeHtml(item.title)}</div><div class="muted">${sourceMarkup(item.source || 'local', `timeline-${index}`)}</div></div>
       <div class="tag ${item.category}">${item.category}</div>
     </div>`).join('') || '<div class="muted">No activity yet.</div>';
   document.querySelector('#apps').innerHTML = report.topApps.map((app, index) => `<p><strong>${escapeHtml(app.app)}</strong><br>${sourceMarkup(app.source || 'local', index)}<br><span class="muted">${formatDuration(app.seconds || app.minutes * 60)}</span></p>`).join('') || '<div class="muted">No apps yet.</div>';
