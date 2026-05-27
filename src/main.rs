@@ -736,6 +736,18 @@ fn handle_http(
         write_response(&mut stream, "application/json", "{\"ok\":true}")?;
     } else if path == "/api/report/history" {
         write_response(&mut stream, "application/json", &report_history_json(&data_dir)?)?;
+    } else if path.starts_with("/api/focus-report") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let target = params
+            .get("target")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        write_response(
+            &mut stream,
+            "application/json",
+            &focus_report_json(&data_dir, &target)?,
+        )?;
     } else if path == "/api/report" {
         write_response(&mut stream, "application/json", &report_json(&data_dir)?)?;
     } else if path == "/api/state" {
@@ -838,6 +850,150 @@ fn report_json(data_dir: &PathBuf) -> io::Result<String> {
         distracting as u64 * SAMPLE_SECONDS / 60,
         app_json
     ))
+}
+
+fn focus_report_json(data_dir: &PathBuf, target_text: &str) -> io::Result<String> {
+    let samples = load_samples(data_dir)?;
+    let since = report_window_start(data_dir)?.max(now() - 24 * 60 * 60);
+    let recent: Vec<_> = samples.into_iter().filter(|s| s.timestamp >= since).collect();
+    let targets = target_list_from_text(target_text);
+    let target_json = targets
+        .iter()
+        .map(|target| format!("\"{}\"", json_escape(target)))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let mut target_seconds: BTreeMap<String, u64> = targets
+        .iter()
+        .map(|target| (target.clone(), 0))
+        .collect::<BTreeMap<_, _>>();
+    let mut outside_seconds = 0;
+    let mut productive_seconds = 0;
+    let mut distracting_seconds = 0;
+    let mut distraction_counts: BTreeMap<(String, String), u64> = BTreeMap::new();
+    let mut hourly: BTreeMap<i64, (u64, u64)> = BTreeMap::new();
+
+    for sample in &recent {
+        let seconds = SAMPLE_SECONDS;
+        let bucket = sample.timestamp - sample.timestamp.rem_euclid(60 * 60);
+        let entry = hourly.entry(bucket).or_default();
+        if sample.category == "productive" {
+            productive_seconds += seconds;
+            entry.0 += seconds;
+        } else {
+            distracting_seconds += seconds;
+            entry.1 += seconds;
+        }
+
+        if let Some(target) = targets
+            .iter()
+            .find(|target| sample_matches_target_text(sample, target))
+        {
+            *target_seconds.entry(target.clone()).or_default() += seconds;
+        } else {
+            outside_seconds += seconds;
+            *distraction_counts
+                .entry((sample.app.clone(), sample.source.clone()))
+                .or_default() += seconds;
+        }
+    }
+
+    let mut target_rows = target_seconds.into_iter().collect::<Vec<_>>();
+    target_rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let target_rows_json = target_rows
+        .iter()
+        .map(|(target, seconds)| {
+            format!(
+                "{{\"target\":\"{}\",\"seconds\":{},\"minutes\":{}}}",
+                json_escape(target),
+                seconds,
+                seconds / 60
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let mut distractions = distraction_counts.into_iter().collect::<Vec<_>>();
+    distractions.sort_by(|a, b| b.1.cmp(&a.1));
+    let distraction_json = distractions
+        .into_iter()
+        .take(5)
+        .map(|((app, source), seconds)| {
+            format!(
+                "{{\"app\":\"{}\",\"source\":\"{}\",\"seconds\":{},\"minutes\":{}}}",
+                json_escape(&app),
+                json_escape(&source),
+                seconds,
+                seconds / 60
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let hourly_json = hourly
+        .into_iter()
+        .map(|(hour, (productive, distracting))| {
+            format!(
+                "{{\"hour\":{},\"productiveSeconds\":{},\"distractingSeconds\":{}}}",
+                hour, productive, distracting
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let focused_seconds = target_rows.iter().map(|(_, seconds)| *seconds).sum::<u64>();
+    let total_seconds = focused_seconds + outside_seconds;
+    let focus_percent = if total_seconds == 0 {
+        0
+    } else {
+        (focused_seconds * 100 / total_seconds).min(100)
+    };
+    let score = if total_seconds == 0 {
+        0
+    } else {
+        ((productive_seconds as f64 * 100.0 - distracting_seconds as f64 * 40.0)
+            / total_seconds as f64)
+            .clamp(0.0, 100.0)
+            .round() as u64
+    };
+
+    Ok(format!(
+        "{{\"windowStart\":{},\"generatedAt\":{},\"targets\":[{}],\"focusSeconds\":{},\"outsideSeconds\":{},\"productiveSeconds\":{},\"distractingSeconds\":{},\"focusPercent\":{},\"score\":{},\"targetBreakdown\":[{}],\"topDistractions\":[{}],\"hourly\":[{}]}}",
+        since,
+        now(),
+        target_json,
+        focused_seconds,
+        outside_seconds,
+        productive_seconds,
+        distracting_seconds,
+        focus_percent,
+        score,
+        target_rows_json,
+        distraction_json,
+        hourly_json
+    ))
+}
+
+fn target_list_from_text(target_text: &str) -> Vec<String> {
+    target_text
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn sample_matches_target_text(sample: &ActivitySample, target: &str) -> bool {
+    let haystack = normalize_match_text(&format!(
+        "{} {} {}",
+        sample.app, sample.title, sample.source
+    ));
+    let normalized = normalize_match_text(target);
+    let domain = domain_from_url(target).map(|domain| normalize_match_text(&domain));
+    haystack.contains(&normalized)
+        || domain
+            .as_ref()
+            .is_some_and(|domain| !domain.is_empty() && haystack.contains(domain))
 }
 
 fn reset_report(data_dir: &PathBuf) -> io::Result<()> {
@@ -952,15 +1108,35 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .focus-paused { background:var(--warn); border-color:var(--warn); color:white; }
 .focus-stop-active { border-color:var(--bad); color:var(--bad); }
 .grid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; }
-.metric, .timeline, .apps, .explain, .history { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
+.metric, .timeline, .apps, .explain, .history, .report { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
 .metric strong { display:block; font-size:28px; }
 .muted { color:var(--muted); }
 .explain { display:none; }
 .explain.open { display:block; }
 .history { display:none; }
 .history.open { display:block; }
+.report { display:none; }
+.report.open { display:grid; gap:16px; }
 .explain-grid { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:12px; }
 .history-grid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:10px; }
+.report-grid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; }
+.report-two { display:grid; grid-template-columns:1.2fr 1fr; gap:16px; align-items:start; }
+.report h2, .report h3 { margin:0; }
+.report-card { border:1px solid var(--line); border-radius:8px; padding:14px; min-width:0; }
+.report-card strong { display:block; font-size:24px; margin-top:4px; }
+.bar-row { display:grid; grid-template-columns:minmax(110px, 1fr) 2fr 72px; gap:10px; align-items:center; margin:10px 0; }
+.bar-track { height:12px; background:color-mix(in srgb, var(--line) 55%, transparent); border-radius:999px; overflow:hidden; }
+.bar-fill { height:100%; background:var(--good); border-radius:999px; min-width:2px; }
+.bar-fill.bad { background:var(--bad); }
+.split-chart { min-height:170px; border-radius:8px; background:conic-gradient(var(--good) var(--focus-angle), var(--bad) 0); border:1px solid var(--line); display:grid; place-items:center; }
+.split-chart span { background:var(--panel); border:1px solid var(--line); border-radius:999px; padding:18px 20px; font-weight:750; }
+.hour-bars { display:grid; grid-template-columns:repeat(12, minmax(12px, 1fr)); gap:8px; align-items:end; min-height:140px; }
+.hour-bar { display:grid; align-items:end; height:120px; gap:2px; }
+.hour-good, .hour-bad { border-radius:4px 4px 0 0; min-height:2px; }
+.hour-good { background:var(--good); }
+.hour-bad { background:var(--bad); }
+.insights { display:grid; gap:8px; }
+.insights p { margin:0; padding:10px 12px; border:1px solid var(--line); border-radius:8px; }
 .explain h2 { margin:0 0 12px; font-size:16px; }
 .history h2 { margin:0 0 12px; font-size:16px; }
 .explain h3, .history h3 { margin:0 0 4px; font-size:13px; }
@@ -971,7 +1147,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .productive { color:var(--good); background:color-mix(in srgb, var(--good) 15%, transparent); }
 .distracting { color:var(--bad); background:color-mix(in srgb, var(--bad) 14%, transparent); }
 .two { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
-@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid { grid-template-columns:1fr; display:grid; } header { align-items:start; } }
+@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row { grid-template-columns:1fr; display:grid; } header { align-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } }
 </style>
 </head>
 <body>
@@ -995,6 +1171,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
   </section>
   <section class="bar">
     <button id="explainToggle" onclick="toggleExplain()" aria-expanded="false">Explain report</button>
+    <button id="focusReportButton" onclick="generateFocusReport()">Focus report</button>
   </section>
   <section class="explain" id="explainPanel">
     <h2>Report meaning</h2>
@@ -1006,6 +1183,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
     </div>
   </section>
   <section class="grid" id="metrics"></section>
+  <section class="report" id="focusReportPanel" aria-live="polite"></section>
   <section class="bar">
     <button id="historyToggle" onclick="toggleHistory()" aria-expanded="false">Previous reports</button>
   </section>
@@ -1034,6 +1212,8 @@ async function stopFocus() { await fetch('/api/focus/stop'); refresh(); }
 async function pauseFocus() { await fetch('/api/focus/pause'); refresh(); }
 async function resetReport() {
   await fetch('/api/report/reset');
+  document.querySelector('#focusReportPanel').classList.remove('open');
+  document.querySelector('#focusReportPanel').innerHTML = '';
   refresh();
 }
 async function addBlock() {
@@ -1075,6 +1255,82 @@ function toggleHistory() {
   const open = panel.classList.toggle('open');
   button.setAttribute('aria-expanded', String(open));
   button.textContent = open ? 'Hide previous reports' : 'Previous reports';
+}
+async function generateFocusReport() {
+  const button = document.querySelector('#focusReportButton');
+  const panel = document.querySelector('#focusReportPanel');
+  const target = document.querySelector('#target').value || '';
+  button.textContent = 'Building report...';
+  button.disabled = true;
+  try {
+    const report = await fetch(`/api/focus-report?target=${encodeURIComponent(target)}`).then(r => r.json());
+    panel.innerHTML = renderFocusReport(report);
+    panel.classList.add('open');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Focus report';
+  }
+}
+function renderFocusReport(report) {
+  if (!report.targets.length) {
+    return `<div><h2>Focus report</h2><p class="muted">Add one or more focus apps or websites first, then run the report.</p></div>`;
+  }
+  const total = report.focusSeconds + report.outsideSeconds;
+  const maxTarget = Math.max(1, ...report.targetBreakdown.map(item => item.seconds));
+  const maxHour = Math.max(1, ...report.hourly.map(item => item.productiveSeconds + item.distractingSeconds));
+  const focusAngle = `${Math.max(0, Math.min(100, report.focusPercent))}%`;
+  const targetBars = report.targetBreakdown.map(item => `
+    <div class="bar-row">
+      <div>${sourceMarkup(item.target, `focus-${escapeAttr(item.target)}`)}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${Math.max(2, item.seconds * 100 / maxTarget)}%"></div></div>
+      <div class="muted">${formatDuration(item.seconds)}</div>
+    </div>`).join('');
+  const distractionRows = report.topDistractions.map((item, index) => `
+    <div class="bar-row">
+      <div><strong>${escapeHtml(item.app)}</strong><br>${sourceMarkup(item.source || 'local', `distraction-${index}`)}</div>
+      <div class="bar-track"><div class="bar-fill bad" style="width:${Math.max(2, item.seconds * 100 / Math.max(1, report.outsideSeconds))}%"></div></div>
+      <div class="muted">${formatDuration(item.seconds)}</div>
+    </div>`).join('') || '<p class="muted">No outside-focus activity in this report window.</p>';
+  const recentHours = report.hourly.slice(-12);
+  const hours = recentHours.map(item => {
+    const productiveHeight = Math.max(2, item.productiveSeconds * 100 / maxHour);
+    const distractingHeight = Math.max(2, item.distractingSeconds * 100 / maxHour);
+    return `<div title="${fmtTime(item.hour)}">
+      <div class="hour-bar">
+        <div class="hour-good" style="height:${productiveHeight}%"></div>
+        <div class="hour-bad" style="height:${distractingHeight}%"></div>
+      </div>
+      <div class="muted" style="font-size:11px;text-align:center">${new Date(item.hour * 1000).toLocaleTimeString([], {hour:'numeric'})}</div>
+    </div>`;
+  }).join('') || '<p class="muted">No hourly data yet.</p>';
+  const bestTarget = report.targetBreakdown.find(item => item.seconds > 0);
+  const mainDistraction = report.topDistractions[0];
+  const insights = [
+    report.focusPercent >= 70 ? `Strong alignment: ${report.focusPercent}% of tracked time matched your focus list.` : `Focus drift is high: ${report.focusPercent}% of tracked time matched your focus list.`,
+    bestTarget ? `Most time was spent on ${bestTarget.target}: ${formatDuration(bestTarget.seconds)}.` : 'No tracked time matched the current focus list yet.',
+    mainDistraction ? `Largest outside-focus item: ${mainDistraction.app} for ${formatDuration(mainDistraction.seconds)}.` : 'No outside-focus distractions were detected.',
+    total ? `Productivity score for this report is ${report.score}/100 across ${formatDuration(total)}.` : 'The report will get richer after more tracked activity.'
+  ].map(text => `<p>${escapeHtml(text)}</p>`).join('');
+  return `
+    <div class="bar"><h2>Focus report</h2><span class="muted">Generated ${new Date(report.generatedAt * 1000).toLocaleString([], {dateStyle:'short', timeStyle:'short'})}</span></div>
+    <div class="report-grid">
+      <div class="report-card"><span class="muted">Focus score</span><strong>${report.score}</strong></div>
+      <div class="report-card"><span class="muted">Matched focus list</span><strong>${formatDuration(report.focusSeconds)}</strong></div>
+      <div class="report-card"><span class="muted">Outside focus</span><strong>${formatDuration(report.outsideSeconds)}</strong></div>
+      <div class="report-card"><span class="muted">Alignment</span><strong>${report.focusPercent}%</strong></div>
+    </div>
+    <div class="report-two">
+      <div class="report-card"><h3>Time on focus apps and websites</h3>${targetBars || '<p class="muted">No target activity yet.</p>'}</div>
+      <div class="report-card">
+        <h3>Focus split</h3>
+        <div class="split-chart" style="--focus-angle:${focusAngle}"><span>${report.focusPercent}% focused</span></div>
+      </div>
+    </div>
+    <div class="report-two">
+      <div class="report-card"><h3>Productive vs distracted by hour</h3><div class="hour-bars">${hours}</div></div>
+      <div class="report-card"><h3>Analysis</h3><div class="insights">${insights}</div></div>
+    </div>
+    <div class="report-card"><h3>Top outside-focus activity</h3>${distractionRows}</div>`;
 }
 async function refresh() {
   const [timeline, report, state, history] = await Promise.all([
@@ -1139,7 +1395,7 @@ function updateFocusButtons(focus) {
 function sourceMarkup(source, index) {
   const shortSource = shortenSource(source);
   if (shortSource === source) return `<span>${escapeHtml(source)}</span>`;
-  return `<button class="source-toggle" data-full="${escapeHtml(source)}" data-short="${escapeHtml(shortSource)}" onclick="toggleSource(event, ${index})">${escapeHtml(shortSource)}</button>`;
+  return `<button class="source-toggle" data-full="${escapeHtml(source)}" data-short="${escapeHtml(shortSource)}" onclick="toggleSource(event)">${escapeHtml(shortSource)}</button>`;
 }
 function toggleSource(event) {
   const button = event.currentTarget;
@@ -1170,6 +1426,9 @@ function formatDuration(seconds) {
 }
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+}
+function escapeAttr(value) {
+  return String(value).replace(/[^a-z0-9_-]/gi, '-');
 }
 restoreFocusDraft();
 refresh();
