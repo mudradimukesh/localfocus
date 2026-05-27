@@ -42,6 +42,8 @@ struct FocusSession {
     paused_total_seconds: i64,
     pomodoro_alerted_at: Option<i64>,
     alert_delay_seconds: u64,
+    alert_action: String,
+    redirect_app: String,
 }
 
 #[derive(Default)]
@@ -247,6 +249,8 @@ fn start_focus(
         paused_total_seconds: 0,
         pomodoro_alerted_at: None,
         alert_delay_seconds: DEFAULT_ALERT_DELAY_SECONDS,
+        alert_action: "alert".into(),
+        redirect_app: String::new(),
     };
     save_focus(&data_dir, &session)?;
     let target_note = if session.target.trim().is_empty() {
@@ -313,7 +317,13 @@ fn detect_distraction(
                 focus.target,
                 sample.app
             );
-            os_alert("Focus warning", &message);
+            if focus.alert_action == "switch" && !focus.redirect_app.trim().is_empty() {
+                if activate_app(&focus.redirect_app).is_err() {
+                    os_alert("Focus warning", &message);
+                }
+            } else {
+                os_alert("Focus warning", &message);
+            }
             guard.last_focus_mismatch_at = sample.timestamp;
             append_event(data_dir, "focus_target_mismatch", &message)?;
         }
@@ -735,6 +745,15 @@ fn handle_http(
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(DEFAULT_ALERT_DELAY_SECONDS)
             .clamp(10, 60 * 60);
+        let alert_action = params
+            .get("alertAction")
+            .filter(|action| action.as_str() == "switch")
+            .cloned()
+            .unwrap_or_else(|| "alert".into());
+        let redirect_app = params
+            .get("redirectApp")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
         let session = FocusSession {
             task,
             target,
@@ -745,6 +764,8 @@ fn handle_http(
             paused_total_seconds: 0,
             pomodoro_alerted_at: None,
             alert_delay_seconds,
+            alert_action,
+            redirect_app,
         };
         save_focus(&data_dir, &session)?;
         if let Ok(mut state) = state.lock() {
@@ -1158,12 +1179,14 @@ fn state_json(focus: Option<FocusSession>) -> String {
             let elapsed = focus_elapsed_seconds(&focus, now());
             let remaining = ((focus.duration_minutes * 60) as i64 - elapsed).max(0);
             format!(
-                "{{\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"paused\":{},\"remainingSeconds\":{}}}}}",
+                "{{\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\",\"paused\":{},\"remainingSeconds\":{}}}}}",
                 json_escape(&focus.task),
                 json_escape(&focus.target),
                 focus.started_at,
                 focus.duration_minutes,
                 focus.alert_delay_seconds,
+                json_escape(&focus.alert_action),
+                json_escape(&focus.redirect_app),
                 focus.paused_at.is_some(),
                 remaining
             )
@@ -1211,7 +1234,7 @@ header { display:flex; align-items:center; justify-content:space-between; gap:16
 h1 { margin:0; font-size:20px; }
 main { max-width:1120px; margin:0 auto; padding:24px; display:grid; gap:18px; }
 .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
-input, button { border:1px solid var(--line); border-radius:6px; padding:9px 11px; background:var(--panel); color:var(--ink); }
+input, select, button { border:1px solid var(--line); border-radius:6px; padding:9px 11px; background:var(--panel); color:var(--ink); }
 button { cursor:pointer; font-weight:650; }
 button:disabled { cursor:not-allowed; opacity:.55; }
 .source-toggle { display:inline; max-width:100%; padding:0; border:0; background:transparent; color:var(--ink); font:inherit; font-weight:500; text-align:left; overflow-wrap:anywhere; }
@@ -1276,6 +1299,11 @@ button:disabled { cursor:not-allowed; opacity:.55; }
     <input id="target" placeholder="Focus apps/sites, comma separated" aria-label="Focus targets">
     <input id="minutes" type="number" min="1" max="180" value="25" aria-label="Minutes">
     <input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Alert after minutes" title="Alert after minutes outside focus">
+    <select id="alertAction" aria-label="After delay action" title="After delay action">
+      <option value="alert">Show alert</option>
+      <option value="switch">Move to app</option>
+    </select>
+    <input id="redirectApp" placeholder="App to open, e.g. Codex" aria-label="Move focus to app">
     <button id="startFocus" class="focus-btn focus-idle" onclick="startFocus()">Start focus</button>
     <button id="pauseFocus" class="focus-btn" onclick="pauseFocus()" disabled>Pause</button>
     <button id="stopFocus" class="focus-btn" onclick="stopFocus()" disabled>Stop</button>
@@ -1323,7 +1351,9 @@ async function startFocus() {
   const target = encodeURIComponent(document.querySelector('#target').value || '');
   const mins = encodeURIComponent(document.querySelector('#minutes').value || '25');
   const alertSeconds = encodeURIComponent(Math.max(1, Number(document.querySelector('#alertMinutes').value || '1')) * 60);
-  await fetch(`/api/focus/start?task=${task}&target=${target}&minutes=${mins}&alertSeconds=${alertSeconds}`);
+  const alertAction = encodeURIComponent(document.querySelector('#alertAction').value || 'alert');
+  const redirectApp = encodeURIComponent(document.querySelector('#redirectApp').value || '');
+  await fetch(`/api/focus/start?task=${task}&target=${target}&minutes=${mins}&alertSeconds=${alertSeconds}&alertAction=${alertAction}&redirectApp=${redirectApp}`);
   refresh();
 }
 async function stopFocus() { await fetch('/api/focus/stop'); refresh(); }
@@ -1347,7 +1377,9 @@ function saveFocusDraft() {
     task: document.querySelector('#task').value,
     target: document.querySelector('#target').value,
     minutes: document.querySelector('#minutes').value,
-    alertMinutes: document.querySelector('#alertMinutes').value
+    alertMinutes: document.querySelector('#alertMinutes').value,
+    alertAction: document.querySelector('#alertAction').value,
+    redirectApp: document.querySelector('#redirectApp').value
   }));
 }
 function restoreFocusDraft() {
@@ -1357,9 +1389,12 @@ function restoreFocusDraft() {
     if (draft.target) document.querySelector('#target').value = draft.target;
     if (draft.minutes) document.querySelector('#minutes').value = draft.minutes;
     if (draft.alertMinutes) document.querySelector('#alertMinutes').value = draft.alertMinutes;
+    if (draft.alertAction) document.querySelector('#alertAction').value = draft.alertAction;
+    if (draft.redirectApp) document.querySelector('#redirectApp').value = draft.redirectApp;
   } catch {}
-  ['#task', '#target', '#minutes', '#alertMinutes'].forEach(selector => {
+  ['#task', '#target', '#minutes', '#alertMinutes', '#alertAction', '#redirectApp'].forEach(selector => {
     document.querySelector(selector).addEventListener('input', saveFocusDraft);
+    document.querySelector(selector).addEventListener('change', saveFocusDraft);
   });
 }
 function toggleExplain() {
@@ -1490,7 +1525,7 @@ async function refresh() {
   updateFocusButtons(state.focus);
   seedFocusInputsFromActiveSession(state.focus);
   document.querySelector('#focusState').textContent = state.focus
-    ? `Focus: ${state.focus.task}${state.focus.target ? ' in ' + state.focus.target : ''}${state.focus.paused ? ' (paused)' : ''}`
+    ? `Focus: ${state.focus.task}${state.focus.target ? ' in ' + state.focus.target : ''} - after ${formatDuration(state.focus.alertDelaySeconds || 60)} ${state.focus.alertAction === 'switch' && state.focus.redirectApp ? 'move to ' + state.focus.redirectApp : 'show alert'}${state.focus.paused ? ' (paused)' : ''}`
     : 'No active focus session - alerts off';
 }
 function seedFocusInputsFromActiveSession(focus) {
@@ -1499,10 +1534,14 @@ function seedFocusInputsFromActiveSession(focus) {
   const taskInput = document.querySelector('#task');
   const minutesInput = document.querySelector('#minutes');
   const alertInput = document.querySelector('#alertMinutes');
+  const actionInput = document.querySelector('#alertAction');
+  const redirectInput = document.querySelector('#redirectApp');
   if (!targetInput.value && focus.target) targetInput.value = focus.target;
   if (!taskInput.value && focus.task) taskInput.value = focus.task;
   if (!minutesInput.value && focus.durationMinutes) minutesInput.value = focus.durationMinutes;
   if (focus.alertDelaySeconds && (!alertInput.value || alertInput.value === '1')) alertInput.value = Math.max(1, Math.round(focus.alertDelaySeconds / 60));
+  if (focus.alertAction) actionInput.value = focus.alertAction;
+  if (!redirectInput.value && focus.redirectApp) redirectInput.value = focus.redirectApp;
   saveFocusDraft();
 }
 function updateFocusButtons(focus) {
@@ -1651,7 +1690,7 @@ fn save_focus(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<()> {
     fs::write(
         data_dir.join("focus.json"),
         format!(
-            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{},\"alertDelaySeconds\":{}}}",
+            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\"}}",
             json_escape(&focus.task),
             json_escape(&focus.target),
             focus.started_at,
@@ -1660,7 +1699,9 @@ fn save_focus(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<()> {
             paused_at,
             focus.paused_total_seconds,
             pomodoro_alerted_at,
-            focus.alert_delay_seconds
+            focus.alert_delay_seconds,
+            json_escape(&focus.alert_action),
+            json_escape(&focus.redirect_app)
         ),
     )
 }
@@ -1679,6 +1720,8 @@ fn load_focus(data_dir: &PathBuf) -> Option<FocusSession> {
         alert_delay_seconds: json_number(&value, "alertDelaySeconds")
             .map(|value| value.max(1) as u64)
             .unwrap_or(DEFAULT_ALERT_DELAY_SECONDS),
+        alert_action: json_string(&value, "alertAction").unwrap_or_else(|| "alert".into()),
+        redirect_app: json_string(&value, "redirectApp").unwrap_or_default(),
     })
 }
 
@@ -1767,6 +1810,60 @@ fn os_alert(title: &str, message: &str) {
             .arg(script)
             .spawn();
     }
+}
+
+fn activate_app(app_name: &str) -> io::Result<()> {
+    let app_name = app_name.trim();
+    if app_name.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing app name"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "tell application \"{}\" to activate",
+            apple_escape(app_name)
+        );
+        let status = Command::new("osascript").arg("-e").arg(script).status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "$name = '{}'; \
+             $shell = New-Object -ComObject WScript.Shell; \
+             if (-not $shell.AppActivate($name)) {{ exit 1 }}",
+            ps_escape(app_name)
+        );
+        let status = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "if command -v wmctrl >/dev/null 2>&1; then wmctrl -a '{}'; else exit 1; fi",
+                shell_escape(app_name)
+            ))
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::Other,
+        "could not activate app",
+    ))
 }
 
 fn parse_query(query: &str) -> HashMap<String, String> {
