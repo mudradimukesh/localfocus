@@ -1187,14 +1187,17 @@ function toggleSource(event) {
   button.dataset.fullShown = showingFull ? 'false' : 'true';
 }
 function shortenSource(source) {
-  if (!/^https?:\/\//i.test(source)) return source;
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(source)) return source;
   try {
     const url = new URL(source);
     const parts = url.pathname.split('/').filter(Boolean);
     const path = parts.length ? `/${parts[0]}/` : '/';
-    return `${url.protocol}//${url.host}${path}`;
+    if (url.host) return `${url.protocol}//${url.host}${path}`;
+    if (url.protocol === 'chrome:' && url.pathname) return `${url.protocol}//${url.pathname.split('/').filter(Boolean)[0] || ''}/`;
+    return `${url.protocol}${path}`;
   } catch {
-    return source;
+    const match = source.match(/^([a-z][a-z0-9+.-]*:\/\/[^/?#]+)(?:[/?#]|$)/i);
+    return match ? `${match[1]}/` : source;
   }
 }
 function formatDuration(seconds) {
