@@ -1820,10 +1820,20 @@ fn activate_app(app_name: &str) -> io::Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        let script = format!(
-            "tell application \"{}\" to activate",
-            apple_escape(app_name)
-        );
+        let open_status = Command::new("open").args(["-a", app_name]).status()?;
+        if open_status.success() {
+            let frontmost_script = format!(
+                "tell application \"System Events\" to set frontmost of first process whose name is \"{}\" to true",
+                apple_escape(app_name)
+            );
+            let _ = Command::new("osascript")
+                .arg("-e")
+                .arg(frontmost_script)
+                .status();
+            return Ok(());
+        }
+
+        let script = format!("tell application \"{}\" to activate", apple_escape(app_name));
         let status = Command::new("osascript").arg("-e").arg(script).status()?;
         if status.success() {
             return Ok(());
