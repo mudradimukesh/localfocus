@@ -5,7 +5,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1776,7 +1776,7 @@ fn os_alert(title: &str, message: &str) {
             apple_escape(message),
             apple_escape(&alert_title)
         );
-        let _ = Command::new("osascript").arg("-e").arg(script).spawn();
+        spawn_macos_focus_alert(script);
     }
 
     #[cfg(target_os = "windows")]
@@ -1817,25 +1817,23 @@ fn os_alert_then_activate(title: &str, message: &str, app_name: &str) {
 
     #[cfg(target_os = "macos")]
     {
-        thread::spawn(move || {
-            let alert_title = format!("FOCUS WARNING - {}", title.to_uppercase());
-            let script = format!(
-                "set targetApp to \"{}\"\n\
-                 display dialog \"{}\" with title \"{}\" buttons {{\"OK\"}} default button \"OK\" with icon caution\n\
-                 do shell script \"open -a \" & quoted form of targetApp\n\
-                 delay 0.4\n\
-                 try\n\
-                 \ttell application targetApp to activate\n\
-                 end try\n\
-                 try\n\
-                 \ttell application \"System Events\" to set frontmost of first process whose name is targetApp to true\n\
-                 end try",
-                apple_escape(&app_name),
-                apple_escape(&message),
-                apple_escape(&alert_title)
-            );
-            let _ = Command::new("osascript").arg("-e").arg(script).status();
-        });
+        let alert_title = format!("FOCUS WARNING - {}", title.to_uppercase());
+        let script = format!(
+            "set targetApp to \"{}\"\n\
+             display dialog \"{}\" with title \"{}\" buttons {{\"OK\"}} default button \"OK\" with icon caution\n\
+             do shell script \"open -a \" & quoted form of targetApp\n\
+             delay 0.4\n\
+             try\n\
+             \ttell application targetApp to activate\n\
+             end try\n\
+             try\n\
+             \ttell application \"System Events\" to set frontmost of first process whose name is targetApp to true\n\
+             end try",
+            apple_escape(&app_name),
+            apple_escape(&message),
+            apple_escape(&alert_title)
+        );
+        spawn_macos_focus_alert(script);
         return;
     }
 
@@ -1844,6 +1842,41 @@ fn os_alert_then_activate(title: &str, message: &str, app_name: &str) {
         let acknowledged = os_alert_blocking(&title, &message);
         if acknowledged {
             let _ = activate_app(&app_name);
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn active_alert_pid() -> &'static Mutex<Option<u32>> {
+    static ACTIVE_ALERT_PID: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
+    ACTIVE_ALERT_PID.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(target_os = "macos")]
+fn close_existing_focus_alert() {
+    let pid = active_alert_pid().lock().ok().and_then(|mut active| active.take());
+    if let Some(pid) = pid {
+        let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_macos_focus_alert(script: String) {
+    close_existing_focus_alert();
+    let Ok(mut child) = Command::new("osascript").arg("-e").arg(script).spawn() else {
+        return;
+    };
+    let pid = child.id();
+    if let Ok(mut active) = active_alert_pid().lock() {
+        *active = Some(pid);
+    }
+
+    thread::spawn(move || {
+        let _ = child.wait();
+        if let Ok(mut active) = active_alert_pid().lock() {
+            if matches!(*active, Some(active_pid) if active_pid == pid) {
+                *active = None;
+            }
         }
     });
 }
