@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const APP_NAME: &str = "local-focus";
 const SAMPLE_SECONDS: u64 = 5;
 const DISTRACTION_SECONDS: i64 = 90;
-const FOCUS_MISMATCH_SECONDS: i64 = 60;
+const DEFAULT_ALERT_DELAY_SECONDS: u64 = 60;
 const IDLE_SECONDS: u64 = 60;
 
 #[derive(Clone, Debug)]
@@ -41,6 +41,7 @@ struct FocusSession {
     paused_at: Option<i64>,
     paused_total_seconds: i64,
     pomodoro_alerted_at: Option<i64>,
+    alert_delay_seconds: u64,
 }
 
 #[derive(Default)]
@@ -245,6 +246,7 @@ fn start_focus(
         paused_at: None,
         paused_total_seconds: 0,
         pomodoro_alerted_at: None,
+        alert_delay_seconds: DEFAULT_ALERT_DELAY_SECONDS,
     };
     save_focus(&data_dir, &session)?;
     let target_note = if session.target.trim().is_empty() {
@@ -288,6 +290,11 @@ fn detect_distraction(
         .is_some_and(|focus| !matches_focus_target(focus, sample));
 
     if focused && focus_mismatch {
+        let alert_delay = guard
+            .focus
+            .as_ref()
+            .map(|focus| focus.alert_delay_seconds.max(1) as i64)
+            .unwrap_or(DEFAULT_ALERT_DELAY_SECONDS as i64);
         let mismatch_started_at = match guard.focus_mismatch_started_at {
             Some(started_at) => started_at,
             None => {
@@ -296,14 +303,15 @@ fn detect_distraction(
             }
         };
         let mismatch_duration = sample.timestamp - mismatch_started_at;
-        let alert_cooldown_passed =
-            sample.timestamp - guard.last_focus_mismatch_at >= FOCUS_MISMATCH_SECONDS;
+        let alert_cooldown_passed = sample.timestamp - guard.last_focus_mismatch_at >= alert_delay;
 
-        if mismatch_duration >= FOCUS_MISMATCH_SECONDS && alert_cooldown_passed {
+        if mismatch_duration >= alert_delay && alert_cooldown_passed {
             let focus = guard.focus.as_ref().expect("focus checked above");
             let message = format!(
-                "You have been outside your focus apps/sites for over 1 minute. Allowed: '{}'. Current activity: {}",
-                focus.target, sample.app
+                "You have been outside your focus apps/sites for over {}. Allowed: '{}'. Current activity: {}",
+                human_duration(alert_delay as u64),
+                focus.target,
+                sample.app
             );
             os_alert("Focus warning", &message);
             guard.last_focus_mismatch_at = sample.timestamp;
@@ -437,6 +445,18 @@ fn focus_targets(focus: &FocusSession) -> Vec<String> {
         .filter(|target| !target.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn human_duration(seconds: u64) -> String {
+    if seconds == 60 {
+        "1 minute".into()
+    } else if seconds % 60 == 0 {
+        format!("{} minutes", seconds / 60)
+    } else if seconds == 1 {
+        "1 second".into()
+    } else {
+        format!("{seconds} seconds")
+    }
 }
 
 fn normalize_match_text(value: &str) -> String {
@@ -710,6 +730,11 @@ fn handle_http(
             .get("target")
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
+        let alert_delay_seconds = params
+            .get("alertSeconds")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_ALERT_DELAY_SECONDS)
+            .clamp(10, 60 * 60);
         let session = FocusSession {
             task,
             target,
@@ -719,6 +744,7 @@ fn handle_http(
             paused_at: None,
             paused_total_seconds: 0,
             pomodoro_alerted_at: None,
+            alert_delay_seconds,
         };
         save_focus(&data_dir, &session)?;
         if let Ok(mut state) = state.lock() {
@@ -1132,11 +1158,12 @@ fn state_json(focus: Option<FocusSession>) -> String {
             let elapsed = focus_elapsed_seconds(&focus, now());
             let remaining = ((focus.duration_minutes * 60) as i64 - elapsed).max(0);
             format!(
-                "{{\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"paused\":{},\"remainingSeconds\":{}}}}}",
+                "{{\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"paused\":{},\"remainingSeconds\":{}}}}}",
                 json_escape(&focus.task),
                 json_escape(&focus.target),
                 focus.started_at,
                 focus.duration_minutes,
+                focus.alert_delay_seconds,
                 focus.paused_at.is_some(),
                 remaining
             )
@@ -1248,6 +1275,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
     <input id="task" value="Deep work" aria-label="Focus task">
     <input id="target" placeholder="Focus apps/sites, comma separated" aria-label="Focus targets">
     <input id="minutes" type="number" min="1" max="180" value="25" aria-label="Minutes">
+    <input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Alert after minutes" title="Alert after minutes outside focus">
     <button id="startFocus" class="focus-btn focus-idle" onclick="startFocus()">Start focus</button>
     <button id="pauseFocus" class="focus-btn" onclick="pauseFocus()" disabled>Pause</button>
     <button id="stopFocus" class="focus-btn" onclick="stopFocus()" disabled>Stop</button>
@@ -1294,7 +1322,8 @@ async function startFocus() {
   const task = encodeURIComponent(document.querySelector('#task').value || 'Focus session');
   const target = encodeURIComponent(document.querySelector('#target').value || '');
   const mins = encodeURIComponent(document.querySelector('#minutes').value || '25');
-  await fetch(`/api/focus/start?task=${task}&target=${target}&minutes=${mins}`);
+  const alertSeconds = encodeURIComponent(Math.max(1, Number(document.querySelector('#alertMinutes').value || '1')) * 60);
+  await fetch(`/api/focus/start?task=${task}&target=${target}&minutes=${mins}&alertSeconds=${alertSeconds}`);
   refresh();
 }
 async function stopFocus() { await fetch('/api/focus/stop'); refresh(); }
@@ -1317,7 +1346,8 @@ function saveFocusDraft() {
   localStorage.setItem(focusDraftKey, JSON.stringify({
     task: document.querySelector('#task').value,
     target: document.querySelector('#target').value,
-    minutes: document.querySelector('#minutes').value
+    minutes: document.querySelector('#minutes').value,
+    alertMinutes: document.querySelector('#alertMinutes').value
   }));
 }
 function restoreFocusDraft() {
@@ -1326,8 +1356,9 @@ function restoreFocusDraft() {
     if (draft.task) document.querySelector('#task').value = draft.task;
     if (draft.target) document.querySelector('#target').value = draft.target;
     if (draft.minutes) document.querySelector('#minutes').value = draft.minutes;
+    if (draft.alertMinutes) document.querySelector('#alertMinutes').value = draft.alertMinutes;
   } catch {}
-  ['#task', '#target', '#minutes'].forEach(selector => {
+  ['#task', '#target', '#minutes', '#alertMinutes'].forEach(selector => {
     document.querySelector(selector).addEventListener('input', saveFocusDraft);
   });
 }
@@ -1467,9 +1498,11 @@ function seedFocusInputsFromActiveSession(focus) {
   const targetInput = document.querySelector('#target');
   const taskInput = document.querySelector('#task');
   const minutesInput = document.querySelector('#minutes');
+  const alertInput = document.querySelector('#alertMinutes');
   if (!targetInput.value && focus.target) targetInput.value = focus.target;
   if (!taskInput.value && focus.task) taskInput.value = focus.task;
   if (!minutesInput.value && focus.durationMinutes) minutesInput.value = focus.durationMinutes;
+  if (focus.alertDelaySeconds && (!alertInput.value || alertInput.value === '1')) alertInput.value = Math.max(1, Math.round(focus.alertDelaySeconds / 60));
   saveFocusDraft();
 }
 function updateFocusButtons(focus) {
@@ -1618,7 +1651,7 @@ fn save_focus(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<()> {
     fs::write(
         data_dir.join("focus.json"),
         format!(
-            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{}}}",
+            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{},\"alertDelaySeconds\":{}}}",
             json_escape(&focus.task),
             json_escape(&focus.target),
             focus.started_at,
@@ -1626,7 +1659,8 @@ fn save_focus(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<()> {
             focus.break_minutes,
             paused_at,
             focus.paused_total_seconds,
-            pomodoro_alerted_at
+            pomodoro_alerted_at,
+            focus.alert_delay_seconds
         ),
     )
 }
@@ -1642,6 +1676,9 @@ fn load_focus(data_dir: &PathBuf) -> Option<FocusSession> {
         paused_at: json_number(&value, "pausedAt"),
         paused_total_seconds: json_number(&value, "pausedTotalSeconds").unwrap_or(0),
         pomodoro_alerted_at: json_number(&value, "pomodoroAlertedAt"),
+        alert_delay_seconds: json_number(&value, "alertDelaySeconds")
+            .map(|value| value.max(1) as u64)
+            .unwrap_or(DEFAULT_ALERT_DELAY_SECONDS),
     })
 }
 
