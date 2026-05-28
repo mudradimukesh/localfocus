@@ -144,6 +144,16 @@ fn run_app(data_dir: PathBuf) -> io::Result<()> {
         });
     }
 
+    {
+        let daily_dir = data_dir.clone();
+        let daily_state = Arc::clone(&state);
+        thread::spawn(move || {
+            if let Err(error) = daily_report_loop(daily_dir, daily_state) {
+                eprintln!("daily report logger stopped: {error}");
+            }
+        });
+    }
+
     let listener = TcpListener::bind("127.0.0.1:4799")?;
     println!("Local Focus is running at http://127.0.0.1:4799");
     println!("Data stays on this machine: {}", data_dir.display());
@@ -229,6 +239,13 @@ fn focus_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<()> 
                 }
             }
         }
+    }
+}
+
+fn daily_report_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<()> {
+    loop {
+        maybe_log_previous_day_report(&data_dir, &state)?;
+        thread::sleep(Duration::from_secs(5 * 60));
     }
 }
 
@@ -848,6 +865,7 @@ fn handle_http(
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
         let since = params.get("since").and_then(|value| value.parse::<i64>().ok());
+        let until = params.get("until").and_then(|value| value.parse::<i64>().ok());
         let period = params
             .get("period")
             .map(|value| value.as_str())
@@ -855,7 +873,7 @@ fn handle_http(
         write_response(
             &mut stream,
             "application/json",
-            &focus_report_json(&data_dir, &target, since, period)?,
+            &focus_report_json(&data_dir, &target, since, until, period)?,
         )?;
     } else if path == "/api/report" {
         write_response(&mut stream, "application/json", &report_json(&data_dir)?)?;
@@ -967,13 +985,17 @@ fn focus_report_json(
     data_dir: &PathBuf,
     target_text: &str,
     since_override: Option<i64>,
+    until_override: Option<i64>,
     period: &str,
 ) -> io::Result<String> {
     let samples = load_samples(data_dir)?;
     let since = since_override
         .unwrap_or(report_window_start(data_dir)?.max(now() - 24 * 60 * 60))
         .max(0);
-    let recent: Vec<_> = samples.into_iter().filter(|s| s.timestamp >= since).collect();
+    let recent: Vec<_> = samples
+        .into_iter()
+        .filter(|s| s.timestamp >= since && until_override.map_or(true, |until| s.timestamp < until))
+        .collect();
     let targets = target_list_from_text(target_text);
     let target_json = targets
         .iter()
@@ -1207,6 +1229,107 @@ fn report_history_json(data_dir: &PathBuf) -> io::Result<String> {
     Ok(format!("[{}]", lines.join(",")))
 }
 
+fn maybe_log_previous_day_report(
+    data_dir: &PathBuf,
+    state: &Arc<Mutex<AppState>>,
+) -> io::Result<()> {
+    let Some((previous_day, previous_start, today_start)) = local_day_window() else {
+        return Ok(());
+    };
+    let marker_path = data_dir.join("last_daily_focus_report.txt");
+    let last_logged = fs::read_to_string(&marker_path).unwrap_or_default();
+    if last_logged.trim() == previous_day {
+        return Ok(());
+    }
+
+    let target = state
+        .lock()
+        .ok()
+        .and_then(|state| state.focus.as_ref().map(|focus| focus.target.clone()))
+        .or_else(|| load_focus(data_dir).map(|focus| focus.target))
+        .unwrap_or_default();
+    let report = focus_report_json(
+        data_dir,
+        &target,
+        Some(previous_start),
+        Some(today_start),
+        "day",
+    )?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("daily_focus_reports.jsonl"))?;
+    writeln!(
+        file,
+        "{{\"day\":\"{}\",\"archivedAt\":{},\"report\":{}}}",
+        json_escape(&previous_day),
+        now(),
+        report
+    )?;
+    fs::write(marker_path, previous_day)
+}
+
+fn local_day_window() -> Option<(String, i64, i64)> {
+    #[cfg(target_os = "macos")]
+    {
+        let today = command_text("date", &["+%Y-%m-%d"])?;
+        let yesterday = command_text("date", &["-v-1d", "+%Y-%m-%d"])?;
+        let today_start = command_text(
+            "date",
+            &["-j", "-f", "%Y-%m-%d %H:%M:%S", &format!("{today} 00:00:00"), "+%s"],
+        )?
+        .parse()
+        .ok()?;
+        let yesterday_start = command_text(
+            "date",
+            &[
+                "-j",
+                "-f",
+                "%Y-%m-%d %H:%M:%S",
+                &format!("{yesterday} 00:00:00"),
+                "+%s",
+            ],
+        )?
+        .parse()
+        .ok()?;
+        return Some((yesterday, yesterday_start, today_start));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let today = command_text("date", &["+%Y-%m-%d"])?;
+        let yesterday = command_text("date", &["-d", "yesterday", "+%Y-%m-%d"])?;
+        let today_start = command_text("date", &["-d", &format!("{today} 00:00:00"), "+%s"])?
+            .parse()
+            .ok()?;
+        let yesterday_start =
+            command_text("date", &["-d", &format!("{yesterday} 00:00:00"), "+%s"])?
+                .parse()
+                .ok()?;
+        return Some((yesterday, yesterday_start, today_start));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = "$today=Get-Date -Hour 0 -Minute 0 -Second 0 -Millisecond 0; $y=$today.AddDays(-1); \"$($y.ToString('yyyy-MM-dd'))|$([int][double]::Parse((Get-Date $y -UFormat %s)))|$([int][double]::Parse((Get-Date $today -UFormat %s)))\"";
+        let value = command_text("powershell", &["-NoProfile", "-Command", script])?;
+        let mut parts = value.split('|');
+        let day = parts.next()?.to_string();
+        let start = parts.next()?.parse().ok()?;
+        let end = parts.next()?.parse().ok()?;
+        return Some((day, start, end));
+    }
+}
+
+fn command_text(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 fn report_window_start(data_dir: &PathBuf) -> io::Result<i64> {
     let path = data_dir.join("report_start.txt");
     if !path.exists() {
@@ -1373,8 +1496,13 @@ button:disabled { cursor:not-allowed; opacity:.55; }
   </section>
   <section class="bar">
     <button id="explainToggle" onclick="toggleExplain()" aria-expanded="false">Explain report</button>
-    <button id="focusReportButton" onclick="generateFocusReport()">Focus report</button>
-    <button id="dayFocusReportButton" onclick="generateDayFocusReport()">Focus report for day</button>
+    <div class="field"><label for="reportPeriod">Focus report for</label><select id="reportPeriod" aria-label="Focus report period">
+      <option value="day">Day</option>
+      <option value="week">Week</option>
+      <option value="month">Month</option>
+      <option value="year">Year</option>
+    </select></div>
+    <button id="focusReportButton" onclick="generateSelectedFocusReport()">Generate report</button>
   </section>
   <section class="explain" id="explainPanel">
     <h2>Report meaning</h2>
@@ -1470,42 +1598,40 @@ function toggleHistory() {
   button.setAttribute('aria-expanded', String(open));
   button.textContent = open ? 'Hide previous reports' : 'Previous reports';
 }
-async function generateFocusReport() {
+async function generateSelectedFocusReport() {
   const button = document.querySelector('#focusReportButton');
   const panel = document.querySelector('#focusReportPanel');
   const target = document.querySelector('#target').value || '';
+  const period = document.querySelector('#reportPeriod').value || 'day';
+  const since = Math.floor(periodStart(period).getTime() / 1000);
   button.textContent = 'Building report...';
   button.disabled = true;
   try {
-    const report = await fetch(`/api/focus-report?target=${encodeURIComponent(target)}`).then(r => r.json());
+    const report = await fetch(`/api/focus-report?target=${encodeURIComponent(target)}&since=${since}&period=${encodeURIComponent(period)}`).then(r => r.json());
     panel.innerHTML = renderFocusReport(report);
     panel.classList.add('open');
   } finally {
     button.disabled = false;
-    button.textContent = 'Focus report';
+    button.textContent = 'Generate report';
   }
 }
-async function generateDayFocusReport() {
-  const button = document.querySelector('#dayFocusReportButton');
-  const panel = document.querySelector('#focusReportPanel');
-  const target = document.querySelector('#target').value || '';
-  const startOfDay = new Date();
-  startOfDay.setHours(0, 0, 0, 0);
-  const since = Math.floor(startOfDay.getTime() / 1000);
-  button.textContent = 'Building day report...';
-  button.disabled = true;
-  try {
-    const report = await fetch(`/api/focus-report?target=${encodeURIComponent(target)}&since=${since}&period=day`).then(r => r.json());
-    panel.innerHTML = renderFocusReport(report);
-    panel.classList.add('open');
-  } finally {
-    button.disabled = false;
-    button.textContent = 'Focus report for day';
+function periodStart(period) {
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  if (period === 'week') {
+    const day = start.getDay();
+    const offset = day === 0 ? 6 : day - 1;
+    start.setDate(start.getDate() - offset);
+  } else if (period === 'month') {
+    start.setDate(1);
+  } else if (period === 'year') {
+    start.setMonth(0, 1);
   }
+  return start;
 }
 function renderFocusReport(report) {
-  const isDay = report.period === 'day';
-  const reportTitle = isDay ? 'Focus report for day' : 'Focus report';
+  const periodName = report.period ? report.period[0].toUpperCase() + report.period.slice(1) : 'Report';
+  const reportTitle = `Focus report for ${periodName.toLowerCase()}`;
   if (!report.targets.length) {
     return `<div><h2>${reportTitle}</h2><p class="muted">Add one or more focus apps or websites first, then run the report.</p></div>`;
   }
@@ -1556,10 +1682,10 @@ function renderFocusReport(report) {
     bestTarget ? `Most time was spent on ${bestTarget.target}: ${formatDuration(bestTarget.seconds)}.` : 'No tracked time matched the current focus list yet.',
     report.idleSeconds ? `Idle time was ${formatDuration(report.idleSeconds)}, including idle periods inside focus apps or websites.` : 'No idle time was detected in this report window.',
     mainDistraction ? `Largest outside-focus item: ${mainDistraction.app} for ${formatDuration(mainDistraction.seconds)}.` : 'No outside-focus distractions were detected.',
-    total ? `${isDay ? 'Whole-day' : 'Report'} tracked time is ${formatDuration(total)}.` : 'The report will get richer after more tracked activity.'
+    total ? `${periodName} tracked time is ${formatDuration(total)}.` : 'The report will get richer after more tracked activity.'
   ].map(text => `<p>${escapeHtml(text)}</p>`).join('');
   return `
-    <div class="bar"><h2>${reportTitle}</h2><span class="muted">${isDay ? 'Since midnight' : 'Current report window'} - generated ${new Date(report.generatedAt * 1000).toLocaleString([], {dateStyle:'short', timeStyle:'short'})}</span></div>
+    <div class="bar"><h2>${reportTitle}</h2><span class="muted">Since ${new Date(report.windowStart * 1000).toLocaleString([], {dateStyle:'short', timeStyle:'short'})} - generated ${new Date(report.generatedAt * 1000).toLocaleString([], {dateStyle:'short', timeStyle:'short'})}</span></div>
     <div class="report-grid">
       <div class="report-card"><span class="muted">Total time</span><strong>${formatDuration(total)}</strong></div>
       <div class="report-card"><span class="muted">Matched focus list</span><strong>${formatDuration(report.focusSeconds)}</strong></div>
