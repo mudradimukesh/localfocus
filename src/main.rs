@@ -1404,6 +1404,17 @@ main { max-width:1120px; margin:0 auto; padding:24px; display:grid; gap:18px; }
 input, select, button { border:1px solid var(--line); border-radius:6px; padding:9px 11px; background:var(--panel); color:var(--ink); }
 button { cursor:pointer; font-weight:650; }
 button:disabled { cursor:not-allowed; opacity:.55; }
+.focus-shell { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; display:grid; gap:14px; }
+.focus-shell-head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.focus-shell h2 { margin:0; font-size:16px; }
+.focus-form { display:grid; grid-template-columns:minmax(260px, 2fr) repeat(4, minmax(130px, 1fr)); gap:12px; align-items:end; }
+.focus-actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+.status-chip { border:1px solid var(--line); border-radius:999px; padding:6px 10px; background:color-mix(in srgb, var(--line) 25%, transparent); color:var(--muted); font-weight:700; }
+.status-chip.running { color:var(--good); border-color:color-mix(in srgb, var(--good) 45%, var(--line)); background:color-mix(in srgb, var(--good) 10%, transparent); }
+.status-chip.paused { color:var(--warn); border-color:color-mix(in srgb, var(--warn) 45%, var(--line)); background:color-mix(in srgb, var(--warn) 12%, transparent); }
+.focus-details-toggle { padding:6px 10px; }
+.focus-details { display:none; border-top:1px solid var(--line); padding-top:12px; color:var(--muted); overflow-wrap:anywhere; }
+.focus-details.open { display:block; }
 .field { display:grid; gap:4px; }
 .field label { color:var(--muted); font-size:12px; font-weight:650; }
 .field input, .field select { width:100%; min-width:150px; }
@@ -1473,28 +1484,38 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .distracting { color:var(--bad); background:color-mix(in srgb, var(--bad) 14%, transparent); }
 .idle { color:var(--warn); background:color-mix(in srgb, var(--warn) 16%, transparent); }
 .two { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
-@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row { grid-template-columns:1fr; display:grid; } header { align-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } }
+@media (max-width:900px) { .focus-form { grid-template-columns:1fr 1fr; } }
+@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form { grid-template-columns:1fr; display:grid; } header { align-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } }
 </style>
 </head>
 <body>
 <header>
   <div><h1>Local Focus</h1><div class="muted">Private activity timeline, focus sessions, and reports. All data stays on this device.</div></div>
-  <div id="focusState" class="muted"></div>
+  <div id="focusState" class="status-chip"></div>
 </header>
 <main>
-  <section class="bar">
-    <div class="field field-wide"><label for="target">Focus apps and websites</label><input id="target" placeholder="Pages, https://claude.ai/" aria-label="Focus targets"></div>
-    <div class="field"><label for="minutes">Focus timer</label><input id="minutes" type="number" min="1" max="180" value="25" aria-label="Minutes"></div>
-    <div class="field"><label for="alertMinutes">Warn after</label><input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Alert after minutes" title="Alert after minutes outside focus"></div>
-    <div class="field"><label for="alertAction">Warning action</label><select id="alertAction" aria-label="After delay action" title="After delay action">
-      <option value="alert">Show alert</option>
-      <option value="switch">Move to app</option>
-    </select></div>
-    <div class="field"><label for="redirectApp">App to move to</label><input id="redirectApp" placeholder="Pages" aria-label="Move focus to app"></div>
-    <button id="startFocus" class="focus-btn focus-idle" onclick="startFocus()">Start focus</button>
-    <button id="pauseFocus" class="focus-btn" onclick="pauseFocus()" disabled>Pause</button>
-    <button id="stopFocus" class="focus-btn" onclick="stopFocus()" disabled>Stop</button>
-    <button onclick="resetReport()">Refresh</button>
+  <section class="focus-shell">
+    <div class="focus-shell-head">
+      <div><h2>Focus setup</h2><div class="muted">Choose the apps and sites that count as focused work.</div></div>
+      <button id="focusDetailsToggle" class="focus-details-toggle" onclick="toggleFocusDetails()" aria-expanded="false">Show focus details</button>
+    </div>
+    <div class="focus-form">
+      <div class="field field-wide"><label for="target">Focus apps and websites</label><input id="target" placeholder="Pages, https://claude.ai/" aria-label="Focus targets"></div>
+      <div class="field"><label for="minutes">Focus timer</label><input id="minutes" type="number" min="1" max="180" value="25" aria-label="Minutes"></div>
+      <div class="field"><label for="alertMinutes">Warn after</label><input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Alert after minutes" title="Alert after minutes outside focus"></div>
+      <div class="field"><label for="alertAction">Warning action</label><select id="alertAction" aria-label="After delay action" title="After delay action">
+        <option value="alert">Show alert</option>
+        <option value="switch">Move to app</option>
+      </select></div>
+      <div class="field"><label for="redirectApp">App to move to</label><input id="redirectApp" placeholder="Pages" aria-label="Move focus to app"></div>
+    </div>
+    <div class="focus-actions">
+      <button id="startFocus" class="focus-btn focus-idle" onclick="startFocus()">Start focus</button>
+      <button id="pauseFocus" class="focus-btn" onclick="pauseFocus()" disabled>Pause</button>
+      <button id="stopFocus" class="focus-btn" onclick="stopFocus()" disabled>Stop</button>
+      <button onclick="resetReport()">Refresh</button>
+    </div>
+    <div id="focusDetails" class="focus-details"></div>
   </section>
   <section class="bar">
     <div class="field field-wide"><label for="blockKeyword">Block keyword, app, or site</label><input id="blockKeyword" placeholder="youtube, reddit, games" aria-label="Block keyword"></div>
@@ -1601,6 +1622,13 @@ function toggleHistory() {
   const open = panel.classList.toggle('open');
   button.setAttribute('aria-expanded', String(open));
   button.textContent = open ? 'Hide previous reports' : 'Previous reports';
+}
+function toggleFocusDetails() {
+  const panel = document.querySelector('#focusDetails');
+  const button = document.querySelector('#focusDetailsToggle');
+  const open = panel.classList.toggle('open');
+  button.setAttribute('aria-expanded', String(open));
+  button.textContent = open ? 'Hide focus details' : 'Show focus details';
 }
 async function generateSelectedFocusReport() {
   const button = document.querySelector('#focusReportButton');
@@ -1750,9 +1778,22 @@ async function refresh() {
   }).join('') || '<div class="muted">No previous reports yet.</div>';
   updateFocusButtons(state.focus);
   seedFocusInputsFromActiveSession(state.focus);
-  document.querySelector('#focusState').textContent = state.focus
-    ? `Focus: ${state.focus.task}${state.focus.target ? ' in ' + state.focus.target : ''} - after ${formatDuration(state.focus.alertDelaySeconds || 60)} ${state.focus.alertAction === 'switch' && state.focus.redirectApp ? 'move to ' + state.focus.redirectApp : 'show alert'}${state.focus.paused ? ' (paused)' : ''}`
-    : 'No active focus session - alerts off';
+  updateFocusSummary(state.focus);
+}
+function updateFocusSummary(focus) {
+  const chip = document.querySelector('#focusState');
+  const details = document.querySelector('#focusDetails');
+  if (!focus) {
+    chip.textContent = 'Focus off';
+    chip.className = 'status-chip';
+    details.textContent = 'No active focus session. Alerts are off.';
+    return;
+  }
+  const paused = Boolean(focus.paused);
+  chip.textContent = paused ? 'Focus paused' : 'Focus active';
+  chip.className = `status-chip ${paused ? 'paused' : 'running'}`;
+  const action = focus.alertAction === 'switch' && focus.redirectApp ? `move to ${focus.redirectApp}` : 'show alert';
+  details.textContent = `Focus apps/sites: ${focus.target || 'none set'} | Warn after ${formatDuration(focus.alertDelaySeconds || 60)} | Action: ${action}`;
 }
 function seedFocusInputsFromActiveSession(focus) {
   if (!focus) return;
