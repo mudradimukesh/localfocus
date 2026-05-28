@@ -1398,6 +1398,8 @@ fn index_html() -> String {
 * { box-sizing: border-box; }
 body { margin:0; font:14px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--ink); }
 header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 24px; border-bottom:1px solid var(--line); background:color-mix(in srgb, var(--panel) 82%, transparent); backdrop-filter:blur(12px); position:sticky; top:0; z-index:20; }
+.header-actions { display:grid; gap:8px; justify-items:end; }
+.header-actions button { padding:7px 11px; }
 h1 { margin:0; font-size:20px; }
 main { max-width:1180px; margin:0 auto; padding:24px; display:grid; gap:18px; }
 .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
@@ -1506,13 +1508,16 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .idle { color:var(--warn); background:color-mix(in srgb, var(--warn) 16%, transparent); }
 .two { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
 @media (max-width:980px) { .focus-layout { grid-template-columns:1fr; } .focus-actions { justify-content:flex-start; } }
-@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid { grid-template-columns:1fr; display:grid; } header { align-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } }
+@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid { grid-template-columns:1fr; display:grid; } header { align-items:start; } .header-actions { justify-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
 <header>
   <div><h1>Local Focus</h1><div class="muted">Private activity timeline, focus sessions, and reports. All data stays on this device.</div></div>
-  <div id="focusState" class="status-chip"></div>
+  <div class="header-actions">
+    <div id="focusState" class="status-chip"></div>
+    <button id="explainToggle" onclick="toggleExplain()" aria-expanded="false">Explain</button>
+  </div>
 </header>
 <main>
   <section class="focus-shell">
@@ -1522,7 +1527,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
         <div><h2>Focus setup</h2><div class="muted">Choose what counts as focused work. Everything else is tracked as distraction.</div></div>
       </div>
       <div class="top-actions">
-        <button id="focusEditorToggle" class="focus-details-toggle" onclick="toggleFocusEditor()" aria-expanded="true">Hide setup</button>
+        <button id="focusEditorToggle" class="focus-details-toggle" onclick="toggleFocusEditor()" aria-expanded="true">Hide edit details</button>
         <button id="focusDetailsToggle" class="focus-details-toggle" onclick="toggleFocusDetails()" aria-expanded="false">Show focus details</button>
       </div>
     </div>
@@ -1559,7 +1564,6 @@ button:disabled { cursor:not-allowed; opacity:.55; }
     <button onclick="addBlock()">Add block</button>
   </section>
   <section class="bar">
-    <button id="explainToggle" onclick="toggleExplain()" aria-expanded="false">Explain report</button>
     <div class="field"><label for="reportPeriod">Focus report for</label><select id="reportPeriod" aria-label="Focus report period">
       <option value="day">Day</option>
       <option value="week">Week</option>
@@ -1652,7 +1656,7 @@ function toggleExplain() {
   const button = document.querySelector('#explainToggle');
   const open = panel.classList.toggle('open');
   button.setAttribute('aria-expanded', String(open));
-  button.textContent = open ? 'Hide report explanation' : 'Explain report';
+  button.textContent = open ? 'Hide explanation' : 'Explain';
 }
 function toggleHistory() {
   const panel = document.querySelector('#historyPanel');
@@ -1674,7 +1678,7 @@ function setFocusEditorOpen(open, manual = false) {
   if (manual) focusEditorManuallyOpened = open;
   editor.classList.toggle('editor-collapsed', !open);
   button.setAttribute('aria-expanded', String(open));
-  button.textContent = open ? 'Hide setup' : 'Edit setup';
+  button.textContent = open ? 'Hide edit details' : 'Edit focus details';
 }
 function toggleFocusEditor() {
   const editor = document.querySelector('#focusEditor');
@@ -1876,11 +1880,11 @@ function seedFocusInputsFromActiveSession(focus) {
   const alertInput = document.querySelector('#alertMinutes');
   const actionInput = document.querySelector('#alertAction');
   const redirectInput = document.querySelector('#redirectApp');
-  if (!targetInput.value && focus.target) targetInput.value = focus.target;
-  if (!minutesInput.value && focus.durationMinutes) minutesInput.value = focus.durationMinutes;
-  if (focus.alertDelaySeconds && (!alertInput.value || alertInput.value === '1')) alertInput.value = Math.max(1, Math.round(focus.alertDelaySeconds / 60));
+  if (focus.target) targetInput.value = focus.target;
+  if (focus.durationMinutes) minutesInput.value = focus.durationMinutes;
+  if (focus.alertDelaySeconds) alertInput.value = Math.max(1, Math.round(focus.alertDelaySeconds / 60));
   if (focus.alertAction) actionInput.value = focus.alertAction;
-  if (!redirectInput.value && focus.redirectApp) redirectInput.value = focus.redirectApp;
+  redirectInput.value = focus.redirectApp || '';
   saveFocusDraft();
 }
 function updateFocusButtons(focus) {
