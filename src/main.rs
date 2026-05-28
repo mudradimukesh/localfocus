@@ -1281,6 +1281,10 @@ main { max-width:1120px; margin:0 auto; padding:24px; display:grid; gap:18px; }
 input, select, button { border:1px solid var(--line); border-radius:6px; padding:9px 11px; background:var(--panel); color:var(--ink); }
 button { cursor:pointer; font-weight:650; }
 button:disabled { cursor:not-allowed; opacity:.55; }
+.field { display:grid; gap:4px; }
+.field label { color:var(--muted); font-size:12px; font-weight:650; }
+.field input, .field select { width:100%; min-width:150px; }
+.field-wide input { min-width:280px; }
 .source-toggle { display:inline; max-width:100%; padding:0; border:0; background:transparent; color:var(--ink); font:inherit; font-weight:500; text-align:left; overflow-wrap:anywhere; }
 .source-toggle:hover { text-decoration:underline; }
 .focus-btn { transition: background .15s ease, border-color .15s ease, color .15s ease; }
@@ -1349,22 +1353,22 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 </header>
 <main>
   <section class="bar">
-    <input id="task" value="Deep work" aria-label="Focus task">
-    <input id="target" placeholder="Focus apps/sites, comma separated" aria-label="Focus targets">
-    <input id="minutes" type="number" min="1" max="180" value="25" aria-label="Minutes">
-    <input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Alert after minutes" title="Alert after minutes outside focus">
-    <select id="alertAction" aria-label="After delay action" title="After delay action">
+    <div class="field"><label for="task">Focus task</label><input id="task" value="Deep work" aria-label="Focus task"></div>
+    <div class="field field-wide"><label for="target">Focus apps and websites</label><input id="target" placeholder="Pages, https://claude.ai/" aria-label="Focus targets"></div>
+    <div class="field"><label for="minutes">Focus timer</label><input id="minutes" type="number" min="1" max="180" value="25" aria-label="Minutes"></div>
+    <div class="field"><label for="alertMinutes">Warn after</label><input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Alert after minutes" title="Alert after minutes outside focus"></div>
+    <div class="field"><label for="alertAction">Warning action</label><select id="alertAction" aria-label="After delay action" title="After delay action">
       <option value="alert">Show alert</option>
       <option value="switch">Move to app</option>
-    </select>
-    <input id="redirectApp" placeholder="App to open, e.g. Codex" aria-label="Move focus to app">
+    </select></div>
+    <div class="field"><label for="redirectApp">App to move to</label><input id="redirectApp" placeholder="Pages" aria-label="Move focus to app"></div>
     <button id="startFocus" class="focus-btn focus-idle" onclick="startFocus()">Start focus</button>
     <button id="pauseFocus" class="focus-btn" onclick="pauseFocus()" disabled>Pause</button>
     <button id="stopFocus" class="focus-btn" onclick="stopFocus()" disabled>Stop</button>
     <button onclick="resetReport()">Refresh</button>
   </section>
   <section class="bar">
-    <input id="blockKeyword" placeholder="Block keyword, app, or site" aria-label="Block keyword">
+    <div class="field field-wide"><label for="blockKeyword">Block keyword, app, or site</label><input id="blockKeyword" placeholder="youtube, reddit, games" aria-label="Block keyword"></div>
     <button onclick="addBlock()">Add block</button>
   </section>
   <section class="bar">
@@ -1375,7 +1379,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
   <section class="explain" id="explainPanel">
     <h2>Report meaning</h2>
     <div class="explain-grid">
-      <div><h3>Score</h3><p>0 to 100 estimate from the last 24 hours. Productive time raises it, distracted time lowers it.</p></div>
+      <div><h3>Total time</h3><p>All tracked time in the current report window: productive, distracted, and idle.</p></div>
       <div><h3>Productive</h3><p>During a targeted focus session, only activity matching one of your focus apps or sites counts here. Outside targeted focus, productive keywords are used.</p></div>
       <div><h3>Distracted</h3><p>Any activity that is not productive. During targeted focus, every app or site outside your focus list is tracked here.</p></div>
       <div><h3>Idle</h3><p>If there is no keyboard or mouse input for 60 seconds, time is tracked as idle even when the focused app or website matches your focus list.</p></div>
@@ -1580,8 +1584,9 @@ async function refresh() {
     fetch('/api/state').then(r => r.json()),
     fetch('/api/report/history').then(r => r.json())
   ]);
+  const totalSeconds = reportTotalSeconds(report);
   document.querySelector('#metrics').innerHTML = `
-    <div class="metric"><span class="muted">Score</span><strong>${report.score}</strong></div>
+    <div class="metric"><span class="muted">Total time</span><strong>${formatDuration(totalSeconds)}</strong></div>
     <div class="metric"><span class="muted">Productive</span><strong>${formatDuration(report.productiveMinutes * 60)}</strong></div>
     <div class="metric"><span class="muted">Distracted</span><strong>${formatDuration(report.distractingMinutes * 60)}</strong></div>
     <div class="metric"><span class="muted">Idle</span><strong>${formatDuration((report.idleMinutes || 0) * 60)}</strong></div>`;
@@ -1597,7 +1602,7 @@ async function refresh() {
     return `<div class="item">
       <div class="muted">${new Date(item.archivedAt * 1000).toLocaleString([], {dateStyle:'short', timeStyle:'short'})}</div>
       <div class="history-grid">
-        <div><h3>Score</h3><p>${r.score}</p></div>
+        <div><h3>Total time</h3><p>${formatDuration(reportTotalSeconds(r))}</p></div>
         <div><h3>Productive</h3><p>${formatDuration(r.productiveMinutes * 60)}</p></div>
         <div><h3>Distracted</h3><p>${formatDuration(r.distractingMinutes * 60)}</p></div>
         <div><h3>Idle</h3><p>${formatDuration((r.idleMinutes || 0) * 60)}</p></div>
@@ -1677,6 +1682,9 @@ function formatDuration(seconds) {
   const mins = Math.floor(seconds / 60);
   const rest = seconds % 60;
   return rest ? `${mins}m ${rest}s` : `${mins}m`;
+}
+function reportTotalSeconds(report) {
+  return ((report.productiveMinutes || 0) + (report.distractingMinutes || 0) + (report.idleMinutes || 0)) * 60;
 }
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
