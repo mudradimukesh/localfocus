@@ -1393,31 +1393,52 @@ fn index_html() -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Local Focus</title>
 <style>
-:root { color-scheme: light dark; --bg:#f7f7f2; --ink:#202124; --muted:#666; --line:#d8d8cf; --good:#277a4f; --warn:#9b5b11; --bad:#a12f32; --panel:#ffffff; }
-@media (prefers-color-scheme: dark) { :root { --bg:#171816; --ink:#f1f1e9; --muted:#aaa; --line:#34362f; --panel:#22231f; } }
+:root { color-scheme: light dark; --bg:#f6f6f1; --ink:#202124; --muted:#686b63; --line:#d9dbd2; --good:#24734d; --warn:#9b6418; --bad:#a8323b; --panel:#ffffff; --panel-soft:#f0f1ea; --accent:#355c7d; --shadow:0 18px 45px rgba(32,33,36,.08); }
+@media (prefers-color-scheme: dark) { :root { --bg:#171816; --ink:#f1f1e9; --muted:#aeb0a8; --line:#34362f; --panel:#22231f; --panel-soft:#1c1d19; --shadow:0 18px 45px rgba(0,0,0,.22); } }
 * { box-sizing: border-box; }
 body { margin:0; font:14px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--ink); }
-header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 24px; border-bottom:1px solid var(--line); }
+header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 24px; border-bottom:1px solid var(--line); background:color-mix(in srgb, var(--panel) 82%, transparent); backdrop-filter:blur(12px); position:sticky; top:0; z-index:20; }
 h1 { margin:0; font-size:20px; }
-main { max-width:1120px; margin:0 auto; padding:24px; display:grid; gap:18px; }
+main { max-width:1180px; margin:0 auto; padding:24px; display:grid; gap:18px; }
 .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
-input, select, button { border:1px solid var(--line); border-radius:6px; padding:9px 11px; background:var(--panel); color:var(--ink); }
-button { cursor:pointer; font-weight:650; }
+input, select, textarea, button { border:1px solid var(--line); border-radius:8px; padding:10px 12px; background:var(--panel); color:var(--ink); }
+textarea { min-height:88px; resize:vertical; font:inherit; }
+button { cursor:pointer; font-weight:700; }
 button:disabled { cursor:not-allowed; opacity:.55; }
-.focus-shell { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; display:grid; gap:14px; }
-.focus-shell-head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
-.focus-shell h2 { margin:0; font-size:16px; }
-.focus-form { display:grid; grid-template-columns:minmax(260px, 2fr) repeat(4, minmax(130px, 1fr)); gap:12px; align-items:end; }
-.focus-actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+.focus-shell { background:linear-gradient(180deg, color-mix(in srgb, var(--panel) 92%, var(--panel-soft)), var(--panel)); border:1px solid var(--line); border-radius:12px; padding:18px; display:grid; gap:16px; box-shadow:var(--shadow); }
+.focus-shell-head { display:flex; align-items:center; justify-content:space-between; gap:14px; }
+.focus-title { display:flex; align-items:center; gap:12px; }
+.focus-mark { width:42px; height:42px; border-radius:10px; background:linear-gradient(135deg, var(--accent), var(--good)); color:white; display:grid; place-items:center; font-weight:850; letter-spacing:.04em; }
+.focus-shell h2 { margin:0; font-size:18px; }
+.focus-layout { display:grid; grid-template-columns:minmax(0, 1.3fr) minmax(320px, .7fr); gap:16px; align-items:start; }
+.focus-layout.editor-collapsed { grid-template-columns:minmax(0, 520px); }
+.focus-layout.editor-collapsed .focus-form { display:none; }
+.focus-form { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; align-items:end; }
+.focus-form .field-wide { grid-column:1 / -1; }
+.focus-actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:flex-end; }
+.focus-side { border:1px solid var(--line); border-radius:10px; padding:14px; background:var(--panel-soft); display:grid; gap:12px; }
+.focus-side h3 { margin:0; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; }
+.quick-metrics { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:8px; }
+.quick-metric { border:1px solid var(--line); border-radius:8px; padding:10px; background:var(--panel); }
+.quick-metric span { color:var(--muted); display:block; font-size:11px; font-weight:700; }
+.quick-metric strong { display:block; margin-top:2px; font-size:16px; }
 .status-chip { border:1px solid var(--line); border-radius:999px; padding:6px 10px; background:color-mix(in srgb, var(--line) 25%, transparent); color:var(--muted); font-weight:700; }
 .status-chip.running { color:var(--good); border-color:color-mix(in srgb, var(--good) 45%, var(--line)); background:color-mix(in srgb, var(--good) 10%, transparent); }
 .status-chip.paused { color:var(--warn); border-color:color-mix(in srgb, var(--warn) 45%, var(--line)); background:color-mix(in srgb, var(--warn) 12%, transparent); }
 .focus-details-toggle { padding:6px 10px; }
-.focus-details { display:none; border-top:1px solid var(--line); padding-top:12px; color:var(--muted); overflow-wrap:anywhere; }
-.focus-details.open { display:block; }
+.top-actions { display:flex; flex-wrap:wrap; gap:8px; justify-content:flex-end; }
+.top-actions button { white-space:nowrap; }
+.focus-details { display:none; border:1px solid var(--line); border-radius:10px; padding:14px; color:var(--muted); overflow-wrap:anywhere; background:var(--panel); }
+.focus-details.open { display:grid; gap:10px; }
+.detail-grid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
+.detail-card { border:1px solid var(--line); border-radius:8px; padding:10px; background:var(--panel-soft); min-width:0; }
+.detail-card span { color:var(--muted); display:block; font-size:11px; font-weight:750; text-transform:uppercase; letter-spacing:.05em; }
+.detail-card strong { display:block; margin-top:4px; color:var(--ink); overflow-wrap:anywhere; }
+.target-chips { display:flex; flex-wrap:wrap; gap:6px; }
+.target-chip { max-width:100%; border:1px solid color-mix(in srgb, var(--accent) 35%, var(--line)); border-radius:999px; padding:5px 9px; background:color-mix(in srgb, var(--accent) 8%, transparent); color:var(--ink); overflow-wrap:anywhere; }
 .field { display:grid; gap:4px; }
 .field label { color:var(--muted); font-size:12px; font-weight:650; }
-.field input, .field select { width:100%; min-width:150px; }
+.field input, .field select, .field textarea { width:100%; min-width:150px; }
 .field-wide input { min-width:280px; }
 .source-toggle { display:inline; max-width:100%; padding:0; border:0; background:transparent; color:var(--ink); font:inherit; font-weight:500; text-align:left; overflow-wrap:anywhere; }
 .source-toggle:hover { text-decoration:underline; }
@@ -1427,7 +1448,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .focus-paused { background:var(--warn); border-color:var(--warn); color:white; }
 .focus-stop-active { border-color:var(--bad); color:var(--bad); }
 .grid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; }
-.metric, .timeline, .apps, .explain, .history, .report { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
+.metric, .timeline, .apps, .explain, .history, .report { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
 .metric strong { display:block; font-size:28px; }
 .muted { color:var(--muted); }
 .explain { display:none; }
@@ -1484,8 +1505,8 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .distracting { color:var(--bad); background:color-mix(in srgb, var(--bad) 14%, transparent); }
 .idle { color:var(--warn); background:color-mix(in srgb, var(--warn) 16%, transparent); }
 .two { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
-@media (max-width:900px) { .focus-form { grid-template-columns:1fr 1fr; } }
-@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form { grid-template-columns:1fr; display:grid; } header { align-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } }
+@media (max-width:980px) { .focus-layout { grid-template-columns:1fr; } .focus-actions { justify-content:flex-start; } }
+@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid { grid-template-columns:1fr; display:grid; } header { align-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -1496,26 +1517,42 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 <main>
   <section class="focus-shell">
     <div class="focus-shell-head">
-      <div><h2>Focus setup</h2><div class="muted">Choose the apps and sites that count as focused work.</div></div>
-      <button id="focusDetailsToggle" class="focus-details-toggle" onclick="toggleFocusDetails()" aria-expanded="false">Show focus details</button>
-    </div>
-    <div class="focus-form">
-      <div class="field field-wide"><label for="target">Focus apps and websites</label><input id="target" placeholder="Pages, https://claude.ai/" aria-label="Focus targets"></div>
-      <div class="field"><label for="minutes">Focus timer</label><input id="minutes" type="number" min="1" max="180" value="25" aria-label="Minutes"></div>
-      <div class="field"><label for="alertMinutes">Warn after</label><input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Alert after minutes" title="Alert after minutes outside focus"></div>
-      <div class="field"><label for="alertAction">Warning action</label><select id="alertAction" aria-label="After delay action" title="After delay action">
-        <option value="alert">Show alert</option>
-        <option value="switch">Move to app</option>
-      </select></div>
-      <div class="field"><label for="redirectApp">App to move to</label><input id="redirectApp" placeholder="Pages" aria-label="Move focus to app"></div>
-    </div>
-    <div class="focus-actions">
-      <button id="startFocus" class="focus-btn focus-idle" onclick="startFocus()">Start focus</button>
-      <button id="pauseFocus" class="focus-btn" onclick="pauseFocus()" disabled>Pause</button>
-      <button id="stopFocus" class="focus-btn" onclick="stopFocus()" disabled>Stop</button>
-      <button onclick="resetReport()">Refresh</button>
+      <div class="focus-title">
+        <div class="focus-mark">LF</div>
+        <div><h2>Focus setup</h2><div class="muted">Choose what counts as focused work. Everything else is tracked as distraction.</div></div>
+      </div>
+      <div class="top-actions">
+        <button id="focusEditorToggle" class="focus-details-toggle" onclick="toggleFocusEditor()" aria-expanded="true">Hide setup</button>
+        <button id="focusDetailsToggle" class="focus-details-toggle" onclick="toggleFocusDetails()" aria-expanded="false">Show focus details</button>
+      </div>
     </div>
     <div id="focusDetails" class="focus-details"></div>
+    <div id="focusEditor" class="focus-layout">
+      <div class="focus-form">
+        <div class="field field-wide"><label for="target">Focus apps and websites</label><textarea id="target" placeholder="Pages, https://claude.ai/, https://gemini.google.com, Notes" aria-label="Focus targets"></textarea></div>
+        <div class="field"><label for="minutes">Focus timer</label><input id="minutes" type="number" min="1" max="180" value="25" aria-label="Minutes"></div>
+        <div class="field"><label for="alertMinutes">Warn after</label><input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Alert after minutes" title="Alert after minutes outside focus"></div>
+        <div class="field"><label for="alertAction">Warning action</label><select id="alertAction" aria-label="After delay action" title="After delay action">
+          <option value="alert">Show alert</option>
+          <option value="switch">Move to app</option>
+        </select></div>
+        <div class="field"><label for="redirectApp">App to move to</label><input id="redirectApp" placeholder="Pages" aria-label="Move focus to app"></div>
+      </div>
+      <aside class="focus-side">
+        <h3>Current session</h3>
+        <div class="quick-metrics">
+          <div class="quick-metric"><span>Status</span><strong id="quickStatus">Off</strong></div>
+          <div class="quick-metric"><span>Warn after</span><strong id="quickDelay">1m</strong></div>
+          <div class="quick-metric"><span>Action</span><strong id="quickAction">Alert</strong></div>
+        </div>
+        <div class="focus-actions">
+          <button id="startFocus" class="focus-btn focus-idle" onclick="startFocus()">Start focus</button>
+          <button id="pauseFocus" class="focus-btn" onclick="pauseFocus()" disabled>Pause</button>
+          <button id="stopFocus" class="focus-btn" onclick="stopFocus()" disabled>Stop</button>
+          <button onclick="resetReport()">Refresh</button>
+        </div>
+      </aside>
+    </div>
   </section>
   <section class="bar">
     <div class="field field-wide"><label for="blockKeyword">Block keyword, app, or site</label><input id="blockKeyword" placeholder="youtube, reddit, games" aria-label="Block keyword"></div>
@@ -1557,6 +1594,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 </main>
 <script>
 const focusDraftKey = 'local-focus-draft';
+let focusEditorManuallyOpened = false;
 const fmtTime = seconds => new Date(seconds * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 const minutes = seconds => Math.max(1, Math.round(seconds / 60));
 async function startFocus() {
@@ -1629,6 +1667,18 @@ function toggleFocusDetails() {
   const open = panel.classList.toggle('open');
   button.setAttribute('aria-expanded', String(open));
   button.textContent = open ? 'Hide focus details' : 'Show focus details';
+}
+function setFocusEditorOpen(open, manual = false) {
+  const editor = document.querySelector('#focusEditor');
+  const button = document.querySelector('#focusEditorToggle');
+  if (manual) focusEditorManuallyOpened = open;
+  editor.classList.toggle('editor-collapsed', !open);
+  button.setAttribute('aria-expanded', String(open));
+  button.textContent = open ? 'Hide setup' : 'Edit setup';
+}
+function toggleFocusEditor() {
+  const editor = document.querySelector('#focusEditor');
+  setFocusEditorOpen(editor.classList.contains('editor-collapsed'), true);
 }
 async function generateSelectedFocusReport() {
   const button = document.querySelector('#focusReportButton');
@@ -1783,17 +1833,41 @@ async function refresh() {
 function updateFocusSummary(focus) {
   const chip = document.querySelector('#focusState');
   const details = document.querySelector('#focusDetails');
+  const quickStatus = document.querySelector('#quickStatus');
+  const quickDelay = document.querySelector('#quickDelay');
+  const quickAction = document.querySelector('#quickAction');
   if (!focus) {
     chip.textContent = 'Focus off';
     chip.className = 'status-chip';
-    details.textContent = 'No active focus session. Alerts are off.';
+    details.innerHTML = `<div class="detail-grid">
+      <div class="detail-card"><span>Focus apps/sites</span><strong>None active</strong></div>
+      <div class="detail-card"><span>Warning</span><strong>Off</strong></div>
+      <div class="detail-card"><span>Action</span><strong>Start focus to enable alerts</strong></div>
+    </div>`;
+    quickStatus.textContent = 'Off';
+    quickDelay.textContent = '1m';
+    quickAction.textContent = 'Alert';
+    focusEditorManuallyOpened = false;
+    setFocusEditorOpen(true);
     return;
   }
   const paused = Boolean(focus.paused);
   chip.textContent = paused ? 'Focus paused' : 'Focus active';
   chip.className = `status-chip ${paused ? 'paused' : 'running'}`;
   const action = focus.alertAction === 'switch' && focus.redirectApp ? `move to ${focus.redirectApp}` : 'show alert';
-  details.textContent = `Focus apps/sites: ${focus.target || 'none set'} | Warn after ${formatDuration(focus.alertDelaySeconds || 60)} | Action: ${action}`;
+  const targets = String(focus.target || '').split(/[,\n]/).map(value => value.trim()).filter(Boolean);
+  const targetChips = targets.map(value => `<span class="target-chip">${escapeHtml(shortenSource(value))}</span>`).join('') || '<span class="target-chip">No target set</span>';
+  details.innerHTML = `
+    <div class="target-chips">${targetChips}</div>
+    <div class="detail-grid">
+      <div class="detail-card"><span>Full focus list</span><strong>${escapeHtml(focus.target || 'No target set')}</strong></div>
+      <div class="detail-card"><span>Warning delay</span><strong>${formatDuration(focus.alertDelaySeconds || 60)} outside focus</strong></div>
+      <div class="detail-card"><span>Notification action</span><strong>${escapeHtml(action)}</strong></div>
+    </div>`;
+  quickStatus.textContent = paused ? 'Paused' : 'Active';
+  quickDelay.textContent = formatDuration(focus.alertDelaySeconds || 60);
+  quickAction.textContent = focus.alertAction === 'switch' && focus.redirectApp ? `Move` : 'Alert';
+  if (!focusEditorManuallyOpened) setFocusEditorOpen(false);
 }
 function seedFocusInputsFromActiveSession(focus) {
   if (!focus) return;
