@@ -1450,7 +1450,9 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .split-chart span { background:var(--panel); border:1px solid var(--line); border-radius:999px; padding:18px 20px; font-weight:750; }
 .hour-bars { display:grid; grid-template-columns:repeat(12, minmax(34px, 1fr)); gap:10px; align-items:end; min-height:150px; }
 .hour-bar { display:grid; align-items:end; height:120px; gap:2px; }
-.hour-segment { border-radius:4px 4px 0 0; min-height:2px; cursor:help; }
+.hour-segment { position:relative; border-radius:4px 4px 0 0; min-height:2px; cursor:default; }
+.hour-segment:hover::after { content:attr(data-tip); position:absolute; left:50%; bottom:calc(100% + 8px); transform:translateX(-50%); z-index:10; width:max-content; max-width:220px; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--ink); box-shadow:0 8px 24px color-mix(in srgb, var(--ink) 18%, transparent); font-size:12px; font-weight:650; white-space:normal; }
+.hour-segment:hover::before { content:""; position:absolute; left:50%; bottom:100%; transform:translateX(-50%); border:5px solid transparent; border-top-color:var(--line); z-index:11; }
 .hour-good, .hour-bad { border-radius:4px 4px 0 0; min-height:2px; }
 .hour-good { background:var(--good); }
 .hour-bad { background:var(--bad); }
@@ -1673,9 +1675,9 @@ function renderFocusReport(report) {
     const range = `${start.toLocaleTimeString([], {hour:'numeric'})} to ${end.toLocaleTimeString([], {hour:'numeric'})}`;
     return `<div>
       <div class="hour-bar">
-        <div class="hour-segment hour-good" title="Productive: ${formatDuration(item.productiveSeconds)} (${range})" style="height:${productiveHeight}%"></div>
-        <div class="hour-segment" title="Idle: ${formatDuration(item.idleSeconds || 0)} (${range})" style="background:var(--warn);height:${idleHeight}%"></div>
-        <div class="hour-segment hour-bad" title="Distracted: ${formatDuration(item.distractingSeconds)} (${range})" style="height:${distractingHeight}%"></div>
+        <div class="hour-segment hour-good" data-tip="Productive: ${formatDuration(item.productiveSeconds)} (${range})" aria-label="Productive: ${formatDuration(item.productiveSeconds)} (${range})" style="height:${productiveHeight}%"></div>
+        <div class="hour-segment" data-tip="Idle: ${formatDuration(item.idleSeconds || 0)} (${range})" aria-label="Idle: ${formatDuration(item.idleSeconds || 0)} (${range})" style="background:var(--warn);height:${idleHeight}%"></div>
+        <div class="hour-segment hour-bad" data-tip="Distracted: ${formatDuration(item.distractingSeconds)} (${range})" aria-label="Distracted: ${formatDuration(item.distractingSeconds)} (${range})" style="height:${distractingHeight}%"></div>
       </div>
       <div class="muted" style="font-size:11px;text-align:center">${new Date(item.hour * 1000).toLocaleTimeString([], {hour:'numeric'})}</div>
     </div>`;
