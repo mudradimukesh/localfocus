@@ -1542,17 +1542,15 @@ function renderFocusReport(report) {
       <div class="report-card"><span class="muted">Outside focus</span><strong>${formatDuration(report.outsideSeconds)}</strong></div>
       <div class="report-card"><span class="muted">Idle</span><strong>${formatDuration(report.idleSeconds)}</strong></div>
     </div>
+    <div class="report-card"><h3>Time on focus apps and websites</h3>${targetBars || '<p class="muted">No target activity yet.</p>'}</div>
     <div class="report-two">
-      <div class="report-card"><h3>Time on focus apps and websites</h3>${targetBars || '<p class="muted">No target activity yet.</p>'}</div>
       <div class="report-card">
         <h3>Focus split</h3>
         <div class="split-chart" style="--focus-angle:${focusAngle}"><span>${report.focusPercent}% focused</span></div>
       </div>
-    </div>
-    <div class="report-two">
       <div class="report-card"><h3>Productive vs distracted by hour</h3><div class="hour-bars">${hours}</div></div>
-      <div class="report-card"><h3>Analysis</h3><div class="insights">${insights}</div></div>
     </div>
+    <div class="report-card"><h3>Analysis</h3><div class="insights">${insights}</div></div>
     <div class="report-card"><h3>Top outside-focus activity</h3>${distractionRows}</div>`;
 }
 async function refresh() {
