@@ -1529,6 +1529,8 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .calendar-title { text-align:center; font-weight:800; }
 .calendar-actions { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
 .calendar-actions button, .week-button, .day-button { min-height:40px; }
+.calendar-actions button.active-report, .week-button.active-report { background:var(--good); border-color:var(--good); color:white; }
+.calendar-actions button.active-year { background:var(--accent); border-color:var(--accent); color:white; }
 .calendar-grid { display:grid; grid-template-columns:64px repeat(7, minmax(0, 1fr)); gap:6px; align-items:stretch; }
 .calendar-label { color:var(--muted); font-size:12px; font-weight:750; text-align:center; padding:4px; }
 .week-button, .day-button { width:100%; padding:8px 6px; }
@@ -1540,7 +1542,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .focus-session-row { border:1px solid var(--line); border-radius:8px; padding:9px; background:var(--panel); }
 .block-fields { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:12px; align-items:end; }
 .block-fields button { min-height:42px; min-width:140px; white-space:nowrap; }
-.focus-layout { display:grid; grid-template-columns:minmax(0, 1.3fr) minmax(320px, .7fr); gap:16px; align-items:start; }
+.focus-layout { display:grid; gap:16px; align-items:start; }
 .focus-layout.editor-collapsed { grid-template-columns:minmax(0, 520px); }
 .focus-layout.editor-collapsed .focus-form { display:none; }
 .focus-form { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; align-items:end; }
@@ -1594,6 +1596,8 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .history.open { display:block; }
 .report { display:none; }
 .report.open { display:grid; gap:16px; }
+.report-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+.report-close { min-width:40px; padding:7px 10px; }
 .explain-grid { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:12px; }
 .history-grid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:10px; }
 .report-grid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; }
@@ -1690,6 +1694,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
     <div id="focusDetails" class="focus-details"></div>
     <div id="focusEditor" class="focus-layout">
       <div class="focus-form">
+        <div class="field field-wide"><label for="task">Focus task</label><input id="task" value="Deep work" placeholder="Deep work" aria-label="Focus task"></div>
         <div class="field field-wide target-builder">
           <label for="targetInput">Focus apps and websites</label>
           <div class="target-entry">
@@ -1707,23 +1712,24 @@ button:disabled { cursor:not-allowed; opacity:.55; }
         </select></div>
         <div class="field"><label for="redirectApp">App to move to</label><input id="redirectApp" placeholder="Pages" aria-label="Move focus to app"></div>
       </div>
-      <aside class="focus-side">
-        <h3>Current session</h3>
-        <div class="quick-metrics">
-          <div class="quick-metric"><span>Status</span><strong id="quickStatus">Off</strong></div>
-          <div class="quick-metric"><span>Warn after</span><strong id="quickDelay">1m</strong></div>
-          <div class="quick-metric"><span>Action</span><strong id="quickAction">Alert</strong></div>
-        </div>
-        <div class="focus-actions">
-          <button id="startFocus" class="focus-btn focus-idle" onclick="startFocus()">Start focus</button>
-          <button id="pauseFocus" class="focus-btn" onclick="pauseFocus()" disabled>Pause</button>
-          <button id="stopFocus" class="focus-btn" onclick="stopFocus()" disabled>Stop</button>
-          <button onclick="resetReport()">Refresh</button>
-        </div>
-      </aside>
     </div>
   </section>
-  <section class="control-shell" aria-label="Reports">
+  <aside class="focus-side">
+    <h3>Current focus session</h3>
+    <div class="quick-metrics">
+      <div class="quick-metric"><span>Task</span><strong id="quickTask">None</strong></div>
+      <div class="quick-metric"><span>Status</span><strong id="quickStatus">Off</strong></div>
+      <div class="quick-metric"><span>Warn after</span><strong id="quickDelay">1m</strong></div>
+      <div class="quick-metric"><span>Action</span><strong id="quickAction">Alert</strong></div>
+    </div>
+    <div class="focus-actions">
+      <button id="startFocus" class="focus-btn focus-idle" onclick="startFocus()">Start focus</button>
+      <button id="pauseFocus" class="focus-btn" onclick="pauseFocus()" disabled>Pause</button>
+      <button id="stopFocus" class="focus-btn" onclick="stopFocus()" disabled>Stop</button>
+      <button onclick="resetReport()">Refresh</button>
+    </div>
+  </aside>
+  <section id="reportsCard" class="control-shell" aria-label="Reports">
     <div>
       <h2>Reports</h2>
       <div class="muted">Click a year, month, week, or date to generate that report.</div>
@@ -1746,7 +1752,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
       </div>
     </div>
   </section>
-  <section class="control-shell" aria-label="Distraction rules">
+  <section id="distractionCard" class="control-shell distraction-card" aria-label="Distraction rules">
     <div>
       <h2>Add distraction rule</h2>
       <div class="muted">Mark keywords, apps, or sites as distracting and eligible for alerts.</div>
@@ -1787,11 +1793,15 @@ let focusTargets = [];
 let currentFocusReport = null;
 let calendarDate = new Date();
 let selectedReportDate = new Date();
+let activeReportPeriod = 'day';
+let activeReportYear = selectedReportDate.getFullYear();
+let activeReportMonth = selectedReportDate.getMonth();
+let activeReportWeek = 0;
 const fmtTime = seconds => new Date(seconds * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 const minutes = seconds => Math.max(1, Math.round(seconds / 60));
 async function startFocus() {
   saveFocusDraft();
-  const task = encodeURIComponent('Focus session');
+  const task = encodeURIComponent(document.querySelector('#task').value || 'Deep work');
   const target = encodeURIComponent(document.querySelector('#target').value || '');
   const mins = encodeURIComponent(document.querySelector('#minutes').value || '25');
   const alertSeconds = encodeURIComponent(Math.max(1, Number(document.querySelector('#alertMinutes').value || '1')) * 60);
@@ -1804,8 +1814,7 @@ async function stopFocus() { await fetch('/api/focus/stop'); refresh(); }
 async function pauseFocus() { await fetch('/api/focus/pause'); refresh(); }
 async function resetReport() {
   await fetch('/api/report/reset');
-  document.querySelector('#focusReportPanel').classList.remove('open');
-  document.querySelector('#focusReportPanel').innerHTML = '';
+  closeFocusReport();
   refresh();
 }
 async function addBlock() {
@@ -1819,6 +1828,7 @@ async function addBlock() {
 function saveFocusDraft() {
   localStorage.setItem(focusDraftKey, JSON.stringify({
     target: document.querySelector('#target').value,
+    task: document.querySelector('#task').value,
     minutes: document.querySelector('#minutes').value,
     alertMinutes: document.querySelector('#alertMinutes').value,
     alertAction: document.querySelector('#alertAction').value,
@@ -1829,12 +1839,13 @@ function restoreFocusDraft() {
   try {
     const draft = JSON.parse(localStorage.getItem(focusDraftKey) || '{}');
     if (draft.target) setFocusTargets(draft.target);
+    if (draft.task) document.querySelector('#task').value = draft.task;
     if (draft.minutes) document.querySelector('#minutes').value = draft.minutes;
     if (draft.alertMinutes) document.querySelector('#alertMinutes').value = draft.alertMinutes;
     if (draft.alertAction) document.querySelector('#alertAction').value = draft.alertAction;
     if (draft.redirectApp) document.querySelector('#redirectApp').value = draft.redirectApp;
   } catch {}
-  ['#minutes', '#alertMinutes', '#alertAction', '#redirectApp'].forEach(selector => {
+  ['#task', '#minutes', '#alertMinutes', '#alertAction', '#redirectApp'].forEach(selector => {
     document.querySelector(selector).addEventListener('input', saveFocusDraft);
     document.querySelector(selector).addEventListener('change', saveFocusDraft);
   });
@@ -1920,9 +1931,27 @@ async function runCalendarReport(period, dateValue = selectedReportDate) {
     currentFocusReport = report;
     panel.innerHTML = renderFocusReport(report);
     panel.classList.add('open');
+    moveDistractionCard(true);
   } catch (error) {
-    panel.innerHTML = `<p class="muted">Could not generate report.</p>`;
+    panel.innerHTML = `<div class="report-head"><p class="muted">Could not generate report.</p><button class="report-close" onclick="closeFocusReport()" aria-label="Close report">X</button></div>`;
     panel.classList.add('open');
+    moveDistractionCard(true);
+  }
+}
+function closeFocusReport() {
+  const panel = document.querySelector('#focusReportPanel');
+  panel.classList.remove('open');
+  panel.innerHTML = '';
+  moveDistractionCard(false);
+}
+function moveDistractionCard(afterReport) {
+  const card = document.querySelector('#distractionCard');
+  const reportPanel = document.querySelector('#focusReportPanel');
+  const reportsCard = document.querySelector('#reportsCard');
+  if (afterReport) {
+    reportPanel.insertAdjacentElement('afterend', card);
+  } else {
+    reportsCard.insertAdjacentElement('afterend', card);
   }
 }
 function calendarPeriodWindow(period, dateValue) {
@@ -1955,12 +1984,16 @@ function renderReportCalendar() {
   document.querySelector('#yearReportButton').textContent = String(monthStart.getFullYear());
   document.querySelector('#monthReportButton').textContent = monthStart.toLocaleDateString([], {month:'long'});
   document.querySelector('#selectedWeekButton').textContent = `Week ${isoWeekNumber(selectedReportDate)}`;
+  document.querySelector('#yearReportButton').classList.toggle('active-year', activeReportPeriod === 'year' && activeReportYear === monthStart.getFullYear());
+  document.querySelector('#monthReportButton').classList.toggle('active-report', activeReportPeriod === 'month' && activeReportYear === monthStart.getFullYear() && activeReportMonth === monthStart.getMonth());
+  document.querySelector('#selectedWeekButton').classList.toggle('active-report', activeReportPeriod === 'week' && activeReportWeek === isoWeekNumber(selectedReportDate));
   const labels = ['Week', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   let html = labels.map(label => `<div class="calendar-label">${label}</div>`).join('');
   for (let row = 0; row < 6; row += 1) {
     const weekDate = new Date(gridStart);
     weekDate.setDate(gridStart.getDate() + row * 7);
-    html += `<button type="button" class="week-button" onclick="selectCalendarWeek(${weekDate.getFullYear()}, ${weekDate.getMonth()}, ${weekDate.getDate()})">W${isoWeekNumber(weekDate)}</button>`;
+    const weekActive = activeReportPeriod === 'week' && activeReportWeek === isoWeekNumber(weekDate);
+    html += `<button type="button" class="week-button ${weekActive ? 'active-report' : ''}" onclick="selectCalendarWeek(${weekDate.getFullYear()}, ${weekDate.getMonth()}, ${weekDate.getDate()})">W${isoWeekNumber(weekDate)}</button>`;
     for (let col = 0; col < 7; col += 1) {
       const day = new Date(weekDate);
       day.setDate(weekDate.getDate() + col);
@@ -1974,12 +2007,14 @@ function renderReportCalendar() {
 function selectCalendarDay(year, month, day) {
   selectedReportDate = new Date(year, month, day);
   calendarDate = new Date(year, month, 1);
+  setActiveCalendarScope('day', selectedReportDate);
   renderReportCalendar();
   runCalendarReport('day', selectedReportDate);
 }
 function selectCalendarWeek(year, month, day) {
   selectedReportDate = new Date(year, month, day);
   calendarDate = new Date(year, month, 1);
+  setActiveCalendarScope('week', selectedReportDate);
   renderReportCalendar();
   runCalendarReport('week', selectedReportDate);
 }
@@ -2007,14 +2042,27 @@ async function setFocusTaskWindow(period, windowRange) {
 }
 function generateCalendarReport(period) {
   if (period === 'year') {
-    runCalendarReport('year', new Date(calendarDate.getFullYear(), 0, 1));
+    const dateValue = new Date(calendarDate.getFullYear(), 0, 1);
+    setActiveCalendarScope('year', dateValue);
+    runCalendarReport('year', dateValue);
   } else if (period === 'month') {
-    runCalendarReport('month', new Date(calendarDate.getFullYear(), calendarDate.getMonth(), 1));
+    const dateValue = new Date(calendarDate.getFullYear(), calendarDate.getMonth(), 1);
+    setActiveCalendarScope('month', dateValue);
+    runCalendarReport('month', dateValue);
   } else if (period === 'week') {
+    setActiveCalendarScope('week', selectedReportDate);
     runCalendarReport('week', selectedReportDate);
   } else if (period === 'day') {
+    setActiveCalendarScope('day', selectedReportDate);
     runCalendarReport('day', selectedReportDate);
   }
+  renderReportCalendar();
+}
+function setActiveCalendarScope(period, dateValue) {
+  activeReportPeriod = period;
+  activeReportYear = dateValue.getFullYear();
+  activeReportMonth = dateValue.getMonth();
+  activeReportWeek = isoWeekNumber(dateValue);
 }
 function sameDate(left, right) {
   return left.getFullYear() === right.getFullYear() && left.getMonth() === right.getMonth() && left.getDate() === right.getDate();
@@ -2087,7 +2135,7 @@ function renderFocusReport(report) {
     total ? `${periodName} tracked time is ${formatDuration(total)}.` : 'The report will get richer after more tracked activity.'
   ].map(text => `<p>${escapeHtml(text)}</p>`).join('');
   return `
-    <div class="bar"><h2>${reportTitle}</h2><span class="muted">Since ${new Date(report.windowStart * 1000).toLocaleString([], {dateStyle:'short', timeStyle:'short'})} - generated ${new Date(report.generatedAt * 1000).toLocaleString([], {dateStyle:'short', timeStyle:'short'})}</span></div>
+    <div class="report-head"><div><h2>${reportTitle}</h2><span class="muted">Since ${new Date(report.windowStart * 1000).toLocaleString([], {dateStyle:'short', timeStyle:'short'})} - generated ${new Date(report.generatedAt * 1000).toLocaleString([], {dateStyle:'short', timeStyle:'short'})}</span></div><button class="report-close" onclick="closeFocusReport()" aria-label="Close report">X</button></div>
     <div class="report-grid">
       <div class="report-card"><span class="muted">Total time</span><strong>${formatDuration(total)}</strong></div>
       <div class="report-card"><span class="muted">Matched focus list</span><strong>${formatDuration(report.focusSeconds)}</strong></div>
@@ -2194,6 +2242,7 @@ async function refresh() {
 function updateFocusSummary(focus) {
   const chip = document.querySelector('#focusState');
   const details = document.querySelector('#focusDetails');
+  const quickTask = document.querySelector('#quickTask');
   const quickStatus = document.querySelector('#quickStatus');
   const quickDelay = document.querySelector('#quickDelay');
   const quickAction = document.querySelector('#quickAction');
@@ -2205,6 +2254,7 @@ function updateFocusSummary(focus) {
       <div class="detail-card"><span>Warning</span><strong>Off</strong></div>
       <div class="detail-card"><span>Action</span><strong>Start focus to enable alerts</strong></div>
     </div>`;
+    quickTask.textContent = 'None';
     quickStatus.textContent = 'Off';
     quickDelay.textContent = '1m';
     quickAction.textContent = 'Alert';
@@ -2225,6 +2275,7 @@ function updateFocusSummary(focus) {
       <div class="detail-card"><span>Warning delay</span><strong>${formatDuration(focus.alertDelaySeconds || 60)} outside focus</strong></div>
       <div class="detail-card"><span>Notification action</span><strong>${escapeHtml(action)}</strong></div>
     </div>`;
+  quickTask.textContent = focus.task || 'Focus session';
   quickStatus.textContent = paused ? 'Paused' : 'Active';
   quickDelay.textContent = formatDuration(focus.alertDelaySeconds || 60);
   quickAction.textContent = focus.alertAction === 'switch' && focus.redirectApp ? `Move` : 'Alert';
@@ -2232,11 +2283,13 @@ function updateFocusSummary(focus) {
 }
 function seedFocusInputsFromActiveSession(focus) {
   if (!focus) return;
+  const taskInput = document.querySelector('#task');
   const targetInput = document.querySelector('#target');
   const minutesInput = document.querySelector('#minutes');
   const alertInput = document.querySelector('#alertMinutes');
   const actionInput = document.querySelector('#alertAction');
   const redirectInput = document.querySelector('#redirectApp');
+  if (focus.task) taskInput.value = focus.task;
   if (focus.target && targetInput.value !== focus.target) setFocusTargets(focus.target);
   if (focus.durationMinutes) minutesInput.value = focus.durationMinutes;
   if (focus.alertDelaySeconds) alertInput.value = Math.max(1, Math.round(focus.alertDelaySeconds / 60));
@@ -2305,6 +2358,7 @@ function escapeAttr(value) {
   return String(value).replace(/[^a-z0-9_-]/gi, '-');
 }
 restoreFocusDraft();
+activeReportWeek = isoWeekNumber(selectedReportDate);
 renderReportCalendar();
 setFocusTaskWindow('day', calendarPeriodWindow('day', selectedReportDate));
 refresh();
