@@ -1025,8 +1025,9 @@ fn focus_report_json(
                 idle_seconds += 0;
             } else {
                 outside_seconds += seconds;
+                let (app, source) = report_activity_key(sample);
                 *distraction_counts
-                    .entry((sample.app.clone(), sample.source.clone()))
+                    .entry((app, source))
                     .or_default() += seconds;
             }
         }
@@ -1042,13 +1043,16 @@ fn focus_report_json(
         .iter()
         .map(|(target, seconds)| {
             let idle = target_idle_seconds.get(target).copied().unwrap_or(0);
+            let total = seconds + idle;
             format!(
-                "{{\"target\":\"{}\",\"seconds\":{},\"idleSeconds\":{},\"minutes\":{},\"idleMinutes\":{}}}",
+                "{{\"target\":\"{}\",\"seconds\":{},\"idleSeconds\":{},\"totalSeconds\":{},\"minutes\":{},\"idleMinutes\":{},\"totalMinutes\":{}}}",
                 json_escape(target),
                 seconds,
                 idle,
+                total,
                 seconds / 60,
-                idle / 60
+                idle / 60,
+                total / 60
             )
         })
         .collect::<Vec<_>>()
@@ -1139,6 +1143,35 @@ fn sample_matches_target_text(sample: &ActivitySample, target: &str) -> bool {
         || domain
             .as_ref()
             .is_some_and(|domain| !domain.is_empty() && haystack.contains(domain))
+}
+
+fn report_activity_key(sample: &ActivitySample) -> (String, String) {
+    if let Some((domain, source)) = website_report_key(&sample.source) {
+        return (domain, source);
+    }
+
+    (sample.app.clone(), sample.source.clone())
+}
+
+fn website_report_key(source: &str) -> Option<(String, String)> {
+    let trimmed = source.trim();
+    let (scheme, rest) = trimmed
+        .strip_prefix("https://")
+        .map(|rest| ("https", rest))
+        .or_else(|| trimmed.strip_prefix("http://").map(|rest| ("http", rest)))?;
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches(':');
+    if host.is_empty() {
+        return None;
+    }
+
+    let display_host = host.to_string();
+    let domain = host.trim_start_matches("www.").to_string();
+    Some((domain, format!("{scheme}://{display_host}/")))
 }
 
 fn reset_report(data_dir: &PathBuf) -> io::Result<()> {
@@ -1463,14 +1496,14 @@ function renderFocusReport(report) {
     return `<div><h2>${reportTitle}</h2><p class="muted">Add one or more focus apps or websites first, then run the report.</p></div>`;
   }
   const total = report.focusSeconds + report.outsideSeconds + report.idleSeconds;
-  const maxTarget = Math.max(1, ...report.targetBreakdown.map(item => item.seconds + (item.idleSeconds || 0)));
+  const maxTarget = Math.max(1, ...report.targetBreakdown.map(item => item.totalSeconds || item.seconds + (item.idleSeconds || 0)));
   const maxHour = Math.max(1, ...report.hourly.map(item => item.productiveSeconds + item.distractingSeconds + (item.idleSeconds || 0)));
   const focusAngle = `${Math.max(0, Math.min(100, report.focusPercent))}%`;
   const targetBars = report.targetBreakdown.map(item => `
     <div class="bar-row">
       <div>${sourceMarkup(item.target, `focus-${escapeAttr(item.target)}`)}</div>
-      <div class="bar-track"><div class="bar-fill" style="width:${Math.max(2, (item.seconds + (item.idleSeconds || 0)) * 100 / maxTarget)}%"></div></div>
-      <div class="muted">${formatDuration(item.seconds)} active${item.idleSeconds ? `<br>${formatDuration(item.idleSeconds)} idle` : ''}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${Math.max(2, (item.totalSeconds || item.seconds + (item.idleSeconds || 0)) * 100 / maxTarget)}%"></div></div>
+      <div class="muted">${formatDuration(item.totalSeconds || item.seconds + (item.idleSeconds || 0))} total<br>${formatDuration(item.seconds)} active<br>${formatDuration(item.idleSeconds || 0)} idle</div>
     </div>`).join('');
   const distractionRows = report.topDistractions.map((item, index) => `
     <div class="bar-row">
