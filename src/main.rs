@@ -270,6 +270,7 @@ fn start_focus(
         redirect_app: String::new(),
     };
     save_focus(&data_dir, &session)?;
+    append_focus_session(&data_dir, &session)?;
     let target_note = if session.target.trim().is_empty() {
         String::new()
     } else {
@@ -700,6 +701,70 @@ fn append_event(data_dir: &PathBuf, kind: &str, message: &str) -> io::Result<()>
     )
 }
 
+fn append_focus_session(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("focus_sessions.jsonl"))?;
+    writeln!(
+        file,
+        "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\"}}",
+        json_escape(&focus.task),
+        json_escape(&focus.target),
+        focus.started_at,
+        focus.duration_minutes,
+        focus.alert_delay_seconds,
+        json_escape(&focus.alert_action),
+        json_escape(&focus.redirect_app)
+    )
+}
+
+fn focus_sessions_json(
+    data_dir: &PathBuf,
+    since: Option<i64>,
+    until: Option<i64>,
+    current_focus: Option<FocusSession>,
+) -> io::Result<String> {
+    let path = data_dir.join("focus_sessions.jsonl");
+    let mut rows = Vec::new();
+    if path.exists() {
+        let reader = BufReader::new(File::open(path)?);
+        for line in reader.lines().map_while(Result::ok) {
+            let started_at = json_number(&line, "startedAt").unwrap_or(0);
+            if started_at == 0
+                || since.is_some_and(|value| started_at < value)
+                || until.is_some_and(|value| started_at >= value)
+            {
+                continue;
+            }
+            rows.push(line);
+        }
+    }
+
+    if let Some(focus) = current_focus {
+        if since.map_or(true, |value| focus.started_at >= value)
+            && until.map_or(true, |value| focus.started_at < value)
+            && !rows
+                .iter()
+                .any(|line| json_number(line, "startedAt") == Some(focus.started_at))
+        {
+            rows.push(format!(
+                "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\"}}",
+                json_escape(&focus.task),
+                json_escape(&focus.target),
+                focus.started_at,
+                focus.duration_minutes,
+                focus.alert_delay_seconds,
+                json_escape(&focus.alert_action),
+                json_escape(&focus.redirect_app)
+            ));
+        }
+    }
+
+    rows.sort_by_key(|line| json_number(line, "startedAt").unwrap_or(0));
+    Ok(format!("[{}]", rows.join(",")))
+}
+
 fn load_samples(data_dir: &PathBuf) -> io::Result<Vec<ActivitySample>> {
     let path = data_dir.join("activity.jsonl");
     if !path.exists() {
@@ -783,6 +848,7 @@ fn handle_http(
             redirect_app,
         };
         save_focus(&data_dir, &session)?;
+        append_focus_session(&data_dir, &session)?;
         if let Ok(mut state) = state.lock() {
             state.focus = Some(session.clone());
         }
@@ -857,6 +923,17 @@ fn handle_http(
         write_response(&mut stream, "application/json", "{\"ok\":true}")?;
     } else if path == "/api/report/history" {
         write_response(&mut stream, "application/json", &report_history_json(&data_dir)?)?;
+    } else if path.starts_with("/api/focus-sessions") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let since = params.get("since").and_then(|value| value.parse::<i64>().ok());
+        let until = params.get("until").and_then(|value| value.parse::<i64>().ok());
+        let focus = state.lock().ok().and_then(|s| s.focus.clone());
+        write_response(
+            &mut stream,
+            "application/json",
+            &focus_sessions_json(&data_dir, since, until, focus)?,
+        )?;
     } else if path.starts_with("/api/focus-report") {
         let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
         let params = parse_query(query);
@@ -1447,9 +1524,21 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .focus-shell h2 { margin:0; font-size:18px; }
 .control-shell { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; display:grid; gap:14px; }
 .control-shell h2 { margin:0; font-size:16px; }
-.control-fields { display:grid; grid-template-columns:minmax(170px, .4fr) minmax(170px, .4fr) auto; gap:12px; align-items:end; }
+.report-calendar { display:grid; gap:12px; }
+.calendar-head { display:grid; grid-template-columns:auto 1fr auto; gap:10px; align-items:center; }
+.calendar-title { text-align:center; font-weight:800; }
+.calendar-actions { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
+.calendar-actions button, .week-button, .day-button { min-height:40px; }
+.calendar-grid { display:grid; grid-template-columns:64px repeat(7, minmax(0, 1fr)); gap:6px; align-items:stretch; }
+.calendar-label { color:var(--muted); font-size:12px; font-weight:750; text-align:center; padding:4px; }
+.week-button, .day-button { width:100%; padding:8px 6px; }
+.day-button.outside { color:var(--muted); opacity:.65; }
+.day-button.selected { background:var(--good); border-color:var(--good); color:white; }
+.focus-task-window { border:1px solid var(--line); border-radius:10px; padding:12px; background:var(--panel-soft); display:grid; gap:8px; }
+.focus-task-window.disabled { opacity:.55; }
+.focus-session-list { display:grid; gap:8px; }
+.focus-session-row { border:1px solid var(--line); border-radius:8px; padding:9px; background:var(--panel); }
 .block-fields { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:12px; align-items:end; }
-.control-fields button { min-height:42px; min-width:140px; white-space:nowrap; }
 .block-fields button { min-height:42px; min-width:140px; white-space:nowrap; }
 .focus-layout { display:grid; grid-template-columns:minmax(0, 1.3fr) minmax(320px, .7fr); gap:16px; align-items:start; }
 .focus-layout.editor-collapsed { grid-template-columns:minmax(0, 520px); }
@@ -1574,8 +1663,8 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .idle { color:var(--warn); background:color-mix(in srgb, var(--warn) 16%, transparent); }
 .two { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
 @media (max-width:980px) { .focus-layout, .control-shell { grid-template-columns:1fr; } .focus-actions { justify-content:flex-start; } }
-@media (max-width:900px) { .focus-shell-head { align-items:start; display:grid; } .top-actions { justify-content:flex-start; } .control-fields, .block-fields { grid-template-columns:minmax(0, 1fr) auto; } }
-@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid, .control-fields, .block-fields, .activity-row { grid-template-columns:1fr; display:grid; } header { align-items:start; } .header-actions { justify-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } }
+@media (max-width:900px) { .focus-shell-head { align-items:start; display:grid; } .top-actions { justify-content:flex-start; } .block-fields { grid-template-columns:minmax(0, 1fr) auto; } }
+@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid, .block-fields, .activity-row, .calendar-actions { grid-template-columns:1fr; display:grid; } header { align-items:start; } .header-actions { justify-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } .calendar-grid { grid-template-columns:48px repeat(7, minmax(28px, 1fr)); gap:4px; } }
 </style>
 </head>
 <body>
@@ -1637,24 +1726,24 @@ button:disabled { cursor:not-allowed; opacity:.55; }
   <section class="control-shell" aria-label="Reports">
     <div>
       <h2>Reports</h2>
-      <div class="muted">Generate focus reports for the current or previous hour, day, week, month, or year.</div>
+      <div class="muted">Click a year, month, week, or date to generate that report.</div>
     </div>
-    <div class="control-fields">
-      <div class="field"><label for="reportPeriod">Focus report for</label><select id="reportPeriod" aria-label="Focus report period">
-        <option value="hour">Hour</option>
-        <option value="day">Day</option>
-        <option value="week">Week</option>
-        <option value="month">Month</option>
-        <option value="year">Year</option>
-      </select></div>
-      <div class="field"><label for="reportOffset">Report window</label><select id="reportOffset" aria-label="Report window">
-        <option value="0">Current</option>
-        <option value="1">Previous 1</option>
-        <option value="2">Previous 2</option>
-        <option value="3">Previous 3</option>
-        <option value="7">Previous 7</option>
-      </select></div>
-      <button id="focusReportButton" onclick="generateSelectedFocusReport()">Generate report</button>
+    <div class="report-calendar">
+      <div class="calendar-head">
+        <button type="button" onclick="moveCalendarMonth(-1)" aria-label="Previous month">Prev</button>
+        <div id="calendarTitle" class="calendar-title"></div>
+        <button type="button" onclick="moveCalendarMonth(1)" aria-label="Next month">Next</button>
+      </div>
+      <div class="calendar-actions">
+        <button id="yearReportButton" type="button" onclick="generateCalendarReport('year')"></button>
+        <button id="monthReportButton" type="button" onclick="generateCalendarReport('month')"></button>
+        <button id="selectedWeekButton" type="button" onclick="generateCalendarReport('week')"></button>
+      </div>
+      <div id="calendarGrid" class="calendar-grid" aria-label="Report calendar"></div>
+      <div id="focusTaskWindow" class="focus-task-window">
+        <div><strong>Report window</strong><div class="muted" id="focusTaskWindowHint">Focus tasks created for the selected date.</div></div>
+        <div id="focusSessionList" class="focus-session-list"></div>
+      </div>
     </div>
   </section>
   <section class="control-shell" aria-label="Distraction rules">
@@ -1696,6 +1785,8 @@ const focusDraftKey = 'local-focus-draft';
 let focusEditorManuallyOpened = false;
 let focusTargets = [];
 let currentFocusReport = null;
+let calendarDate = new Date();
+let selectedReportDate = new Date();
 const fmtTime = seconds => new Date(seconds * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 const minutes = seconds => Math.max(1, Math.round(seconds / 60));
 async function startFocus() {
@@ -1817,57 +1908,123 @@ function toggleFocusEditor() {
   const editor = document.querySelector('#focusEditor');
   setFocusEditorOpen(editor.classList.contains('editor-collapsed'), true);
 }
-async function generateSelectedFocusReport() {
-  const button = document.querySelector('#focusReportButton');
+async function runCalendarReport(period, dateValue = selectedReportDate) {
   const panel = document.querySelector('#focusReportPanel');
   const target = document.querySelector('#target').value || '';
-  const period = document.querySelector('#reportPeriod').value || 'day';
-  const offset = Number(document.querySelector('#reportOffset').value || '0');
-  const windowRange = periodWindow(period, offset);
+  const windowRange = calendarPeriodWindow(period, dateValue);
   const since = Math.floor(windowRange.since.getTime() / 1000);
   const until = Math.floor(windowRange.until.getTime() / 1000);
-  button.textContent = 'Building report...';
-  button.disabled = true;
+  setFocusTaskWindow(period, windowRange);
   try {
     const report = await fetch(`/api/focus-report?target=${encodeURIComponent(target)}&since=${since}&until=${until}&period=${encodeURIComponent(period)}`).then(r => r.json());
     currentFocusReport = report;
     panel.innerHTML = renderFocusReport(report);
     panel.classList.add('open');
-  } finally {
-    button.disabled = false;
-    button.textContent = 'Generate report';
+  } catch (error) {
+    panel.innerHTML = `<p class="muted">Could not generate report.</p>`;
+    panel.classList.add('open');
   }
 }
-function periodWindow(period, offset) {
-  const start = new Date();
-  const end = new Date(start);
-  if (period === 'hour') {
-    start.setMinutes(0, 0, 0);
-    start.setHours(start.getHours() - offset);
-    end.setTime(start.getTime());
-    end.setHours(end.getHours() + 1);
-  } else {
-    start.setHours(0, 0, 0, 0);
-    if (period === 'week') {
-    const day = start.getDay();
-    const offset = day === 0 ? 6 : day - 1;
+function calendarPeriodWindow(period, dateValue) {
+  const start = new Date(dateValue);
+  start.setHours(0, 0, 0, 0);
+  if (period === 'week') {
+    const offset = start.getDay() === 0 ? 6 : start.getDay() - 1;
     start.setDate(start.getDate() - offset);
-    } else if (period === 'month') {
+  } else if (period === 'month') {
     start.setDate(1);
-    } else if (period === 'year') {
+  } else if (period === 'year') {
     start.setMonth(0, 1);
-    }
-    if (period === 'day') start.setDate(start.getDate() - offset);
-    if (period === 'week') start.setDate(start.getDate() - offset * 7);
-    if (period === 'month') start.setMonth(start.getMonth() - offset);
-    if (period === 'year') start.setFullYear(start.getFullYear() - offset);
-    end.setTime(start.getTime());
-    if (period === 'day') end.setDate(end.getDate() + 1);
-    if (period === 'week') end.setDate(end.getDate() + 7);
-    if (period === 'month') end.setMonth(end.getMonth() + 1);
-    if (period === 'year') end.setFullYear(end.getFullYear() + 1);
   }
+  const end = new Date(start);
+  if (period === 'day') end.setDate(end.getDate() + 1);
+  if (period === 'week') end.setDate(end.getDate() + 7);
+  if (period === 'month') end.setMonth(end.getMonth() + 1);
+  if (period === 'year') end.setFullYear(end.getFullYear() + 1);
   return { since: start, until: end };
+}
+function moveCalendarMonth(delta) {
+  calendarDate.setMonth(calendarDate.getMonth() + delta);
+  renderReportCalendar();
+}
+function renderReportCalendar() {
+  const monthStart = new Date(calendarDate.getFullYear(), calendarDate.getMonth(), 1);
+  const gridStart = new Date(monthStart);
+  gridStart.setDate(gridStart.getDate() - (gridStart.getDay() === 0 ? 6 : gridStart.getDay() - 1));
+  document.querySelector('#calendarTitle').textContent = monthStart.toLocaleDateString([], {month:'long', year:'numeric'});
+  document.querySelector('#yearReportButton').textContent = String(monthStart.getFullYear());
+  document.querySelector('#monthReportButton').textContent = monthStart.toLocaleDateString([], {month:'long'});
+  document.querySelector('#selectedWeekButton').textContent = `Week ${isoWeekNumber(selectedReportDate)}`;
+  const labels = ['Week', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  let html = labels.map(label => `<div class="calendar-label">${label}</div>`).join('');
+  for (let row = 0; row < 6; row += 1) {
+    const weekDate = new Date(gridStart);
+    weekDate.setDate(gridStart.getDate() + row * 7);
+    html += `<button type="button" class="week-button" onclick="selectCalendarWeek(${weekDate.getFullYear()}, ${weekDate.getMonth()}, ${weekDate.getDate()})">W${isoWeekNumber(weekDate)}</button>`;
+    for (let col = 0; col < 7; col += 1) {
+      const day = new Date(weekDate);
+      day.setDate(weekDate.getDate() + col);
+      const outside = day.getMonth() !== monthStart.getMonth();
+      const selected = sameDate(day, selectedReportDate);
+      html += `<button type="button" class="day-button ${outside ? 'outside' : ''} ${selected ? 'selected' : ''}" onclick="selectCalendarDay(${day.getFullYear()}, ${day.getMonth()}, ${day.getDate()})">${day.getDate()}</button>`;
+    }
+  }
+  document.querySelector('#calendarGrid').innerHTML = html;
+}
+function selectCalendarDay(year, month, day) {
+  selectedReportDate = new Date(year, month, day);
+  calendarDate = new Date(year, month, 1);
+  renderReportCalendar();
+  runCalendarReport('day', selectedReportDate);
+}
+function selectCalendarWeek(year, month, day) {
+  selectedReportDate = new Date(year, month, day);
+  calendarDate = new Date(year, month, 1);
+  renderReportCalendar();
+  runCalendarReport('week', selectedReportDate);
+}
+async function setFocusTaskWindow(period, windowRange) {
+  const shell = document.querySelector('#focusTaskWindow');
+  const hint = document.querySelector('#focusTaskWindowHint');
+  const list = document.querySelector('#focusSessionList');
+  shell.classList.toggle('disabled', period !== 'day');
+  if (period !== 'day') {
+    hint.textContent = 'Available only when a single date is selected.';
+    list.innerHTML = '<p class="muted">Select a date to see focus tasks created that day.</p>';
+    return;
+  }
+  hint.textContent = `Focus tasks created on ${windowRange.since.toLocaleDateString([], {dateStyle:'medium'})}.`;
+  const since = Math.floor(windowRange.since.getTime() / 1000);
+  const until = Math.floor(windowRange.until.getTime() / 1000);
+  const sessions = await fetch(`/api/focus-sessions?since=${since}&until=${until}`).then(r => r.json());
+  list.innerHTML = sessions.map(session => `
+    <div class="focus-session-row">
+      <strong>${escapeHtml(session.task || 'Focus session')}</strong>
+      <div class="muted">${new Date(session.startedAt * 1000).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'})} · ${session.durationMinutes || 0}m</div>
+      <div>${escapeHtml(session.target || 'No focus apps/sites recorded')}</div>
+    </div>
+  `).join('') || '<p class="muted">No focus tasks were created for this date.</p>';
+}
+function generateCalendarReport(period) {
+  if (period === 'year') {
+    runCalendarReport('year', new Date(calendarDate.getFullYear(), 0, 1));
+  } else if (period === 'month') {
+    runCalendarReport('month', new Date(calendarDate.getFullYear(), calendarDate.getMonth(), 1));
+  } else if (period === 'week') {
+    runCalendarReport('week', selectedReportDate);
+  } else if (period === 'day') {
+    runCalendarReport('day', selectedReportDate);
+  }
+}
+function sameDate(left, right) {
+  return left.getFullYear() === right.getFullYear() && left.getMonth() === right.getMonth() && left.getDate() === right.getDate();
+}
+function isoWeekNumber(dateValue) {
+  const date = new Date(Date.UTC(dateValue.getFullYear(), dateValue.getMonth(), dateValue.getDate()));
+  const day = date.getUTCDay() || 7;
+  date.setUTCDate(date.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1));
+  return Math.ceil((((date - yearStart) / 86400000) + 1) / 7);
 }
 function renderFocusReport(report) {
   const periodName = report.period ? report.period[0].toUpperCase() + report.period.slice(1) : 'Report';
@@ -2148,6 +2305,8 @@ function escapeAttr(value) {
   return String(value).replace(/[^a-z0-9_-]/gi, '-');
 }
 restoreFocusDraft();
+renderReportCalendar();
+setFocusTaskWindow('day', calendarPeriodWindow('day', selectedReportDate));
 refresh();
 setInterval(refresh, 10000);
 </script>
