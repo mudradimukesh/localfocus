@@ -1305,6 +1305,16 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .report h2, .report h3 { margin:0; }
 .report-card { border:1px solid var(--line); border-radius:8px; padding:14px; min-width:0; }
 .report-card strong { display:block; font-size:24px; margin-top:4px; }
+.target-list { display:grid; gap:12px; margin-top:12px; }
+.target-row { display:grid; gap:8px; border-top:1px solid var(--line); padding-top:12px; }
+.target-head { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
+.target-name { min-width:0; font-weight:700; overflow-wrap:anywhere; }
+.target-total { color:var(--ink); font-weight:750; white-space:nowrap; }
+.target-stack { display:flex; height:16px; overflow:hidden; border-radius:999px; background:color-mix(in srgb, var(--line) 55%, transparent); }
+.target-active { background:var(--good); min-width:2px; }
+.target-idle { background:var(--warn); min-width:2px; }
+.target-meta { display:flex; flex-wrap:wrap; gap:8px; }
+.meta-pill { border:1px solid var(--line); border-radius:999px; padding:3px 8px; color:var(--muted); font-size:12px; }
 .bar-row { display:grid; grid-template-columns:minmax(110px, 1fr) 2fr 72px; gap:10px; align-items:center; margin:10px 0; }
 .bar-track { height:12px; background:color-mix(in srgb, var(--line) 55%, transparent); border-radius:999px; overflow:hidden; }
 .bar-fill { height:100%; background:var(--good); border-radius:999px; min-width:2px; }
@@ -1500,10 +1510,20 @@ function renderFocusReport(report) {
   const maxHour = Math.max(1, ...report.hourly.map(item => item.productiveSeconds + item.distractingSeconds + (item.idleSeconds || 0)));
   const focusAngle = `${Math.max(0, Math.min(100, report.focusPercent))}%`;
   const targetBars = report.targetBreakdown.map(item => `
-    <div class="bar-row">
-      <div>${sourceMarkup(item.target, `focus-${escapeAttr(item.target)}`)}</div>
-      <div class="bar-track"><div class="bar-fill" style="width:${Math.max(2, (item.totalSeconds || item.seconds + (item.idleSeconds || 0)) * 100 / maxTarget)}%"></div></div>
-      <div class="muted">${formatDuration(item.totalSeconds || item.seconds + (item.idleSeconds || 0))} total<br>${formatDuration(item.seconds)} active<br>${formatDuration(item.idleSeconds || 0)} idle</div>
+    <div class="target-row">
+      <div class="target-head">
+        <div class="target-name">${sourceMarkup(item.target, `focus-${escapeAttr(item.target)}`)}</div>
+        <div class="target-total">${formatDuration(item.totalSeconds || item.seconds + (item.idleSeconds || 0))}</div>
+      </div>
+      <div class="target-stack" aria-label="Active and idle time">
+        <div class="target-active" style="width:${Math.max(0, item.seconds * 100 / maxTarget)}%"></div>
+        <div class="target-idle" style="width:${Math.max(0, (item.idleSeconds || 0) * 100 / maxTarget)}%"></div>
+      </div>
+      <div class="target-meta">
+        <span class="meta-pill">total ${formatDuration(item.totalSeconds || item.seconds + (item.idleSeconds || 0))}</span>
+        <span class="meta-pill">focus active ${formatDuration(item.seconds)}</span>
+        <span class="meta-pill">idle ${formatDuration(item.idleSeconds || 0)}</span>
+      </div>
     </div>`).join('');
   const distractionRows = report.topDistractions.map((item, index) => `
     <div class="bar-row">
@@ -1542,7 +1562,7 @@ function renderFocusReport(report) {
       <div class="report-card"><span class="muted">Outside focus</span><strong>${formatDuration(report.outsideSeconds)}</strong></div>
       <div class="report-card"><span class="muted">Idle</span><strong>${formatDuration(report.idleSeconds)}</strong></div>
     </div>
-    <div class="report-card"><h3>Time on focus apps and websites</h3>${targetBars || '<p class="muted">No target activity yet.</p>'}</div>
+    <div class="report-card"><h3>Time on focus apps and websites</h3><div class="target-list">${targetBars || '<p class="muted">No target activity yet.</p>'}</div></div>
     <div class="report-two">
       <div class="report-card">
         <h3>Focus split</h3>
@@ -1649,6 +1669,11 @@ function shortenSource(source) {
 function formatDuration(seconds) {
   if (!seconds) return '0s';
   if (seconds < 60) return `${seconds}s`;
+  if (seconds > 3600) {
+    const hours = Math.floor(seconds / 3600);
+    const mins = Math.round((seconds % 3600) / 60);
+    return mins ? `${hours}h ${mins}m` : `${hours}h`;
+  }
   const mins = Math.floor(seconds / 60);
   const rest = seconds % 60;
   return rest ? `${mins}m ${rest}s` : `${mins}m`;
