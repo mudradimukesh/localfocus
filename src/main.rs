@@ -1017,11 +1017,23 @@ fn focus_report_json(
     let mut idle_seconds = 0;
     let mut distraction_counts: BTreeMap<(String, String), u64> = BTreeMap::new();
     let mut hourly: BTreeMap<i64, (u64, u64, u64)> = BTreeMap::new();
+    let mut hourly_details: BTreeMap<i64, BTreeMap<(String, String, String, String), u64>> =
+        BTreeMap::new();
 
     for sample in &recent {
         let seconds = SAMPLE_SECONDS;
         let bucket = sample.timestamp - sample.timestamp.rem_euclid(60 * 60);
         let entry = hourly.entry(bucket).or_default();
+        *hourly_details
+            .entry(bucket)
+            .or_default()
+            .entry((
+                sample.app.clone(),
+                sample.title.clone(),
+                sample.source.clone(),
+                sample.category.clone(),
+            ))
+            .or_default() += seconds;
         if sample.category == "productive" {
             productive_seconds += seconds;
             entry.0 += seconds;
@@ -1100,9 +1112,30 @@ fn focus_report_json(
     let hourly_json = hourly
         .into_iter()
         .map(|(hour, (productive, distracting, idle))| {
+            let mut details = hourly_details
+                .remove(&hour)
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>();
+            details.sort_by(|a, b| b.1.cmp(&a.1));
+            let details_json = details
+                .into_iter()
+                .take(12)
+                .map(|((app, title, source, category), seconds)| {
+                    format!(
+                        "{{\"app\":\"{}\",\"title\":\"{}\",\"source\":\"{}\",\"category\":\"{}\",\"seconds\":{}}}",
+                        json_escape(&app),
+                        json_escape(&title),
+                        json_escape(&source),
+                        json_escape(&category),
+                        seconds
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             format!(
-                "{{\"hour\":{},\"productiveSeconds\":{},\"distractingSeconds\":{},\"idleSeconds\":{}}}",
-                hour, productive, distracting, idle
+                "{{\"hour\":{},\"productiveSeconds\":{},\"distractingSeconds\":{},\"idleSeconds\":{},\"items\":[{}]}}",
+                hour, productive, distracting, idle, details_json
             )
         })
         .collect::<Vec<_>>()
@@ -1412,11 +1445,22 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .focus-title { display:flex; align-items:center; gap:12px; }
 .focus-mark { width:42px; height:42px; border-radius:10px; background:linear-gradient(135deg, var(--accent), var(--good)); color:white; display:grid; place-items:center; font-weight:850; letter-spacing:.04em; }
 .focus-shell h2 { margin:0; font-size:18px; }
+.control-shell { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; display:grid; gap:14px; }
+.control-shell h2 { margin:0; font-size:16px; }
+.control-fields { display:grid; grid-template-columns:minmax(0, 1fr) auto minmax(150px, .25fr) minmax(150px, .25fr) auto; gap:12px; align-items:end; }
+.control-fields button { min-height:42px; min-width:140px; white-space:nowrap; }
 .focus-layout { display:grid; grid-template-columns:minmax(0, 1.3fr) minmax(320px, .7fr); gap:16px; align-items:start; }
 .focus-layout.editor-collapsed { grid-template-columns:minmax(0, 520px); }
 .focus-layout.editor-collapsed .focus-form { display:none; }
 .focus-form { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; align-items:end; }
 .focus-form .field-wide { grid-column:1 / -1; }
+.target-builder { display:grid; gap:8px; }
+.target-entry { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; }
+.target-entry button { min-width:96px; }
+.target-list-editor { display:flex; flex-wrap:wrap; gap:8px; min-height:38px; padding:8px; border:1px solid var(--line); border-radius:8px; background:var(--panel-soft); }
+.target-list-editor.empty::before { content:"Add up to 10 focus apps or websites."; color:var(--muted); }
+.target-remove { display:inline-flex; align-items:center; gap:6px; max-width:100%; border:1px solid color-mix(in srgb, var(--accent) 35%, var(--line)); border-radius:999px; padding:5px 9px; background:var(--panel); color:var(--ink); font:inherit; font-weight:650; overflow-wrap:anywhere; }
+.target-remove span { color:var(--muted); font-weight:850; }
 .focus-actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:flex-end; }
 .focus-side { border:1px solid var(--line); border-radius:10px; padding:14px; background:var(--panel-soft); display:grid; gap:12px; }
 .focus-side h3 { margin:0; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; }
@@ -1485,6 +1529,8 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .hour-bars { display:grid; grid-template-columns:repeat(12, minmax(34px, 1fr)); gap:10px; align-items:end; min-height:150px; }
 .hour-bar { display:grid; align-items:end; height:120px; gap:2px; }
 .hour-segment { position:relative; border-radius:4px 4px 0 0; min-height:2px; cursor:default; }
+.hour-click { border:0; background:transparent; padding:0; color:inherit; width:100%; cursor:pointer; }
+.hour-detail { margin-top:12px; display:grid; gap:8px; }
 .hour-segment:hover::after { content:attr(data-tip); position:absolute; left:50%; bottom:calc(100% + 8px); transform:translateX(-50%); z-index:10; width:max-content; max-width:220px; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--ink); box-shadow:0 8px 24px color-mix(in srgb, var(--ink) 18%, transparent); font-size:12px; font-weight:650; white-space:normal; }
 .hour-segment:hover::before { content:""; position:absolute; left:50%; bottom:100%; transform:translateX(-50%); border:5px solid transparent; border-top-color:var(--line); z-index:11; }
 .hour-good, .hour-bad { border-radius:4px 4px 0 0; min-height:2px; }
@@ -1507,8 +1553,9 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .distracting { color:var(--bad); background:color-mix(in srgb, var(--bad) 14%, transparent); }
 .idle { color:var(--warn); background:color-mix(in srgb, var(--warn) 16%, transparent); }
 .two { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
-@media (max-width:980px) { .focus-layout { grid-template-columns:1fr; } .focus-actions { justify-content:flex-start; } }
-@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid { grid-template-columns:1fr; display:grid; } header { align-items:start; } .header-actions { justify-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } }
+@media (max-width:980px) { .focus-layout, .control-shell { grid-template-columns:1fr; } .focus-actions { justify-content:flex-start; } }
+@media (max-width:900px) { .focus-shell-head { align-items:start; display:grid; } .top-actions { justify-content:flex-start; } .control-fields { grid-template-columns:minmax(0, 1fr) auto; } }
+@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid, .control-fields { grid-template-columns:1fr; display:grid; } header { align-items:start; } .header-actions { justify-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -1534,7 +1581,15 @@ button:disabled { cursor:not-allowed; opacity:.55; }
     <div id="focusDetails" class="focus-details"></div>
     <div id="focusEditor" class="focus-layout">
       <div class="focus-form">
-        <div class="field field-wide"><label for="target">Focus apps and websites</label><textarea id="target" placeholder="Pages, https://claude.ai/, https://gemini.google.com, Notes" aria-label="Focus targets"></textarea></div>
+        <div class="field field-wide target-builder">
+          <label for="targetInput">Focus apps and websites</label>
+          <div class="target-entry">
+            <input id="targetInput" placeholder="Pages, https://claude.ai/" aria-label="Focus app or website">
+            <button type="button" onclick="addFocusTarget()">Add</button>
+          </div>
+          <div id="targetListEditor" class="target-list-editor empty" aria-live="polite"></div>
+          <input id="target" type="hidden" aria-label="Focus targets">
+        </div>
         <div class="field"><label for="minutes">Focus timer</label><input id="minutes" type="number" min="1" max="180" value="25" aria-label="Minutes"></div>
         <div class="field"><label for="alertMinutes">Warn after</label><input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Alert after minutes" title="Alert after minutes outside focus"></div>
         <div class="field"><label for="alertAction">Warning action</label><select id="alertAction" aria-label="After delay action" title="After delay action">
@@ -1559,18 +1614,30 @@ button:disabled { cursor:not-allowed; opacity:.55; }
       </aside>
     </div>
   </section>
-  <section class="bar">
-    <div class="field field-wide"><label for="blockKeyword">Block keyword, app, or site</label><input id="blockKeyword" placeholder="youtube, reddit, games" aria-label="Block keyword"></div>
-    <button onclick="addBlock()">Add block</button>
-  </section>
-  <section class="bar">
-    <div class="field"><label for="reportPeriod">Focus report for</label><select id="reportPeriod" aria-label="Focus report period">
-      <option value="day">Day</option>
-      <option value="week">Week</option>
-      <option value="month">Month</option>
-      <option value="year">Year</option>
-    </select></div>
-    <button id="focusReportButton" onclick="generateSelectedFocusReport()">Generate report</button>
+  <section class="control-shell" aria-label="Review controls">
+    <div>
+      <h2>Review controls</h2>
+      <div class="muted">Add distraction rules and create focus reports from one place.</div>
+    </div>
+    <div class="control-fields">
+      <div class="field"><label for="blockKeyword">Block keyword, app, or site</label><input id="blockKeyword" placeholder="youtube, reddit, games" aria-label="Block keyword"></div>
+      <button onclick="addBlock()">Add block</button>
+      <div class="field"><label for="reportPeriod">Focus report for</label><select id="reportPeriod" aria-label="Focus report period">
+        <option value="hour">Hour</option>
+        <option value="day">Day</option>
+        <option value="week">Week</option>
+        <option value="month">Month</option>
+        <option value="year">Year</option>
+      </select></div>
+      <div class="field"><label for="reportOffset">Report window</label><select id="reportOffset" aria-label="Report window">
+        <option value="0">Current</option>
+        <option value="1">Previous 1</option>
+        <option value="2">Previous 2</option>
+        <option value="3">Previous 3</option>
+        <option value="7">Previous 7</option>
+      </select></div>
+      <button id="focusReportButton" onclick="generateSelectedFocusReport()">Generate report</button>
+    </div>
   </section>
   <section class="explain" id="explainPanel">
     <h2>Report meaning</h2>
@@ -1599,6 +1666,8 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 <script>
 const focusDraftKey = 'local-focus-draft';
 let focusEditorManuallyOpened = false;
+let focusTargets = [];
+let currentFocusReport = null;
 const fmtTime = seconds => new Date(seconds * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 const minutes = seconds => Math.max(1, Math.round(seconds / 60));
 async function startFocus() {
@@ -1640,16 +1709,52 @@ function saveFocusDraft() {
 function restoreFocusDraft() {
   try {
     const draft = JSON.parse(localStorage.getItem(focusDraftKey) || '{}');
-    if (draft.target) document.querySelector('#target').value = draft.target;
+    if (draft.target) setFocusTargets(draft.target);
     if (draft.minutes) document.querySelector('#minutes').value = draft.minutes;
     if (draft.alertMinutes) document.querySelector('#alertMinutes').value = draft.alertMinutes;
     if (draft.alertAction) document.querySelector('#alertAction').value = draft.alertAction;
     if (draft.redirectApp) document.querySelector('#redirectApp').value = draft.redirectApp;
   } catch {}
-  ['#target', '#minutes', '#alertMinutes', '#alertAction', '#redirectApp'].forEach(selector => {
+  ['#minutes', '#alertMinutes', '#alertAction', '#redirectApp'].forEach(selector => {
     document.querySelector(selector).addEventListener('input', saveFocusDraft);
     document.querySelector(selector).addEventListener('change', saveFocusDraft);
   });
+  document.querySelector('#targetInput').addEventListener('keydown', event => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      addFocusTarget();
+    }
+  });
+}
+function setFocusTargets(value) {
+  focusTargets = String(value || '').split(/[,\n]/).map(item => item.trim()).filter(Boolean).slice(0, 10);
+  syncFocusTargets();
+}
+function syncFocusTargets() {
+  document.querySelector('#target').value = focusTargets.join(', ');
+  const editor = document.querySelector('#targetListEditor');
+  editor.classList.toggle('empty', focusTargets.length === 0);
+  editor.innerHTML = focusTargets.map((target, index) => `
+    <button type="button" class="target-remove" onclick="removeFocusTarget(${index})">${escapeHtml(shortenSource(target))} <span aria-hidden="true">x</span></button>
+  `).join('');
+  saveFocusDraft();
+}
+function addFocusTarget() {
+  const input = document.querySelector('#targetInput');
+  const value = input.value.trim();
+  if (!value || focusTargets.length >= 10) return;
+  for (const target of value.split(/[,\n]/).map(item => item.trim()).filter(Boolean)) {
+    if (focusTargets.length >= 10) break;
+    if (!focusTargets.some(existing => existing.toLowerCase() === target.toLowerCase())) {
+      focusTargets.push(target);
+    }
+  }
+  input.value = '';
+  syncFocusTargets();
+}
+function removeFocusTarget(index) {
+  focusTargets.splice(index, 1);
+  syncFocusTargets();
 }
 function toggleExplain() {
   const panel = document.querySelector('#explainPanel');
@@ -1689,11 +1794,15 @@ async function generateSelectedFocusReport() {
   const panel = document.querySelector('#focusReportPanel');
   const target = document.querySelector('#target').value || '';
   const period = document.querySelector('#reportPeriod').value || 'day';
-  const since = Math.floor(periodStart(period).getTime() / 1000);
+  const offset = Number(document.querySelector('#reportOffset').value || '0');
+  const windowRange = periodWindow(period, offset);
+  const since = Math.floor(windowRange.since.getTime() / 1000);
+  const until = Math.floor(windowRange.until.getTime() / 1000);
   button.textContent = 'Building report...';
   button.disabled = true;
   try {
-    const report = await fetch(`/api/focus-report?target=${encodeURIComponent(target)}&since=${since}&period=${encodeURIComponent(period)}`).then(r => r.json());
+    const report = await fetch(`/api/focus-report?target=${encodeURIComponent(target)}&since=${since}&until=${until}&period=${encodeURIComponent(period)}`).then(r => r.json());
+    currentFocusReport = report;
     panel.innerHTML = renderFocusReport(report);
     panel.classList.add('open');
   } finally {
@@ -1701,19 +1810,36 @@ async function generateSelectedFocusReport() {
     button.textContent = 'Generate report';
   }
 }
-function periodStart(period) {
+function periodWindow(period, offset) {
   const start = new Date();
-  start.setHours(0, 0, 0, 0);
-  if (period === 'week') {
+  const end = new Date(start);
+  if (period === 'hour') {
+    start.setMinutes(0, 0, 0);
+    start.setHours(start.getHours() - offset);
+    end.setTime(start.getTime());
+    end.setHours(end.getHours() + 1);
+  } else {
+    start.setHours(0, 0, 0, 0);
+    if (period === 'week') {
     const day = start.getDay();
     const offset = day === 0 ? 6 : day - 1;
     start.setDate(start.getDate() - offset);
-  } else if (period === 'month') {
+    } else if (period === 'month') {
     start.setDate(1);
-  } else if (period === 'year') {
+    } else if (period === 'year') {
     start.setMonth(0, 1);
+    }
+    if (period === 'day') start.setDate(start.getDate() - offset);
+    if (period === 'week') start.setDate(start.getDate() - offset * 7);
+    if (period === 'month') start.setMonth(start.getMonth() - offset);
+    if (period === 'year') start.setFullYear(start.getFullYear() - offset);
+    end.setTime(start.getTime());
+    if (period === 'day') end.setDate(end.getDate() + 1);
+    if (period === 'week') end.setDate(end.getDate() + 7);
+    if (period === 'month') end.setMonth(end.getMonth() + 1);
+    if (period === 'year') end.setFullYear(end.getFullYear() + 1);
   }
-  return start;
+  return { since: start, until: end };
 }
 function renderFocusReport(report) {
   const periodName = report.period ? report.period[0].toUpperCase() + report.period.slice(1) : 'Report';
@@ -1756,11 +1882,13 @@ function renderFocusReport(report) {
     const end = new Date((item.hour + 3600) * 1000);
     const range = `${start.toLocaleTimeString([], {hour:'numeric'})} to ${end.toLocaleTimeString([], {hour:'numeric'})}`;
     return `<div>
+      <button type="button" class="hour-click" onclick="showHourDetails(${item.hour})" aria-label="Show details for ${range}">
       <div class="hour-bar">
         <div class="hour-segment hour-good" data-tip="Productive: ${formatDuration(item.productiveSeconds)} (${range})" aria-label="Productive: ${formatDuration(item.productiveSeconds)} (${range})" style="height:${productiveHeight}%"></div>
         <div class="hour-segment" data-tip="Idle: ${formatDuration(item.idleSeconds || 0)} (${range})" aria-label="Idle: ${formatDuration(item.idleSeconds || 0)} (${range})" style="background:var(--warn);height:${idleHeight}%"></div>
         <div class="hour-segment hour-bad" data-tip="Distracted: ${formatDuration(item.distractingSeconds)} (${range})" aria-label="Distracted: ${formatDuration(item.distractingSeconds)} (${range})" style="height:${distractingHeight}%"></div>
       </div>
+      </button>
       <div class="muted" style="font-size:11px;text-align:center">${new Date(item.hour * 1000).toLocaleTimeString([], {hour:'numeric'})}</div>
     </div>`;
   }).join('') || '<p class="muted">No hourly data yet.</p>';
@@ -1782,7 +1910,7 @@ function renderFocusReport(report) {
       <div class="report-card"><span class="muted">Idle</span><strong>${formatDuration(report.idleSeconds)}</strong></div>
     </div>
     <div class="report-card"><h3>Time on focus apps and websites</h3><div class="target-list">${targetBars || '<p class="muted">No target activity yet.</p>'}</div></div>
-    <div class="report-card"><h3>Productive vs distracted by hour</h3><div class="hour-bars">${hours}</div></div>
+    <div class="report-card"><h3>Productive vs distracted by hour</h3><div class="hour-bars">${hours}</div><div id="hourDetail" class="hour-detail"></div></div>
     <div class="report-two">
       <div class="report-card">
         <h3>Focus split</h3>
@@ -1791,6 +1919,23 @@ function renderFocusReport(report) {
       <div class="report-card"><h3>Analysis</h3><div class="insights">${insights}</div></div>
     </div>
     <div class="report-card"><h3>Top outside-focus activity</h3>${distractionRows}</div>`;
+}
+function showHourDetails(hour) {
+  const panel = document.querySelector('#hourDetail');
+  if (!panel) return;
+  const end = hour + 3600;
+  const hourData = currentFocusReport?.hourly?.find(item => item.hour === hour);
+  const rows = (hourData?.items || [])
+    .map((item, index) => `
+      <div class="item">
+        <div class="muted">${formatDuration(item.seconds)}</div>
+        <div><strong>${escapeHtml(item.app)}</strong><div>${escapeHtml(item.title)}</div><div class="muted">${sourceMarkup(item.source || 'local', `hour-${hour}-${index}`)}</div></div>
+        <div class="tag ${item.category}">${item.category}</div>
+      </div>
+    `).join('');
+  const startLabel = new Date(hour * 1000).toLocaleTimeString([], {hour:'numeric'});
+  const endLabel = new Date(end * 1000).toLocaleTimeString([], {hour:'numeric'});
+  panel.innerHTML = `<h3>${startLabel} to ${endLabel}</h3>${rows || '<p class="muted">No detailed activity found for this hour.</p>'}`;
 }
 async function refresh() {
   const [timeline, report, state, history] = await Promise.all([
@@ -1880,7 +2025,7 @@ function seedFocusInputsFromActiveSession(focus) {
   const alertInput = document.querySelector('#alertMinutes');
   const actionInput = document.querySelector('#alertAction');
   const redirectInput = document.querySelector('#redirectApp');
-  if (focus.target) targetInput.value = focus.target;
+  if (focus.target && targetInput.value !== focus.target) setFocusTargets(focus.target);
   if (focus.durationMinutes) minutesInput.value = focus.durationMinutes;
   if (focus.alertDelaySeconds) alertInput.value = Math.max(1, Math.round(focus.alertDelaySeconds / 60));
   if (focus.alertAction) actionInput.value = focus.alertAction;
