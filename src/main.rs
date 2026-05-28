@@ -1480,7 +1480,6 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 </header>
 <main>
   <section class="bar">
-    <div class="field"><label for="task">Focus task</label><input id="task" value="Deep work" aria-label="Focus task"></div>
     <div class="field field-wide"><label for="target">Focus apps and websites</label><input id="target" placeholder="Pages, https://claude.ai/" aria-label="Focus targets"></div>
     <div class="field"><label for="minutes">Focus timer</label><input id="minutes" type="number" min="1" max="180" value="25" aria-label="Minutes"></div>
     <div class="field"><label for="alertMinutes">Warn after</label><input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Alert after minutes" title="Alert after minutes outside focus"></div>
@@ -1538,7 +1537,7 @@ const fmtTime = seconds => new Date(seconds * 1000).toLocaleTimeString([], {hour
 const minutes = seconds => Math.max(1, Math.round(seconds / 60));
 async function startFocus() {
   saveFocusDraft();
-  const task = encodeURIComponent(document.querySelector('#task').value || 'Focus session');
+  const task = encodeURIComponent('Focus session');
   const target = encodeURIComponent(document.querySelector('#target').value || '');
   const mins = encodeURIComponent(document.querySelector('#minutes').value || '25');
   const alertSeconds = encodeURIComponent(Math.max(1, Number(document.querySelector('#alertMinutes').value || '1')) * 60);
@@ -1565,7 +1564,6 @@ async function addBlock() {
 }
 function saveFocusDraft() {
   localStorage.setItem(focusDraftKey, JSON.stringify({
-    task: document.querySelector('#task').value,
     target: document.querySelector('#target').value,
     minutes: document.querySelector('#minutes').value,
     alertMinutes: document.querySelector('#alertMinutes').value,
@@ -1576,14 +1574,13 @@ function saveFocusDraft() {
 function restoreFocusDraft() {
   try {
     const draft = JSON.parse(localStorage.getItem(focusDraftKey) || '{}');
-    if (draft.task) document.querySelector('#task').value = draft.task;
     if (draft.target) document.querySelector('#target').value = draft.target;
     if (draft.minutes) document.querySelector('#minutes').value = draft.minutes;
     if (draft.alertMinutes) document.querySelector('#alertMinutes').value = draft.alertMinutes;
     if (draft.alertAction) document.querySelector('#alertAction').value = draft.alertAction;
     if (draft.redirectApp) document.querySelector('#redirectApp').value = draft.redirectApp;
   } catch {}
-  ['#task', '#target', '#minutes', '#alertMinutes', '#alertAction', '#redirectApp'].forEach(selector => {
+  ['#target', '#minutes', '#alertMinutes', '#alertAction', '#redirectApp'].forEach(selector => {
     document.querySelector(selector).addEventListener('input', saveFocusDraft);
     document.querySelector(selector).addEventListener('change', saveFocusDraft);
   });
@@ -1670,7 +1667,8 @@ function renderFocusReport(report) {
     const productiveHeight = Math.max(2, item.productiveSeconds * 100 / maxHour);
     const distractingHeight = Math.max(2, item.distractingSeconds * 100 / maxHour);
     const idleHeight = Math.max(2, (item.idleSeconds || 0) * 100 / maxHour);
-    return `<div title="${fmtTime(item.hour)}">
+    const hourTooltip = `${new Date(item.hour * 1000).toLocaleTimeString([], {hour:'numeric'})}: productive ${formatDuration(item.productiveSeconds)}, distracted ${formatDuration(item.distractingSeconds)}, idle ${formatDuration(item.idleSeconds || 0)}, total ${formatDuration(item.productiveSeconds + item.distractingSeconds + (item.idleSeconds || 0))}`;
+    return `<div title="${escapeHtml(hourTooltip)}">
       <div class="hour-bar">
         <div class="hour-good" style="height:${productiveHeight}%"></div>
         <div style="background:var(--warn);border-radius:4px 4px 0 0;min-height:2px;height:${idleHeight}%"></div>
@@ -1754,13 +1752,11 @@ async function refresh() {
 function seedFocusInputsFromActiveSession(focus) {
   if (!focus) return;
   const targetInput = document.querySelector('#target');
-  const taskInput = document.querySelector('#task');
   const minutesInput = document.querySelector('#minutes');
   const alertInput = document.querySelector('#alertMinutes');
   const actionInput = document.querySelector('#alertAction');
   const redirectInput = document.querySelector('#redirectApp');
   if (!targetInput.value && focus.target) targetInput.value = focus.target;
-  if (!taskInput.value && focus.task) taskInput.value = focus.task;
   if (!minutesInput.value && focus.durationMinutes) minutesInput.value = focus.durationMinutes;
   if (focus.alertDelaySeconds && (!alertInput.value || alertInput.value === '1')) alertInput.value = Math.max(1, Math.round(focus.alertDelaySeconds / 60));
   if (focus.alertAction) actionInput.value = focus.alertAction;
