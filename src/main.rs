@@ -1532,7 +1532,25 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .hour-bar { display:grid; align-items:end; height:120px; gap:2px; }
 .hour-segment { position:relative; border-radius:4px 4px 0 0; min-height:2px; cursor:default; }
 .hour-click { border:0; background:transparent; padding:0; color:inherit; width:100%; cursor:pointer; }
-.hour-detail { margin-top:12px; display:grid; gap:8px; }
+.hour-click.selected .hour-bar { outline:2px solid color-mix(in srgb, var(--accent) 75%, var(--line)); outline-offset:3px; border-radius:6px; }
+.hour-detail { margin-top:12px; display:grid; gap:12px; }
+.hour-detail-head { display:flex; flex-wrap:wrap; gap:10px; justify-content:space-between; align-items:flex-start; }
+.hour-detail-title h3 { margin:0; }
+.hour-summary { display:flex; flex-wrap:wrap; gap:8px; }
+.hour-summary .meta-pill strong { color:var(--ink); margin-left:4px; }
+.detail-stack { display:flex; height:18px; overflow:hidden; border-radius:999px; background:color-mix(in srgb, var(--line) 55%, transparent); }
+.detail-stack span { min-width:2px; }
+.detail-good { background:var(--good); }
+.detail-idle { background:var(--warn); }
+.detail-bad { background:var(--bad); }
+.activity-mix { display:grid; gap:10px; }
+.activity-row { display:grid; grid-template-columns:minmax(0, 1fr) 110px; gap:12px; align-items:center; border-top:1px solid var(--line); padding-top:10px; }
+.activity-main { min-width:0; }
+.activity-title { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+.activity-title strong { overflow-wrap:anywhere; }
+.activity-bar { display:grid; gap:4px; }
+.activity-bar-track { height:8px; border-radius:999px; background:color-mix(in srgb, var(--line) 55%, transparent); overflow:hidden; }
+.activity-bar-fill { height:100%; border-radius:999px; min-width:2px; }
 .hour-segment:hover::after { content:attr(data-tip); position:absolute; left:50%; bottom:calc(100% + 8px); transform:translateX(-50%); z-index:10; width:max-content; max-width:220px; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--ink); box-shadow:0 8px 24px color-mix(in srgb, var(--ink) 18%, transparent); font-size:12px; font-weight:650; white-space:normal; }
 .hour-segment:hover::before { content:""; position:absolute; left:50%; bottom:100%; transform:translateX(-50%); border:5px solid transparent; border-top-color:var(--line); z-index:11; }
 .hour-good, .hour-bad { border-radius:4px 4px 0 0; min-height:2px; }
@@ -1557,7 +1575,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .two { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
 @media (max-width:980px) { .focus-layout, .control-shell { grid-template-columns:1fr; } .focus-actions { justify-content:flex-start; } }
 @media (max-width:900px) { .focus-shell-head { align-items:start; display:grid; } .top-actions { justify-content:flex-start; } .control-fields, .block-fields { grid-template-columns:minmax(0, 1fr) auto; } }
-@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid, .control-fields, .block-fields { grid-template-columns:1fr; display:grid; } header { align-items:start; } .header-actions { justify-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } }
+@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid, .control-fields, .block-fields, .activity-row { grid-template-columns:1fr; display:grid; } header { align-items:start; } .header-actions { justify-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -1892,7 +1910,7 @@ function renderFocusReport(report) {
     const end = new Date((item.hour + 3600) * 1000);
     const range = `${start.toLocaleTimeString([], {hour:'numeric'})} to ${end.toLocaleTimeString([], {hour:'numeric'})}`;
     return `<div>
-      <button type="button" class="hour-click" onclick="showHourDetails(${item.hour})" aria-label="Show details for ${range}">
+      <button type="button" class="hour-click" onclick="showHourDetails(${item.hour}, this)" aria-label="Show details for ${range}">
       <div class="hour-bar">
         <div class="hour-segment hour-good" data-tip="Productive: ${formatDuration(item.productiveSeconds)} (${range})" aria-label="Productive: ${formatDuration(item.productiveSeconds)} (${range})" style="height:${productiveHeight}%"></div>
         <div class="hour-segment" data-tip="Idle: ${formatDuration(item.idleSeconds || 0)} (${range})" aria-label="Idle: ${formatDuration(item.idleSeconds || 0)} (${range})" style="background:var(--warn);height:${idleHeight}%"></div>
@@ -1930,22 +1948,49 @@ function renderFocusReport(report) {
     </div>
     <div class="report-card"><h3>Top outside-focus activity</h3>${distractionRows}</div>`;
 }
-function showHourDetails(hour) {
+function showHourDetails(hour, button) {
   const panel = document.querySelector('#hourDetail');
   if (!panel) return;
   const end = hour + 3600;
   const hourData = currentFocusReport?.hourly?.find(item => item.hour === hour);
+  document.querySelectorAll('.hour-click').forEach(item => item.classList.remove('selected'));
+  if (button) button.classList.add('selected');
+  const productive = hourData?.productiveSeconds || 0;
+  const distracted = hourData?.distractingSeconds || 0;
+  const idle = hourData?.idleSeconds || 0;
+  const total = productive + distracted + idle;
   const rows = (hourData?.items || [])
     .map((item, index) => `
-      <div class="item">
-        <div class="muted">${formatDuration(item.seconds)}</div>
-        <div><strong>${escapeHtml(item.app)}</strong><div>${escapeHtml(item.title)}</div><div class="muted">${sourceMarkup(item.source || 'local', `hour-${hour}-${index}`)}</div></div>
-        <div class="tag ${item.category}">${item.category}</div>
+      <div class="activity-row">
+        <div class="activity-main">
+          <div class="activity-title"><strong>${escapeHtml(item.app)}</strong><span class="tag ${item.category}">${item.category}</span></div>
+          <div>${escapeHtml(item.title)}</div>
+          <div class="muted">${sourceMarkup(item.source || 'local', `hour-${hour}-${index}`)}</div>
+        </div>
+        <div class="activity-bar">
+          <strong>${formatDuration(item.seconds)}</strong>
+          <div class="activity-bar-track"><div class="activity-bar-fill ${item.category === 'productive' ? 'detail-good' : item.category === 'idle' ? 'detail-idle' : 'detail-bad'}" style="width:${Math.max(2, item.seconds * 100 / Math.max(1, total))}%"></div></div>
+        </div>
       </div>
     `).join('');
   const startLabel = new Date(hour * 1000).toLocaleTimeString([], {hour:'numeric'});
   const endLabel = new Date(end * 1000).toLocaleTimeString([], {hour:'numeric'});
-  panel.innerHTML = `<h3>${startLabel} to ${endLabel}</h3>${rows || '<p class="muted">No detailed activity found for this hour.</p>'}`;
+  panel.innerHTML = `
+    <div class="hour-detail-head">
+      <div class="hour-detail-title"><h3>${startLabel} to ${endLabel}</h3><div class="muted">Click another hour to compare the breakdown.</div></div>
+      <div class="hour-summary">
+        <span class="meta-pill">total <strong>${formatDuration(total)}</strong></span>
+        <span class="meta-pill">productive <strong>${formatDuration(productive)}</strong></span>
+        <span class="meta-pill">distracted <strong>${formatDuration(distracted)}</strong></span>
+        <span class="meta-pill">idle <strong>${formatDuration(idle)}</strong></span>
+      </div>
+    </div>
+    <div class="detail-stack" aria-label="Hour mix">
+      <span class="detail-good" style="width:${Math.max(0, productive * 100 / Math.max(1, total))}%"></span>
+      <span class="detail-idle" style="width:${Math.max(0, idle * 100 / Math.max(1, total))}%"></span>
+      <span class="detail-bad" style="width:${Math.max(0, distracted * 100 / Math.max(1, total))}%"></span>
+    </div>
+    <div class="activity-mix">${rows || '<p class="muted">No detailed activity found for this hour.</p>'}</div>`;
 }
 async function refresh() {
   const [timeline, report, state, history] = await Promise.all([
