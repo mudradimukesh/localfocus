@@ -847,10 +847,15 @@ fn handle_http(
             .get("target")
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
+        let since = params.get("since").and_then(|value| value.parse::<i64>().ok());
+        let period = params
+            .get("period")
+            .map(|value| value.as_str())
+            .unwrap_or("window");
         write_response(
             &mut stream,
             "application/json",
-            &focus_report_json(&data_dir, &target)?,
+            &focus_report_json(&data_dir, &target, since, period)?,
         )?;
     } else if path == "/api/report" {
         write_response(&mut stream, "application/json", &report_json(&data_dir)?)?;
@@ -958,9 +963,16 @@ fn report_json(data_dir: &PathBuf) -> io::Result<String> {
     ))
 }
 
-fn focus_report_json(data_dir: &PathBuf, target_text: &str) -> io::Result<String> {
+fn focus_report_json(
+    data_dir: &PathBuf,
+    target_text: &str,
+    since_override: Option<i64>,
+    period: &str,
+) -> io::Result<String> {
     let samples = load_samples(data_dir)?;
-    let since = report_window_start(data_dir)?.max(now() - 24 * 60 * 60);
+    let since = since_override
+        .unwrap_or(report_window_start(data_dir)?.max(now() - 24 * 60 * 60))
+        .max(0);
     let recent: Vec<_> = samples.into_iter().filter(|s| s.timestamp >= since).collect();
     let targets = target_list_from_text(target_text);
     let target_json = targets
@@ -1089,7 +1101,8 @@ fn focus_report_json(data_dir: &PathBuf, target_text: &str) -> io::Result<String
     };
 
     Ok(format!(
-        "{{\"windowStart\":{},\"generatedAt\":{},\"targets\":[{}],\"focusSeconds\":{},\"outsideSeconds\":{},\"idleSeconds\":{},\"productiveSeconds\":{},\"distractingSeconds\":{},\"focusPercent\":{},\"score\":{},\"targetBreakdown\":[{}],\"topDistractions\":[{}],\"hourly\":[{}]}}",
+        "{{\"period\":\"{}\",\"windowStart\":{},\"generatedAt\":{},\"targets\":[{}],\"focusSeconds\":{},\"outsideSeconds\":{},\"idleSeconds\":{},\"productiveSeconds\":{},\"distractingSeconds\":{},\"focusPercent\":{},\"score\":{},\"targetBreakdown\":[{}],\"topDistractions\":[{}],\"hourly\":[{}]}}",
+        json_escape(period),
         since,
         now(),
         target_json,
@@ -1314,6 +1327,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
   <section class="bar">
     <button id="explainToggle" onclick="toggleExplain()" aria-expanded="false">Explain report</button>
     <button id="focusReportButton" onclick="generateFocusReport()">Focus report</button>
+    <button id="dayFocusReportButton" onclick="generateDayFocusReport()">Focus report for day</button>
   </section>
   <section class="explain" id="explainPanel">
     <h2>Report meaning</h2>
@@ -1424,9 +1438,29 @@ async function generateFocusReport() {
     button.textContent = 'Focus report';
   }
 }
+async function generateDayFocusReport() {
+  const button = document.querySelector('#dayFocusReportButton');
+  const panel = document.querySelector('#focusReportPanel');
+  const target = document.querySelector('#target').value || '';
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+  const since = Math.floor(startOfDay.getTime() / 1000);
+  button.textContent = 'Building day report...';
+  button.disabled = true;
+  try {
+    const report = await fetch(`/api/focus-report?target=${encodeURIComponent(target)}&since=${since}&period=day`).then(r => r.json());
+    panel.innerHTML = renderFocusReport(report);
+    panel.classList.add('open');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Focus report for day';
+  }
+}
 function renderFocusReport(report) {
+  const isDay = report.period === 'day';
+  const reportTitle = isDay ? 'Focus report for day' : 'Focus report';
   if (!report.targets.length) {
-    return `<div><h2>Focus report</h2><p class="muted">Add one or more focus apps or websites first, then run the report.</p></div>`;
+    return `<div><h2>${reportTitle}</h2><p class="muted">Add one or more focus apps or websites first, then run the report.</p></div>`;
   }
   const total = report.focusSeconds + report.outsideSeconds + report.idleSeconds;
   const maxTarget = Math.max(1, ...report.targetBreakdown.map(item => item.seconds + (item.idleSeconds || 0)));
@@ -1465,10 +1499,10 @@ function renderFocusReport(report) {
     bestTarget ? `Most time was spent on ${bestTarget.target}: ${formatDuration(bestTarget.seconds)}.` : 'No tracked time matched the current focus list yet.',
     report.idleSeconds ? `Idle time was ${formatDuration(report.idleSeconds)}, including idle periods inside focus apps or websites.` : 'No idle time was detected in this report window.',
     mainDistraction ? `Largest outside-focus item: ${mainDistraction.app} for ${formatDuration(mainDistraction.seconds)}.` : 'No outside-focus distractions were detected.',
-    total ? `Productivity score for this report is ${report.score}/100 across ${formatDuration(total)}.` : 'The report will get richer after more tracked activity.'
+    total ? `${isDay ? 'Whole-day' : 'Report'} productivity score is ${report.score}/100 across ${formatDuration(total)}.` : 'The report will get richer after more tracked activity.'
   ].map(text => `<p>${escapeHtml(text)}</p>`).join('');
   return `
-    <div class="bar"><h2>Focus report</h2><span class="muted">Generated ${new Date(report.generatedAt * 1000).toLocaleString([], {dateStyle:'short', timeStyle:'short'})}</span></div>
+    <div class="bar"><h2>${reportTitle}</h2><span class="muted">${isDay ? 'Since midnight' : 'Current report window'} - generated ${new Date(report.generatedAt * 1000).toLocaleString([], {dateStyle:'short', timeStyle:'short'})}</span></div>
     <div class="report-grid">
       <div class="report-card"><span class="muted">Focus score</span><strong>${report.score}</strong></div>
       <div class="report-card"><span class="muted">Matched focus list</span><strong>${formatDuration(report.focusSeconds)}</strong></div>
