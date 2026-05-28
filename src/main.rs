@@ -1552,12 +1552,12 @@ function renderFocusReport(report) {
     bestTarget ? `Most time was spent on ${bestTarget.target}: ${formatDuration(bestTarget.seconds)}.` : 'No tracked time matched the current focus list yet.',
     report.idleSeconds ? `Idle time was ${formatDuration(report.idleSeconds)}, including idle periods inside focus apps or websites.` : 'No idle time was detected in this report window.',
     mainDistraction ? `Largest outside-focus item: ${mainDistraction.app} for ${formatDuration(mainDistraction.seconds)}.` : 'No outside-focus distractions were detected.',
-    total ? `${isDay ? 'Whole-day' : 'Report'} productivity score is ${report.score}/100 across ${formatDuration(total)}.` : 'The report will get richer after more tracked activity.'
+    total ? `${isDay ? 'Whole-day' : 'Report'} tracked time is ${formatDuration(total)}.` : 'The report will get richer after more tracked activity.'
   ].map(text => `<p>${escapeHtml(text)}</p>`).join('');
   return `
     <div class="bar"><h2>${reportTitle}</h2><span class="muted">${isDay ? 'Since midnight' : 'Current report window'} - generated ${new Date(report.generatedAt * 1000).toLocaleString([], {dateStyle:'short', timeStyle:'short'})}</span></div>
     <div class="report-grid">
-      <div class="report-card"><span class="muted">Focus score</span><strong>${report.score}</strong></div>
+      <div class="report-card"><span class="muted">Total time</span><strong>${formatDuration(total)}</strong></div>
       <div class="report-card"><span class="muted">Matched focus list</span><strong>${formatDuration(report.focusSeconds)}</strong></div>
       <div class="report-card"><span class="muted">Outside focus</span><strong>${formatDuration(report.outsideSeconds)}</strong></div>
       <div class="report-card"><span class="muted">Idle</span><strong>${formatDuration(report.idleSeconds)}</strong></div>
@@ -1582,9 +1582,9 @@ async function refresh() {
   ]);
   document.querySelector('#metrics').innerHTML = `
     <div class="metric"><span class="muted">Score</span><strong>${report.score}</strong></div>
-    <div class="metric"><span class="muted">Productive</span><strong>${report.productiveMinutes}m</strong></div>
-    <div class="metric"><span class="muted">Distracted</span><strong>${report.distractingMinutes}m</strong></div>
-    <div class="metric"><span class="muted">Idle</span><strong>${report.idleMinutes || 0}m</strong></div>`;
+    <div class="metric"><span class="muted">Productive</span><strong>${formatDuration(report.productiveMinutes * 60)}</strong></div>
+    <div class="metric"><span class="muted">Distracted</span><strong>${formatDuration(report.distractingMinutes * 60)}</strong></div>
+    <div class="metric"><span class="muted">Idle</span><strong>${formatDuration((report.idleMinutes || 0) * 60)}</strong></div>`;
   document.querySelector('#timeline').innerHTML = timeline.slice(-80).reverse().map((item, index) => `
     <div class="item">
       <div class="muted">${fmtTime(item.start)}<br>${minutes(item.durationSeconds)} min</div>
@@ -1598,9 +1598,9 @@ async function refresh() {
       <div class="muted">${new Date(item.archivedAt * 1000).toLocaleString([], {dateStyle:'short', timeStyle:'short'})}</div>
       <div class="history-grid">
         <div><h3>Score</h3><p>${r.score}</p></div>
-        <div><h3>Productive</h3><p>${r.productiveMinutes}m</p></div>
-        <div><h3>Distracted</h3><p>${r.distractingMinutes}m</p></div>
-        <div><h3>Idle</h3><p>${r.idleMinutes || 0}m</p></div>
+        <div><h3>Productive</h3><p>${formatDuration(r.productiveMinutes * 60)}</p></div>
+        <div><h3>Distracted</h3><p>${formatDuration(r.distractingMinutes * 60)}</p></div>
+        <div><h3>Idle</h3><p>${formatDuration((r.idleMinutes || 0) * 60)}</p></div>
       </div>
       <div class="muted">${(r.topApps || []).slice(0, 2).map(app => escapeHtml(`${app.app}${app.source ? ' - ' + app.source : ''}`)).join(', ')}</div>
     </div>`;
