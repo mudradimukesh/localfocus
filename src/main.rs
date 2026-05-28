@@ -1447,8 +1447,10 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .focus-shell h2 { margin:0; font-size:18px; }
 .control-shell { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; display:grid; gap:14px; }
 .control-shell h2 { margin:0; font-size:16px; }
-.control-fields { display:grid; grid-template-columns:minmax(0, 1fr) auto minmax(150px, .25fr) minmax(150px, .25fr) auto; gap:12px; align-items:end; }
+.control-fields { display:grid; grid-template-columns:minmax(170px, .4fr) minmax(170px, .4fr) auto; gap:12px; align-items:end; }
+.block-fields { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:12px; align-items:end; }
 .control-fields button { min-height:42px; min-width:140px; white-space:nowrap; }
+.block-fields button { min-height:42px; min-width:140px; white-space:nowrap; }
 .focus-layout { display:grid; grid-template-columns:minmax(0, 1.3fr) minmax(320px, .7fr); gap:16px; align-items:start; }
 .focus-layout.editor-collapsed { grid-template-columns:minmax(0, 520px); }
 .focus-layout.editor-collapsed .focus-form { display:none; }
@@ -1554,8 +1556,8 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .idle { color:var(--warn); background:color-mix(in srgb, var(--warn) 16%, transparent); }
 .two { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
 @media (max-width:980px) { .focus-layout, .control-shell { grid-template-columns:1fr; } .focus-actions { justify-content:flex-start; } }
-@media (max-width:900px) { .focus-shell-head { align-items:start; display:grid; } .top-actions { justify-content:flex-start; } .control-fields { grid-template-columns:minmax(0, 1fr) auto; } }
-@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid, .control-fields { grid-template-columns:1fr; display:grid; } header { align-items:start; } .header-actions { justify-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } }
+@media (max-width:900px) { .focus-shell-head { align-items:start; display:grid; } .top-actions { justify-content:flex-start; } .control-fields, .block-fields { grid-template-columns:minmax(0, 1fr) auto; } }
+@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid, .control-fields, .block-fields { grid-template-columns:1fr; display:grid; } header { align-items:start; } .header-actions { justify-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -1614,14 +1616,12 @@ button:disabled { cursor:not-allowed; opacity:.55; }
       </aside>
     </div>
   </section>
-  <section class="control-shell" aria-label="Review controls">
+  <section class="control-shell" aria-label="Reports">
     <div>
-      <h2>Review controls</h2>
-      <div class="muted">Add distraction rules and create focus reports from one place.</div>
+      <h2>Reports</h2>
+      <div class="muted">Generate focus reports for the current or previous hour, day, week, month, or year.</div>
     </div>
     <div class="control-fields">
-      <div class="field"><label for="blockKeyword">Block keyword, app, or site</label><input id="blockKeyword" placeholder="youtube, reddit, games" aria-label="Block keyword"></div>
-      <button onclick="addBlock()">Add block</button>
       <div class="field"><label for="reportPeriod">Focus report for</label><select id="reportPeriod" aria-label="Focus report period">
         <option value="hour">Hour</option>
         <option value="day">Day</option>
@@ -1637,6 +1637,16 @@ button:disabled { cursor:not-allowed; opacity:.55; }
         <option value="7">Previous 7</option>
       </select></div>
       <button id="focusReportButton" onclick="generateSelectedFocusReport()">Generate report</button>
+    </div>
+  </section>
+  <section class="control-shell" aria-label="Distraction rules">
+    <div>
+      <h2>Add distraction rule</h2>
+      <div class="muted">Mark keywords, apps, or sites as distracting and eligible for alerts.</div>
+    </div>
+    <div class="block-fields">
+      <div class="field"><label for="blockKeyword">Block keyword, app, or site</label><input id="blockKeyword" placeholder="youtube, reddit, games" aria-label="Block keyword"></div>
+      <button onclick="addBlock()">Add block</button>
     </div>
   </section>
   <section class="explain" id="explainPanel">
@@ -2039,7 +2049,7 @@ function updateFocusButtons(focus) {
   const running = Boolean(focus && !focus.paused);
   const paused = Boolean(focus && focus.paused);
   startButton.className = `focus-btn ${running ? 'focus-running' : 'focus-idle'}`;
-  startButton.textContent = running || paused ? 'Restart focus' : 'Start focus';
+  startButton.textContent = paused ? 'Restart focus' : running ? 'Focus' : 'Start focus';
   pauseButton.disabled = !focus;
   pauseButton.className = `focus-btn ${paused ? 'focus-paused' : running ? 'focus-running' : ''}`;
   pauseButton.textContent = paused ? 'Resume' : 'Pause';
