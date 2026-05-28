@@ -1448,8 +1448,9 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .bar-fill.bad { background:var(--bad); }
 .split-chart { min-height:170px; border-radius:8px; background:conic-gradient(var(--good) var(--focus-angle), var(--bad) 0); border:1px solid var(--line); display:grid; place-items:center; }
 .split-chart span { background:var(--panel); border:1px solid var(--line); border-radius:999px; padding:18px 20px; font-weight:750; }
-.hour-bars { display:grid; grid-template-columns:repeat(12, minmax(12px, 1fr)); gap:8px; align-items:end; min-height:140px; }
+.hour-bars { display:grid; grid-template-columns:repeat(12, minmax(34px, 1fr)); gap:10px; align-items:end; min-height:150px; }
 .hour-bar { display:grid; align-items:end; height:120px; gap:2px; }
+.hour-segment { border-radius:4px 4px 0 0; min-height:2px; cursor:help; }
 .hour-good, .hour-bad { border-radius:4px 4px 0 0; min-height:2px; }
 .hour-good { background:var(--good); }
 .hour-bad { background:var(--bad); }
@@ -1667,12 +1668,14 @@ function renderFocusReport(report) {
     const productiveHeight = Math.max(2, item.productiveSeconds * 100 / maxHour);
     const distractingHeight = Math.max(2, item.distractingSeconds * 100 / maxHour);
     const idleHeight = Math.max(2, (item.idleSeconds || 0) * 100 / maxHour);
-    const hourTooltip = `${new Date(item.hour * 1000).toLocaleTimeString([], {hour:'numeric'})}: productive ${formatDuration(item.productiveSeconds)}, distracted ${formatDuration(item.distractingSeconds)}, idle ${formatDuration(item.idleSeconds || 0)}, total ${formatDuration(item.productiveSeconds + item.distractingSeconds + (item.idleSeconds || 0))}`;
-    return `<div title="${escapeHtml(hourTooltip)}">
+    const start = new Date(item.hour * 1000);
+    const end = new Date((item.hour + 3600) * 1000);
+    const range = `${start.toLocaleTimeString([], {hour:'numeric'})} to ${end.toLocaleTimeString([], {hour:'numeric'})}`;
+    return `<div>
       <div class="hour-bar">
-        <div class="hour-good" style="height:${productiveHeight}%"></div>
-        <div style="background:var(--warn);border-radius:4px 4px 0 0;min-height:2px;height:${idleHeight}%"></div>
-        <div class="hour-bad" style="height:${distractingHeight}%"></div>
+        <div class="hour-segment hour-good" title="Productive: ${formatDuration(item.productiveSeconds)} (${range})" style="height:${productiveHeight}%"></div>
+        <div class="hour-segment" title="Idle: ${formatDuration(item.idleSeconds || 0)} (${range})" style="background:var(--warn);height:${idleHeight}%"></div>
+        <div class="hour-segment hour-bad" title="Distracted: ${formatDuration(item.distractingSeconds)} (${range})" style="height:${distractingHeight}%"></div>
       </div>
       <div class="muted" style="font-size:11px;text-align:center">${new Date(item.hour * 1000).toLocaleTimeString([], {hour:'numeric'})}</div>
     </div>`;
@@ -1695,14 +1698,14 @@ function renderFocusReport(report) {
       <div class="report-card"><span class="muted">Idle</span><strong>${formatDuration(report.idleSeconds)}</strong></div>
     </div>
     <div class="report-card"><h3>Time on focus apps and websites</h3><div class="target-list">${targetBars || '<p class="muted">No target activity yet.</p>'}</div></div>
+    <div class="report-card"><h3>Productive vs distracted by hour</h3><div class="hour-bars">${hours}</div></div>
     <div class="report-two">
       <div class="report-card">
         <h3>Focus split</h3>
         <div class="split-chart" style="--focus-angle:${focusAngle}"><span>${report.focusPercent}% focused</span></div>
       </div>
-      <div class="report-card"><h3>Productive vs distracted by hour</h3><div class="hour-bars">${hours}</div></div>
+      <div class="report-card"><h3>Analysis</h3><div class="insights">${insights}</div></div>
     </div>
-    <div class="report-card"><h3>Analysis</h3><div class="insights">${insights}</div></div>
     <div class="report-card"><h3>Top outside-focus activity</h3>${distractionRows}</div>`;
 }
 async function refresh() {
