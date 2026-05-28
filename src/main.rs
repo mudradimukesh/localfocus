@@ -1461,6 +1461,10 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .explain p, .history p { margin:0; color:var(--muted); }
 .timeline { display:grid; gap:10px; }
 .item { display:grid; grid-template-columns:120px 1fr 96px; gap:12px; align-items:start; border-top:1px solid var(--line); padding-top:10px; }
+.item.long-attention { border-left:4px solid var(--bad); padding-left:10px; background:color-mix(in srgb, var(--bad) 7%, transparent); }
+.item.long-attention.long-idle { border-left-color:var(--warn); background:color-mix(in srgb, var(--warn) 8%, transparent); }
+.long-note { display:inline-block; margin-top:4px; border-radius:999px; padding:2px 7px; font-size:11px; font-weight:700; color:var(--bad); background:color-mix(in srgb, var(--bad) 14%, transparent); }
+.long-idle .long-note { color:var(--warn); background:color-mix(in srgb, var(--warn) 16%, transparent); }
 .tag { width:max-content; border-radius:999px; padding:2px 8px; font-size:12px; }
 .productive { color:var(--good); background:color-mix(in srgb, var(--good) 15%, transparent); }
 .distracting { color:var(--bad); background:color-mix(in srgb, var(--bad) 14%, transparent); }
@@ -1716,12 +1720,17 @@ async function refresh() {
     <div class="metric"><span class="muted">Productive</span><strong>${formatDuration(report.productiveMinutes * 60)}</strong></div>
     <div class="metric"><span class="muted">Distracted</span><strong>${formatDuration(report.distractingMinutes * 60)}</strong></div>
     <div class="metric"><span class="muted">Idle</span><strong>${formatDuration((report.idleMinutes || 0) * 60)}</strong></div>`;
-  document.querySelector('#timeline').innerHTML = timeline.slice(-80).reverse().map((item, index) => `
-    <div class="item">
-      <div class="muted">${fmtTime(item.start)}<br>${minutes(item.durationSeconds)} min</div>
+  document.querySelector('#timeline').innerHTML = timeline.slice(-80).reverse().map((item, index) => {
+    const longAttention = item.durationSeconds > 15 * 60 && (item.category === 'idle' || item.category === 'distracting');
+    const longClass = longAttention ? ` long-attention ${item.category === 'idle' ? 'long-idle' : 'long-distracting'}` : '';
+    const longNote = longAttention ? `<span class="long-note">${item.category === 'idle' ? 'Long idle' : 'Long distraction'}</span>` : '';
+    return `
+    <div class="item${longClass}">
+      <div class="muted">${fmtTime(item.start)}<br>${formatDuration(item.durationSeconds)}${longNote ? `<br>${longNote}` : ''}</div>
       <div><strong>${escapeHtml(item.app)}</strong><div>${escapeHtml(item.title)}</div><div class="muted">${sourceMarkup(item.source || 'local', `timeline-${index}`)}</div></div>
       <div class="tag ${item.category}">${item.category}</div>
-    </div>`).join('') || '<div class="muted">No activity yet.</div>';
+    </div>`;
+  }).join('') || '<div class="muted">No activity yet.</div>';
   document.querySelector('#apps').innerHTML = report.topApps.map((app, index) => `<p><strong>${escapeHtml(app.app)}</strong><br>${sourceMarkup(app.source || 'local', index)}<br><span class="muted">${formatDuration(app.seconds || app.minutes * 60)}</span></p>`).join('') || '<div class="muted">No apps yet.</div>';
   document.querySelector('#historyList').innerHTML = history.map(item => {
     const r = item.report;
