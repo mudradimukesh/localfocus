@@ -2,6 +2,17 @@ import Cocoa
 import WebKit
 
 @main
+struct LocalFocusHost {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.regular)
+        app.activate(ignoringOtherApps: true)
+        app.run()
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private var webView: WKWebView?
@@ -14,12 +25,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         loadDashboardWhenReady()
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        if window == nil || window?.isVisible == false {
+            openWindow()
+            loadDashboardWhenReady()
+        } else {
+            bringWindowForward()
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         serverProcess?.terminate()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            openWindow()
+            loadDashboardWhenReady()
+        } else {
+            bringWindowForward()
+        }
+        return true
     }
 
     private func startLocalServer() {
@@ -56,11 +86,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.title = "Local Focus"
         window.center()
         window.contentView = webView
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
 
         self.window = window
         self.webView = webView
+        bringWindowForward()
+        bringWindowForwardAfterLaunch()
+    }
+
+    private func bringWindowForward() {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.unhide(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+        window?.orderFrontRegardless()
+    }
+
+    private func bringWindowForwardAfterLaunch() {
+        for delay in [0.2, 0.8, 1.6] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.bringWindowForward()
+            }
+        }
     }
 
     private func loadDashboardWhenReady(attempt: Int = 0) {
