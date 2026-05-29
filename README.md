@@ -127,3 +127,30 @@ On Windows, the executable is:
 ```text
 target\release\local-focus.exe
 ```
+
+## Mac App Store Packaging
+
+Local Focus includes a Mac App Store-oriented `.app` packaging scaffold in `macos/`.
+
+Build an unsigned app bundle:
+
+```sh
+scripts/package-mas.sh
+```
+
+Output:
+
+```text
+target/macos/Local Focus.app
+```
+
+For a Mac App Store upload, you need an Apple Developer Program account, an App Store Connect app record, a matching bundle id, and Mac App Store signing certificates. Example:
+
+```sh
+LOCAL_FOCUS_BUNDLE_ID=com.yourcompany.localfocus \
+MAS_APP_SIGN_IDENTITY="3rd Party Mac Developer Application: Your Name (TEAMID)" \
+MAS_INSTALLER_SIGN_IDENTITY="3rd Party Mac Developer Installer: Your Name (TEAMID)" \
+scripts/package-mas.sh
+```
+
+More detail: `macos/README-App-Store.md`.

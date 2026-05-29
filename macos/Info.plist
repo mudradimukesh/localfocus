@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>Local Focus</string>
+  <key>CFBundleExecutable</key>
+  <string>local-focus</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.localfocus.app</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>Local Focus</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>12.0</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Local Focus reads the active browser tab URL and foreground app name locally so it can classify focus activity. No activity data leaves this Mac.</string>
+  <key>NSHumanReadableCopyright</key>
+  <string>Copyright © 2026 Local Focus. All rights reserved.</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>
