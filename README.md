@@ -32,6 +32,18 @@ On macOS, it also installs a local app bundle:
 ~/Applications/Local Focus.app
 ```
 
+Build a drag-to-Applications DMG on macOS:
+
+```sh
+scripts/package-dmg.sh
+```
+
+Output:
+
+```text
+target/macos/LocalFocus.dmg
+```
+
 Start from terminal:
 
 ```sh
