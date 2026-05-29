@@ -18,16 +18,24 @@ No cloud account is used. No data is sent off the machine. The app records local
 
 ## Install
 
-Install Rust from <https://www.rust-lang.org/tools/install>, then run:
+Install Rust from <https://www.rust-lang.org/tools/install>, then run the local installer:
 
 ```sh
-cargo install --path .
+scripts/install.sh
 ```
 
-Start the app:
+This builds a release binary and copies it to `~/.local/bin/local-focus` without using `cargo install --path`.
+
+On macOS, it also installs a local app bundle:
+
+```text
+~/Applications/Local Focus.app
+```
+
+Start from terminal:
 
 ```sh
-local-focus serve
+~/.local/bin/local-focus serve
 ```
 
 Open:
@@ -37,6 +45,12 @@ http://127.0.0.1:4799
 ```
 
 Optional run-at-login helpers are in `scripts/`.
+
+On Windows PowerShell:
+
+```powershell
+.\scripts\install.ps1
+```
 
 ## Platform Notes
 
@@ -52,7 +66,7 @@ Windows uses PowerShell and Win32 APIs for active-window metadata. Notification 
 
 ## Run at Login
 
-After `cargo install --path .`, run the helper for your OS:
+After installing locally, run the helper for your OS:
 
 ```sh
 scripts/autostart-macos.sh
