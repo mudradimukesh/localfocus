@@ -44,6 +44,8 @@ Output:
 target/macos/LocalFocus.dmg
 ```
 
+Open the DMG, drag `Local Focus.app` to `Applications`, then launch it from Applications. The app opens in its own native Mac window and starts the private local server behind the scenes.
+
 Start from terminal:
 
 ```sh
