@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -12,6 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const APP_NAME: &str = "local-focus";
 const SAMPLE_SECONDS: u64 = 5;
 const DISTRACTION_SECONDS: i64 = 90;
+const BLOCK_COOLDOWN_SECONDS: i64 = 10;
+const DEVICE_NOTIFY_COOLDOWN_SECONDS: i64 = 60;
 const DEFAULT_ALERT_DELAY_SECONDS: u64 = 60;
 const IDLE_SECONDS: u64 = 60;
 
@@ -20,6 +22,7 @@ struct Config {
     productive_keywords: Vec<String>,
     distracting_keywords: Vec<String>,
     blocked_keywords: Vec<String>,
+    network_devices: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +56,36 @@ struct AppState {
     last_distraction_at: i64,
     last_focus_mismatch_at: i64,
     focus_mismatch_started_at: Option<i64>,
+    last_blocked_at: i64,
+    last_blocked_key: String,
+    last_device_notify_at: i64,
+    last_device_notify_key: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockRuleKind {
+    App,
+    Website,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockMode {
+    Full,
+    Password,
+}
+
+#[derive(Clone, Debug)]
+struct BlockRule {
+    target: String,
+    mode: BlockMode,
+    password: String,
+}
+
+#[derive(Clone, Debug)]
+struct NetworkDevice {
+    name: String,
+    kind: String,
+    endpoint: String,
 }
 
 impl Default for Config {
@@ -83,6 +116,7 @@ impl Default for Config {
                 "steam".into(),
             ],
             blocked_keywords: Vec::new(),
+            network_devices: Vec::new(),
         }
     }
 }
@@ -96,7 +130,10 @@ fn main() -> io::Result<()> {
     match args.get(1).map(String::as_str) {
         Some("track") => run_tracker(data_dir),
         Some("focus") => {
-            let task = args.get(2).cloned().unwrap_or_else(|| "Focus session".into());
+            let task = args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| "Focus session".into());
             let minutes = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(25);
             let target = args.get(4).cloned().unwrap_or_default();
             start_focus(data_dir, task, target, minutes, 5)
@@ -122,6 +159,10 @@ fn run_app(data_dir: PathBuf) -> io::Result<()> {
         last_distraction_at: 0,
         last_focus_mismatch_at: 0,
         focus_mismatch_started_at: None,
+        last_blocked_at: 0,
+        last_blocked_key: String::new(),
+        last_device_notify_at: 0,
+        last_device_notify_key: String::new(),
     }));
 
     {
@@ -154,8 +195,11 @@ fn run_app(data_dir: PathBuf) -> io::Result<()> {
         });
     }
 
-    let listener = TcpListener::bind("127.0.0.1:4799")?;
+    let listener = TcpListener::bind("0.0.0.0:4799")?;
     println!("Local Focus is running at http://127.0.0.1:4799");
+    if let Some(url) = local_network_url() {
+        println!("Same-WiFi devices can connect at {url}/device");
+    }
     println!("Data stays on this machine: {}", data_dir.display());
 
     for stream in listener.incoming() {
@@ -183,6 +227,10 @@ fn run_tracker(data_dir: PathBuf) -> io::Result<()> {
         last_distraction_at: 0,
         last_focus_mismatch_at: 0,
         focus_mismatch_started_at: None,
+        last_blocked_at: 0,
+        last_blocked_key: String::new(),
+        last_device_notify_at: 0,
+        last_device_notify_key: String::new(),
     }));
     tracking_loop(data_dir, state)
 }
@@ -207,6 +255,8 @@ fn tracking_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<(
             sample.category = "idle".into();
         }
 
+        enforce_blocked_access(&data_dir, &state, &config, &sample)?;
+        notify_devices_for_attention_event(&data_dir, &state, &config, &sample)?;
         append_sample(&data_dir, &sample)?;
         detect_distraction(&data_dir, &state, &sample)?;
         thread::sleep(Duration::from_secs(SAMPLE_SECONDS));
@@ -278,7 +328,10 @@ fn start_focus(
     };
     notify(
         "Focus started",
-        &format!("{} minutes: {}{}", duration_minutes, session.task, target_note),
+        &format!(
+            "{} minutes: {}{}",
+            duration_minutes, session.task, target_note
+        ),
     );
     println!("Started focus session: {}", session.task);
     Ok(())
@@ -353,13 +406,180 @@ fn detect_distraction(
             .as_ref()
             .map(|f| f.task.clone())
             .unwrap_or_else(|| "your task".into());
-        let message = format!("You are in focus mode for {task}. Current activity: {}", sample.app);
+        let message = format!(
+            "You are in focus mode for {task}. Current activity: {}",
+            sample.app
+        );
         os_alert("Distraction warning", &message);
         guard.last_distraction_at = sample.timestamp;
         append_event(data_dir, "distraction_alert", &message)?;
     }
 
     Ok(())
+}
+
+fn enforce_blocked_access(
+    data_dir: &PathBuf,
+    state: &Arc<Mutex<AppState>>,
+    config: &Config,
+    sample: &ActivitySample,
+) -> io::Result<()> {
+    let Some((rule, rule_kind)) = blocked_keyword_match(config, sample) else {
+        return Ok(());
+    };
+    let blocked_key = format!(
+        "{}|{}|{}",
+        normalize_match_text(&rule.target),
+        normalize_match_text(&sample.app),
+        normalize_match_text(&sample.source)
+    );
+
+    {
+        let mut guard = match state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return Ok(()),
+        };
+        let within_cooldown = sample.timestamp - guard.last_blocked_at < BLOCK_COOLDOWN_SECONDS;
+        if within_cooldown && guard.last_blocked_key == blocked_key {
+            return Ok(());
+        }
+        guard.last_blocked_at = sample.timestamp;
+        guard.last_blocked_key = blocked_key;
+    }
+
+    let message = format!(
+        "Blocked access to '{}' because it matches your distraction rule '{}'.",
+        blocked_activity_label(sample),
+        rule.target
+    );
+    notify("Blocked by Local Focus", &message);
+    match rule.mode {
+        BlockMode::Full => block_activity_access(sample, &rule.target, rule_kind),
+        BlockMode::Password => password_block_activity_access(sample, &rule, &message),
+    }
+    append_event(data_dir, "blocked_access", &message)
+}
+
+fn blocked_keyword_match(
+    config: &Config,
+    sample: &ActivitySample,
+) -> Option<(BlockRule, BlockRuleKind)> {
+    config
+        .blocked_keywords
+        .iter()
+        .map(|record| parse_block_rule_record(record))
+        .find_map(|rule| blocked_rule_match(sample, &rule.target).map(|kind| (rule, kind)))
+}
+
+fn blocked_rule_match(sample: &ActivitySample, keyword: &str) -> Option<BlockRuleKind> {
+    if website_rule_matches(sample, keyword) {
+        return Some(BlockRuleKind::Website);
+    }
+    if app_rule_matches(sample, keyword) {
+        return Some(BlockRuleKind::App);
+    }
+    None
+}
+
+fn website_rule_matches(sample: &ActivitySample, keyword: &str) -> bool {
+    let Some(rule_domain) = website_rule_domain(keyword) else {
+        return false;
+    };
+    let source = sample.source.trim();
+    if let Some(sample_domain) = website_rule_domain(source) {
+        return sample_domain == rule_domain || sample_domain.ends_with(&format!(".{rule_domain}"));
+    }
+    let haystack = normalize_match_text(&format!("{} {}", sample.title, sample.source));
+    haystack.contains(&rule_domain)
+}
+
+fn app_rule_matches(sample: &ActivitySample, keyword: &str) -> bool {
+    if website_rule_domain(keyword).is_some() {
+        return false;
+    }
+    let normalized = normalize_match_text(keyword);
+    !normalized.is_empty()
+        && normalize_match_text(&format!("{} {}", sample.app, sample.title)).contains(&normalized)
+}
+
+fn website_rule_domain(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(domain) = domain_from_url(trimmed) {
+        return Some(domain);
+    }
+    let host = trimmed
+        .trim_end_matches('/')
+        .trim_start_matches("www.")
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches(':')
+        .to_lowercase();
+    if host.contains('.') && !host.contains(' ') {
+        Some(host)
+    } else {
+        None
+    }
+}
+
+fn blocked_activity_label(sample: &ActivitySample) -> String {
+    if sample.source != "local" && !sample.source.trim().is_empty() {
+        return sample.source.clone();
+    }
+    if !sample.title.trim().is_empty() {
+        return format!("{} - {}", sample.app, sample.title);
+    }
+    sample.app.clone()
+}
+
+fn notify_devices_for_attention_event(
+    data_dir: &PathBuf,
+    state: &Arc<Mutex<AppState>>,
+    config: &Config,
+    sample: &ActivitySample,
+) -> io::Result<()> {
+    if config.network_devices.is_empty()
+        || !matches!(sample.category.as_str(), "idle" | "distracting")
+    {
+        return Ok(());
+    }
+
+    let event_key = format!(
+        "{}|{}|{}",
+        sample.category,
+        normalize_match_text(&sample.app),
+        normalize_match_text(&sample.source)
+    );
+    {
+        let mut guard = match state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return Ok(()),
+        };
+        let within_cooldown =
+            sample.timestamp - guard.last_device_notify_at < DEVICE_NOTIFY_COOLDOWN_SECONDS;
+        if within_cooldown && guard.last_device_notify_key == event_key {
+            return Ok(());
+        }
+        guard.last_device_notify_at = sample.timestamp;
+        guard.last_device_notify_key = event_key;
+    }
+
+    let message = if sample.category == "idle" {
+        format!("This machine is idle. Last active app: {}", sample.app)
+    } else {
+        format!(
+            "Distracted activity detected on this machine: {} - {}",
+            sample.app,
+            blocked_activity_label(sample)
+        )
+    };
+    send_device_notifications(&config.network_devices, &sample.category, &message, sample);
+    append_device_notification(data_dir, &sample.category, &message, sample)?;
+    append_event(data_dir, "device_notification", &message)
 }
 
 fn matches_focus_target(focus: &FocusSession, sample: &ActivitySample) -> bool {
@@ -508,13 +728,19 @@ fn domain_from_url(value: &str) -> Option<String> {
 }
 
 fn foreground_activity() -> (String, String, String) {
-    platform_foreground_activity().unwrap_or_else(|| {
-        (
-            "Unknown".into(),
-            "Unknown activity".into(),
-            "local".into(),
-        )
-    })
+    platform_foreground_activity()
+        .unwrap_or_else(|| ("Unknown".into(), "Unknown activity".into(), "local".into()))
+}
+
+fn local_network_url() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    if ip.is_loopback() {
+        None
+    } else {
+        Some(format!("http://{ip}:4799"))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -529,7 +755,11 @@ end try
 end tell
 return frontApp & "||" & windowTitle"#;
 
-    let output = Command::new("osascript").arg("-e").arg(script).output().ok()?;
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .ok()?;
     let (app, title, fallback_source) = parse_activity(&String::from_utf8_lossy(&output.stdout))?;
     let source = active_browser_url(&app).unwrap_or(fallback_source);
     Some((app, title, source))
@@ -552,7 +782,11 @@ fn active_browser_url(app: &str) -> Option<String> {
         _ => return None,
     };
 
-    let output = Command::new("osascript").arg("-e").arg(script).output().ok()?;
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -596,7 +830,9 @@ fn platform_foreground_activity() -> Option<(String, String, String)> {
         .arg("xdotool getactivewindow 2>/dev/null")
         .output()
         .ok()?;
-    let window_id = String::from_utf8_lossy(&window_id.stdout).trim().to_string();
+    let window_id = String::from_utf8_lossy(&window_id.stdout)
+        .trim()
+        .to_string();
     if window_id.is_empty() {
         return None;
     }
@@ -651,7 +887,11 @@ fn source_from_title(title: &str) -> String {
 
 fn classify(config: &Config, app: &str, title: &str) -> String {
     let haystack = format!("{} {}", app, title).to_lowercase();
-    if config.blocked_keywords.iter().any(|k| haystack.contains(k)) {
+    if config
+        .blocked_keywords
+        .iter()
+        .any(|k| haystack.contains(&normalize_match_text(&parse_block_rule_record(k).target)))
+    {
         return "distracting".into();
     }
     if config
@@ -698,6 +938,30 @@ fn append_event(data_dir: &PathBuf, kind: &str, message: &str) -> io::Result<()>
         now(),
         json_escape(kind),
         json_escape(message)
+    )
+}
+
+fn append_device_notification(
+    data_dir: &PathBuf,
+    event: &str,
+    message: &str,
+    sample: &ActivitySample,
+) -> io::Result<()> {
+    let timestamp = now();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("device_notifications.jsonl"))?;
+    writeln!(
+        file,
+        "{{\"timestamp\":{},\"event\":\"{}\",\"message\":\"{}\",\"app\":\"{}\",\"title\":\"{}\",\"source\":\"{}\",\"category\":\"{}\"}}",
+        timestamp,
+        json_escape(event),
+        json_escape(message),
+        json_escape(&sample.app),
+        json_escape(&sample.title),
+        json_escape(&sample.source),
+        json_escape(&sample.category)
     )
 }
 
@@ -902,13 +1166,29 @@ fn handle_http(
             .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty())
             .unwrap_or_default();
+        let mode = params
+            .get("mode")
+            .map(|value| parse_block_mode(value))
+            .unwrap_or(BlockMode::Full);
+        let password = params
+            .get("password")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let original = params
+            .get("original")
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default();
 
         if !keyword.is_empty() {
+            let record = format_block_rule_record(&keyword, mode, &password);
             let mut config = load_config(&data_dir).unwrap_or_default();
-            if !config.blocked_keywords.iter().any(|k| k == &keyword) {
-                config.blocked_keywords.push(keyword.clone());
-                save_config(&data_dir, &config)?;
-            }
+            config.blocked_keywords.retain(|item| {
+                let target = parse_block_rule_record(item).target;
+                target != keyword && (original.is_empty() || target != original)
+            });
+            config.blocked_keywords.push(record.clone());
+            save_config(&data_dir, &config)?;
             if let Ok(mut state) = state.lock() {
                 state.config = config;
             }
@@ -916,18 +1196,126 @@ fn handle_http(
         }
 
         write_response(&mut stream, "application/json", "{\"ok\":true}")?;
+    } else if path.starts_with("/api/block/remove") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let keyword = params
+            .get("keyword")
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default();
+        if !keyword.is_empty() {
+            let mut config = load_config(&data_dir).unwrap_or_default();
+            config
+                .blocked_keywords
+                .retain(|item| parse_block_rule_record(item).target != keyword);
+            save_config(&data_dir, &config)?;
+            if let Ok(mut state) = state.lock() {
+                state.config = config;
+            }
+            append_event(&data_dir, "blocked_keyword_removed", &keyword)?;
+        }
+        write_response(&mut stream, "application/json", "{\"ok\":true}")?;
+    } else if path.starts_with("/api/device/add") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let endpoint = params
+            .get("url")
+            .map(|s| normalize_device_endpoint(s))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default();
+        let name = params
+            .get("name")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Device".into());
+        let kind = params
+            .get("kind")
+            .map(|s| normalize_device_kind(s))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "device".into());
+
+        if !endpoint.is_empty() {
+            let device = format_device_record(&name, &kind, &endpoint);
+            let mut config = load_config(&data_dir).unwrap_or_default();
+            if !config
+                .network_devices
+                .iter()
+                .any(|item| parse_network_device_record(item).endpoint == endpoint)
+            {
+                config.network_devices.push(device.clone());
+                save_config(&data_dir, &config)?;
+            }
+            if let Ok(mut state) = state.lock() {
+                state.config = config;
+            }
+            append_event(&data_dir, "device_added", &device)?;
+        }
+
+        write_response(&mut stream, "application/json", "{\"ok\":true}")?;
+    } else if path.starts_with("/api/device/register") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let name = params
+            .get("name")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Device".into());
+        let kind = params
+            .get("kind")
+            .map(|s| normalize_device_kind(s))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "device".into());
+        let endpoint = format!("browser:{}", now());
+        let device = format_device_record(&name, &kind, &endpoint);
+        let mut config = load_config(&data_dir).unwrap_or_default();
+        config.network_devices.push(device.clone());
+        save_config(&data_dir, &config)?;
+        if let Ok(mut state) = state.lock() {
+            state.config = config;
+        }
+        append_event(&data_dir, "browser_device_connected", &device)?;
+        write_response(
+            &mut stream,
+            "application/json",
+            &format!(
+                "{{\"ok\":true,\"device\":\"{}\",\"since\":{}}}",
+                json_escape(&device),
+                now()
+            ),
+        )?;
+    } else if path.starts_with("/api/device/events") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let since = params
+            .get("since")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        write_response(
+            &mut stream,
+            "application/json",
+            &device_notifications_json(&data_dir, since)?,
+        )?;
     } else if path == "/api/timeline" {
         write_response(&mut stream, "application/json", &timeline_json(&data_dir)?)?;
     } else if path == "/api/report/reset" {
         reset_report(&data_dir)?;
         write_response(&mut stream, "application/json", "{\"ok\":true}")?;
     } else if path == "/api/report/history" {
-        write_response(&mut stream, "application/json", &report_history_json(&data_dir)?)?;
+        write_response(
+            &mut stream,
+            "application/json",
+            &report_history_json(&data_dir)?,
+        )?;
     } else if path.starts_with("/api/focus-sessions") {
         let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
         let params = parse_query(query);
-        let since = params.get("since").and_then(|value| value.parse::<i64>().ok());
-        let until = params.get("until").and_then(|value| value.parse::<i64>().ok());
+        let since = params
+            .get("since")
+            .and_then(|value| value.parse::<i64>().ok());
+        let until = params
+            .get("until")
+            .and_then(|value| value.parse::<i64>().ok());
         let focus = state.lock().ok().and_then(|s| s.focus.clone());
         write_response(
             &mut stream,
@@ -941,8 +1329,12 @@ fn handle_http(
             .get("target")
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
-        let since = params.get("since").and_then(|value| value.parse::<i64>().ok());
-        let until = params.get("until").and_then(|value| value.parse::<i64>().ok());
+        let since = params
+            .get("since")
+            .and_then(|value| value.parse::<i64>().ok());
+        let until = params
+            .get("until")
+            .and_then(|value| value.parse::<i64>().ok());
         let period = params
             .get("period")
             .map(|value| value.as_str())
@@ -955,8 +1347,23 @@ fn handle_http(
     } else if path == "/api/report" {
         write_response(&mut stream, "application/json", &report_json(&data_dir)?)?;
     } else if path == "/api/state" {
-        let focus = state.lock().ok().and_then(|s| s.focus.clone());
-        write_response(&mut stream, "application/json", &state_json(focus))?;
+        let (focus, devices, blocks) = state
+            .lock()
+            .map(|s| {
+                (
+                    s.focus.clone(),
+                    s.config.network_devices.clone(),
+                    s.config.blocked_keywords.clone(),
+                )
+            })
+            .unwrap_or_default();
+        write_response(
+            &mut stream,
+            "application/json",
+            &state_json(focus, &devices, &blocks),
+        )?;
+    } else if path == "/device" || path.starts_with("/device?") {
+        write_response(&mut stream, "text/html; charset=utf-8", &device_html())?;
     } else {
         write_response(&mut stream, "text/html; charset=utf-8", &index_html())?;
     }
@@ -980,7 +1387,14 @@ fn timeline_json(data_dir: &PathBuf) -> io::Result<String> {
     let mut current_start = 0;
     let mut last_timestamp = 0;
 
-    for sample in samples.into_iter().rev().take(1500).collect::<Vec<_>>().into_iter().rev() {
+    for sample in samples
+        .into_iter()
+        .rev()
+        .take(1500)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
         match &current {
             Some(active)
                 if active.app == sample.app
@@ -1013,7 +1427,10 @@ fn timeline_json(data_dir: &PathBuf) -> io::Result<String> {
 fn report_json(data_dir: &PathBuf) -> io::Result<String> {
     let samples = load_samples(data_dir)?;
     let since = report_window_start(data_dir)?.max(now() - 24 * 60 * 60);
-    let recent: Vec<_> = samples.into_iter().filter(|s| s.timestamp >= since).collect();
+    let recent: Vec<_> = samples
+        .into_iter()
+        .filter(|s| s.timestamp >= since)
+        .collect();
     let total = recent.len().max(1) as f64;
     let productive = recent.iter().filter(|s| s.category == "productive").count() as f64;
     let idle = recent.iter().filter(|s| s.category == "idle").count() as f64;
@@ -1071,7 +1488,9 @@ fn focus_report_json(
         .max(0);
     let recent: Vec<_> = samples
         .into_iter()
-        .filter(|s| s.timestamp >= since && until_override.map_or(true, |until| s.timestamp < until))
+        .filter(|s| {
+            s.timestamp >= since && until_override.map_or(true, |until| s.timestamp < until)
+        })
         .collect();
     let targets = target_list_from_text(target_text);
     let target_json = targets
@@ -1137,9 +1556,7 @@ fn focus_report_json(
             } else {
                 outside_seconds += seconds;
                 let (app, source) = report_activity_key(sample);
-                *distraction_counts
-                    .entry((app, source))
-                    .or_default() += seconds;
+                *distraction_counts.entry((app, source)).or_default() += seconds;
             }
         }
     }
@@ -1316,8 +1733,7 @@ fn reset_report(data_dir: &PathBuf) -> io::Result<()> {
     writeln!(
         file,
         "{{\"archivedAt\":{},\"report\":{}}}",
-        archived_at,
-        report
+        archived_at, report
     )?;
     fs::write(data_dir.join("report_start.txt"), archived_at.to_string())
 }
@@ -1337,6 +1753,20 @@ fn report_history_json(data_dir: &PathBuf) -> io::Result<String> {
     lines.reverse();
     lines.truncate(20);
     Ok(format!("[{}]", lines.join(",")))
+}
+
+fn device_notifications_json(data_dir: &PathBuf, since: i64) -> io::Result<String> {
+    let path = data_dir.join("device_notifications.jsonl");
+    if !path.exists() {
+        return Ok("[]".into());
+    }
+
+    let rows = BufReader::new(File::open(path)?)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|line| json_number(line, "timestamp").is_some_and(|timestamp| timestamp > since))
+        .collect::<Vec<_>>();
+    Ok(format!("[{}]", rows.join(",")))
 }
 
 fn maybe_log_previous_day_report(
@@ -1387,7 +1817,13 @@ fn local_day_window() -> Option<(String, i64, i64)> {
         let yesterday = command_text("date", &["-v-1d", "+%Y-%m-%d"])?;
         let today_start = command_text(
             "date",
-            &["-j", "-f", "%Y-%m-%d %H:%M:%S", &format!("{today} 00:00:00"), "+%s"],
+            &[
+                "-j",
+                "-f",
+                "%Y-%m-%d %H:%M:%S",
+                &format!("{today} 00:00:00"),
+                "+%s",
+            ],
         )?
         .parse()
         .ok()?;
@@ -1450,13 +1886,40 @@ fn report_window_start(data_dir: &PathBuf) -> io::Result<i64> {
     Ok(value.trim().parse().unwrap_or(0))
 }
 
-fn state_json(focus: Option<FocusSession>) -> String {
+fn state_json(focus: Option<FocusSession>, devices: &[String], blocks: &[String]) -> String {
+    let lan_url = local_network_url().unwrap_or_else(|| "http://127.0.0.1:4799".into());
+    let devices_json = devices
+        .iter()
+        .map(|device| {
+            let device = parse_network_device_record(device);
+            format!(
+                "{{\"name\":\"{}\",\"kind\":\"{}\",\"endpoint\":\"{}\"}}",
+                json_escape(&device.name),
+                json_escape(&device.kind),
+                json_escape(&device.endpoint)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let blocks_json = blocks
+        .iter()
+        .map(|record| {
+            let rule = parse_block_rule_record(record);
+            format!(
+                "{{\"target\":\"{}\",\"mode\":\"{}\",\"hasPassword\":{}}}",
+                json_escape(&rule.target),
+                json_escape(block_mode_name(rule.mode)),
+                !rule.password.is_empty()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     match focus {
         Some(focus) => {
             let elapsed = focus_elapsed_seconds(&focus, now());
             let remaining = ((focus.duration_minutes * 60) as i64 - elapsed).max(0);
             format!(
-                "{{\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\",\"paused\":{},\"remainingSeconds\":{}}}}}",
+                "{{\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\",\"paused\":{},\"remainingSeconds\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"deviceConnectUrl\":\"{}/device\"}}",
                 json_escape(&focus.task),
                 json_escape(&focus.target),
                 focus.started_at,
@@ -1465,10 +1928,18 @@ fn state_json(focus: Option<FocusSession>) -> String {
                 json_escape(&focus.alert_action),
                 json_escape(&focus.redirect_app),
                 focus.paused_at.is_some(),
-                remaining
+                remaining,
+                devices_json,
+                blocks_json,
+                json_escape(&lan_url)
             )
         }
-        None => "{\"focus\":null}".into(),
+        None => format!(
+            "{{\"focus\":null,\"devices\":[{}],\"blockedRules\":[{}],\"deviceConnectUrl\":\"{}/device\"}}",
+            devices_json,
+            blocks_json,
+            json_escape(&lan_url)
+        ),
     }
 }
 
@@ -1540,8 +2011,26 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .focus-task-window.disabled { opacity:.55; }
 .focus-session-list { display:grid; gap:8px; }
 .focus-session-row { border:1px solid var(--line); border-radius:8px; padding:9px; background:var(--panel); }
-.block-fields { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:12px; align-items:end; }
+.block-fields { border:1px solid var(--line); border-radius:10px; padding:12px; background:var(--panel-soft); display:grid; grid-template-columns:minmax(0, 1fr); gap:12px; align-items:start; }
+.device-fields { display:grid; grid-template-columns:minmax(120px, 1fr) minmax(110px, .7fr) minmax(180px, 1.4fr) auto; gap:12px; align-items:end; }
 .block-fields button { min-height:42px; min-width:140px; white-space:nowrap; }
+.device-fields button { min-height:42px; min-width:130px; white-space:nowrap; }
+.check-field { display:grid; gap:7px; }
+.block-type-options { display:grid; grid-template-columns:repeat(2, minmax(140px, 1fr)); gap:8px; max-width:520px; }
+.block-password-field { max-width:520px; }
+.block-submit { justify-self:start; align-self:start; }
+.inline-check { min-height:42px; border:1px solid var(--line); border-radius:8px; padding:8px 10px; display:flex; align-items:center; gap:9px; background:var(--panel); font-weight:800; cursor:pointer; }
+.inline-check.selected, .inline-check:has(input:checked) { border-color:color-mix(in srgb, var(--accent) 55%, var(--line)); background:color-mix(in srgb, var(--accent) 10%, var(--panel)); color:var(--ink); }
+.inline-check input { width:18px; height:18px; accent-color:var(--accent); }
+.password-hidden { display:none !important; }
+.device-list { display:grid; gap:8px; margin-top:10px; }
+.device-pill { border:1px solid var(--line); border-radius:8px; padding:8px 10px; background:var(--panel); overflow-wrap:anywhere; }
+.blocked-list { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+.blocked-chip { display:inline-flex; align-items:center; gap:8px; border:1px solid color-mix(in srgb, var(--bad) 38%, var(--line)); border-radius:999px; padding:6px 10px; background:color-mix(in srgb, var(--bad) 7%, transparent); color:var(--ink); font-weight:700; max-width:100%; overflow-wrap:anywhere; }
+.blocked-chip.editing { border-color:color-mix(in srgb, var(--accent) 65%, var(--line)); background:color-mix(in srgb, var(--accent) 12%, transparent); }
+.blocked-chip small { color:var(--muted); font-weight:800; }
+.blocked-chip button { width:auto; min-width:0; border:0; background:transparent; color:var(--bad); padding:0 2px; font-weight:900; }
+.blocked-chip .edit-chip { color:var(--accent); }
 .focus-layout { display:grid; gap:16px; align-items:start; }
 .focus-layout.editor-collapsed { grid-template-columns:minmax(0, 520px); }
 .focus-layout.editor-collapsed .focus-form { display:none; }
@@ -1621,11 +2110,11 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .bar-fill.bad { background:var(--bad); }
 .split-chart { min-height:170px; border-radius:8px; background:conic-gradient(var(--good) var(--focus-angle), var(--bad) 0); border:1px solid var(--line); display:grid; place-items:center; }
 .split-chart span { background:var(--panel); border:1px solid var(--line); border-radius:999px; padding:18px 20px; font-weight:750; }
-.hour-bars { display:grid; grid-template-columns:repeat(12, minmax(34px, 1fr)); gap:10px; align-items:end; min-height:150px; }
+.hour-bars, .period-bars { display:grid; grid-template-columns:repeat(auto-fit, minmax(30px, 1fr)); gap:10px; align-items:end; min-height:150px; }
 .hour-bar { display:grid; align-items:end; height:120px; gap:2px; }
 .hour-segment { position:relative; border-radius:4px 4px 0 0; min-height:2px; cursor:default; }
-.hour-click { border:0; background:transparent; padding:0; color:inherit; width:100%; cursor:pointer; }
-.hour-click.selected .hour-bar { outline:2px solid color-mix(in srgb, var(--accent) 75%, var(--line)); outline-offset:3px; border-radius:6px; }
+.hour-click, .period-click { border:0; background:transparent; padding:0; color:inherit; width:100%; cursor:pointer; }
+.hour-click.selected .hour-bar, .period-click.selected .hour-bar { outline:2px solid color-mix(in srgb, var(--accent) 75%, var(--line)); outline-offset:3px; border-radius:6px; }
 .hour-detail { margin-top:12px; display:grid; gap:12px; }
 .hour-detail-head { display:flex; flex-wrap:wrap; gap:10px; justify-content:space-between; align-items:flex-start; }
 .hour-detail-title h3 { margin:0; }
@@ -1644,7 +2133,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .activity-bar { display:grid; gap:4px; }
 .activity-bar-track { height:8px; border-radius:999px; background:color-mix(in srgb, var(--line) 55%, transparent); overflow:hidden; }
 .activity-bar-fill { height:100%; border-radius:999px; min-width:2px; }
-.hour-segment:hover::after { content:attr(data-tip); position:absolute; left:50%; bottom:calc(100% + 8px); transform:translateX(-50%); z-index:10; width:max-content; max-width:220px; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--ink); box-shadow:0 8px 24px color-mix(in srgb, var(--ink) 18%, transparent); font-size:12px; font-weight:650; white-space:normal; }
+.hour-segment:hover::after { content:attr(data-tip); position:absolute; left:50%; bottom:calc(100% + 8px); transform:translateX(-50%); z-index:10; width:max-content; max-width:240px; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--ink); box-shadow:0 8px 24px color-mix(in srgb, var(--ink) 18%, transparent); font-size:12px; font-weight:650; white-space:normal; }
 .hour-segment:hover::before { content:""; position:absolute; left:50%; bottom:100%; transform:translateX(-50%); border:5px solid transparent; border-top-color:var(--line); z-index:11; }
 .hour-good, .hour-bad { border-radius:4px 4px 0 0; min-height:2px; }
 .hour-good { background:var(--good); }
@@ -1667,8 +2156,8 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .idle { color:var(--warn); background:color-mix(in srgb, var(--warn) 16%, transparent); }
 .two { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
 @media (max-width:980px) { .focus-layout, .control-shell { grid-template-columns:1fr; } .focus-actions { justify-content:flex-start; } }
-@media (max-width:900px) { .focus-shell-head { align-items:start; display:grid; } .top-actions { justify-content:flex-start; } .block-fields { grid-template-columns:minmax(0, 1fr) auto; } }
-@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid, .block-fields, .activity-row, .calendar-actions { grid-template-columns:1fr; display:grid; } header { align-items:start; } .header-actions { justify-items:start; } .hour-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } .calendar-grid { grid-template-columns:48px repeat(7, minmax(28px, 1fr)); gap:4px; } }
+@media (max-width:900px) { .focus-shell-head { align-items:start; display:grid; } .top-actions { justify-content:flex-start; } }
+@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid, .block-fields, .device-fields, .activity-row, .calendar-actions { grid-template-columns:1fr; display:grid; } header { align-items:start; } .header-actions { justify-items:start; } .hour-bars, .period-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } .calendar-grid { grid-template-columns:48px repeat(7, minmax(28px, 1fr)); gap:4px; } .block-type-options { grid-template-columns:1fr; } .block-password-field { grid-column:auto; } }
 </style>
 </head>
 <body>
@@ -1755,12 +2244,46 @@ button:disabled { cursor:not-allowed; opacity:.55; }
   <section id="distractionCard" class="control-shell distraction-card" aria-label="Distraction rules">
     <div>
       <h2>Add distraction rule</h2>
-      <div class="muted">Mark keywords, apps, or sites as distracting and eligible for alerts.</div>
+      <div class="muted">Block matching apps or sites. Websites close their active tab; apps are quit.</div>
+    </div>
+    <div>
+      <strong>Blocked apps and websites</strong>
+      <div id="blockedList" class="blocked-list"></div>
     </div>
     <div class="block-fields">
-      <div class="field"><label for="blockKeyword">Block keyword, app, or site</label><input id="blockKeyword" placeholder="youtube, reddit, games" aria-label="Block keyword"></div>
-      <button onclick="addBlock()">Add block</button>
+      <div class="field"><label for="blockKeyword">Block keyword, app, or site</label><input id="blockKeyword" placeholder="youtube, reddit, games" aria-label="Block keyword" oninput="syncBlockEditState()"></div>
+      <div class="field check-field">
+        <label>Block type</label>
+        <div class="block-type-options" role="group" aria-label="Block type">
+          <label id="fullBlockOption" class="inline-check selected" for="fullBlock"><input id="fullBlock" type="checkbox" checked onchange="setBlockMode('full')" aria-label="Use full block"> Full block</label>
+          <label id="passwordBlockOption" class="inline-check" for="passwordBlock"><input id="passwordBlock" type="checkbox" onchange="setBlockMode('password')" aria-label="Use password block"> Password block</label>
+        </div>
+        <div id="blockModeHint" class="muted">Full block is active.</div>
+      </div>
+      <div id="blockPasswordField" class="field block-password-field password-hidden"><label for="blockPassword">Password</label><input id="blockPassword" type="password" placeholder="Enter password to continue when blocked" aria-label="Block password"></div>
+      <button id="blockSubmit" class="block-submit" onclick="addBlock()">Add block</button>
     </div>
+  </section>
+  <section id="devicesCard" class="control-shell" aria-label="Network devices">
+    <div>
+      <h2>Devices</h2>
+      <div class="muted">Open the connect link on a same-WiFi phone, TV, tablet, or laptop. Webhook URL is optional.</div>
+    </div>
+    <div class="device-pill"><strong>Connect link</strong><br><span id="deviceConnectUrl" class="muted">Loading...</span></div>
+    <div class="device-fields">
+      <div class="field"><label for="deviceName">Device name</label><input id="deviceName" placeholder="Mukesh phone" aria-label="Device name"></div>
+      <div class="field"><label for="deviceKind">Device type</label><select id="deviceKind" aria-label="Device type">
+        <option value="phone">Phone</option>
+        <option value="tv">TV</option>
+        <option value="tablet">Tablet</option>
+        <option value="laptop">Laptop</option>
+        <option value="desktop">Desktop</option>
+        <option value="device">Other</option>
+      </select></div>
+      <div class="field"><label for="deviceUrl">Webhook URL optional</label><input id="deviceUrl" placeholder="Optional: 192.168.1.25:8080/notify" aria-label="Device webhook URL"></div>
+      <button onclick="addDevice()">Add webhook</button>
+    </div>
+    <div id="deviceList" class="device-list"></div>
   </section>
   <section class="explain" id="explainPanel">
     <h2>Report meaning</h2>
@@ -1769,7 +2292,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
       <div><h3>Productive</h3><p>During a targeted focus session, only activity matching one of your focus apps or sites counts here. Outside targeted focus, productive keywords are used.</p></div>
       <div><h3>Distracted</h3><p>Any activity that is not productive. During targeted focus, every app or site outside your focus list is tracked here.</p></div>
       <div><h3>Idle</h3><p>If there is no keyboard or mouse input for 60 seconds, time is tracked as idle even when the focused app or website matches your focus list.</p></div>
-      <div><h3>Blocked</h3><p>Blocked keywords are treated as distracted activity and can still trigger OS-level warnings.</p></div>
+      <div><h3>Blocked</h3><p>Blocked apps or sites are actively closed when detected, and the blocked time is tracked as distracted.</p></div>
     </div>
   </section>
   <section class="grid" id="metrics"></section>
@@ -1797,6 +2320,8 @@ let activeReportPeriod = 'day';
 let activeReportYear = selectedReportDate.getFullYear();
 let activeReportMonth = selectedReportDate.getMonth();
 let activeReportWeek = 0;
+let blockedRules = [];
+let editingBlockTarget = '';
 const fmtTime = seconds => new Date(seconds * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 const minutes = seconds => Math.max(1, Math.round(seconds / 60));
 async function startFocus() {
@@ -1819,10 +2344,120 @@ async function resetReport() {
 }
 async function addBlock() {
   const input = document.querySelector('#blockKeyword');
+  const fullModeInput = document.querySelector('#fullBlock');
+  const passwordModeInput = document.querySelector('#passwordBlock');
+  const passwordInput = document.querySelector('#blockPassword');
   const keyword = encodeURIComponent(input.value || '');
+  const passwordMode = Boolean(passwordModeInput && passwordModeInput.checked);
+  const mode = encodeURIComponent(passwordMode ? 'password' : 'full');
+  const password = encodeURIComponent(passwordInput.value || '');
+  const original = encodeURIComponent(editingBlockTarget || '');
   if (!keyword) return;
-  await fetch(`/api/block/add?keyword=${keyword}`);
+  if (passwordMode && !passwordInput.value) {
+    passwordInput.focus();
+    return;
+  }
+  await fetch(`/api/block/add?keyword=${keyword}&mode=${mode}&password=${password}&original=${original}`);
+  editingBlockTarget = '';
   input.value = '';
+  passwordInput.value = '';
+  if (fullModeInput) fullModeInput.checked = true;
+  if (passwordModeInput) passwordModeInput.checked = false;
+  syncBlockMode();
+  syncBlockEditState();
+  refresh();
+}
+function selectBlockRule(target) {
+  const rule = blockedRules.find(item => item.target === target);
+  if (!rule) return;
+  editingBlockTarget = rule.target || '';
+  const input = document.querySelector('#blockKeyword');
+  const passwordInput = document.querySelector('#blockPassword');
+  input.value = rule.target || '';
+  passwordInput.value = '';
+  passwordInput.placeholder = rule.mode === 'password' && rule.hasPassword ? 'Enter password to update this block' : 'Enter password to continue when blocked';
+  setBlockMode(rule.mode === 'password' ? 'password' : 'full');
+  syncBlockEditState();
+  input.focus();
+}
+function editBlockFromButton(button) {
+  selectBlockRule(button.dataset.target || '');
+}
+function normalizedBlockValue(value) {
+  return String(value || '').trim().toLowerCase();
+}
+function syncBlockEditState() {
+  const input = document.querySelector('#blockKeyword');
+  const button = document.querySelector('#blockSubmit');
+  if (!input || !button) return;
+  const current = normalizedBlockValue(input.value);
+  const selectedExists = editingBlockTarget && blockedRules.some(rule => rule.target === editingBlockTarget);
+  const typedRule = blockedRules.find(rule => rule.target === current);
+  if (!selectedExists && typedRule) editingBlockTarget = typedRule.target;
+  if (selectedExists && current !== editingBlockTarget) editingBlockTarget = '';
+  button.textContent = editingBlockTarget ? 'Edit block' : 'Add block';
+  document.querySelectorAll('.blocked-chip').forEach(chip => {
+    chip.classList.toggle('editing', chip.dataset.target === editingBlockTarget);
+  });
+}
+function setBlockMode(mode) {
+  const fullModeInput = document.querySelector('#fullBlock');
+  const passwordModeInput = document.querySelector('#passwordBlock');
+  if (mode === 'password') {
+    if (fullModeInput) fullModeInput.checked = false;
+    if (passwordModeInput) passwordModeInput.checked = true;
+  } else {
+    if (fullModeInput) fullModeInput.checked = true;
+    if (passwordModeInput) passwordModeInput.checked = false;
+  }
+  syncBlockMode();
+}
+function syncBlockMode() {
+  const fullModeInput = document.querySelector('#fullBlock');
+  const passwordModeInput = document.querySelector('#passwordBlock');
+  const fullOption = document.querySelector('#fullBlockOption');
+  const passwordOption = document.querySelector('#passwordBlockOption');
+  const passwordField = document.querySelector('#blockPasswordField');
+  const passwordInput = document.querySelector('#blockPassword');
+  const modeHint = document.querySelector('#blockModeHint');
+  let passwordMode = Boolean(passwordModeInput && passwordModeInput.checked);
+  if (!passwordMode && fullModeInput && !fullModeInput.checked) {
+    fullModeInput.checked = true;
+  }
+  if (passwordMode && fullModeInput) fullModeInput.checked = false;
+  if (fullOption) fullOption.classList.toggle('selected', !passwordMode);
+  if (passwordOption) passwordOption.classList.toggle('selected', passwordMode);
+  if (passwordField) passwordField.classList.toggle('password-hidden', !passwordMode);
+  if (modeHint) modeHint.textContent = passwordMode ? 'Password block is active.' : 'Full block is active.';
+  if (passwordInput) {
+    passwordInput.required = passwordMode;
+    if (!passwordMode) passwordInput.value = '';
+  }
+}
+async function removeBlock(target) {
+  await fetch(`/api/block/remove?keyword=${encodeURIComponent(target)}`);
+  if (editingBlockTarget === target) {
+    editingBlockTarget = '';
+    document.querySelector('#blockKeyword').value = '';
+    document.querySelector('#blockPassword').value = '';
+    setBlockMode('full');
+  }
+  refresh();
+}
+function removeBlockFromButton(button) {
+  removeBlock(button.dataset.target || '');
+}
+async function addDevice() {
+  const nameInput = document.querySelector('#deviceName');
+  const kindInput = document.querySelector('#deviceKind');
+  const urlInput = document.querySelector('#deviceUrl');
+  const name = encodeURIComponent(nameInput.value || '');
+  const kind = encodeURIComponent(kindInput.value || 'device');
+  const url = encodeURIComponent(urlInput.value || '');
+  if (!url) return;
+  await fetch(`/api/device/add?name=${name}&kind=${kind}&url=${url}`);
+  nameInput.value = '';
+  urlInput.value = '';
   refresh();
 }
 function saveFocusDraft() {
@@ -2082,7 +2717,6 @@ function renderFocusReport(report) {
   }
   const total = report.focusSeconds + report.outsideSeconds + report.idleSeconds;
   const maxTarget = Math.max(1, ...report.targetBreakdown.map(item => item.totalSeconds || item.seconds + (item.idleSeconds || 0)));
-  const maxHour = Math.max(1, ...report.hourly.map(item => item.productiveSeconds + item.distractingSeconds + (item.idleSeconds || 0)));
   const focusAngle = `${Math.max(0, Math.min(100, report.focusPercent))}%`;
   const targetBars = report.targetBreakdown.map(item => `
     <div class="target-row">
@@ -2106,25 +2740,7 @@ function renderFocusReport(report) {
       <div class="bar-track"><div class="bar-fill bad" style="width:${Math.max(2, item.seconds * 100 / Math.max(1, report.outsideSeconds))}%"></div></div>
       <div class="muted">${formatDuration(item.seconds)}</div>
     </div>`).join('') || '<p class="muted">No outside-focus activity in this report window.</p>';
-  const recentHours = report.hourly.slice(-12);
-  const hours = recentHours.map(item => {
-    const productiveHeight = Math.max(2, item.productiveSeconds * 100 / maxHour);
-    const distractingHeight = Math.max(2, item.distractingSeconds * 100 / maxHour);
-    const idleHeight = Math.max(2, (item.idleSeconds || 0) * 100 / maxHour);
-    const start = new Date(item.hour * 1000);
-    const end = new Date((item.hour + 3600) * 1000);
-    const range = `${start.toLocaleTimeString([], {hour:'numeric'})} to ${end.toLocaleTimeString([], {hour:'numeric'})}`;
-    return `<div>
-      <button type="button" class="hour-click" onclick="showHourDetails(${item.hour}, this)" aria-label="Show details for ${range}">
-      <div class="hour-bar">
-        <div class="hour-segment hour-good" data-tip="Productive: ${formatDuration(item.productiveSeconds)} (${range})" aria-label="Productive: ${formatDuration(item.productiveSeconds)} (${range})" style="height:${productiveHeight}%"></div>
-        <div class="hour-segment" data-tip="Idle: ${formatDuration(item.idleSeconds || 0)} (${range})" aria-label="Idle: ${formatDuration(item.idleSeconds || 0)} (${range})" style="background:var(--warn);height:${idleHeight}%"></div>
-        <div class="hour-segment hour-bad" data-tip="Distracted: ${formatDuration(item.distractingSeconds)} (${range})" aria-label="Distracted: ${formatDuration(item.distractingSeconds)} (${range})" style="height:${distractingHeight}%"></div>
-      </div>
-      </button>
-      <div class="muted" style="font-size:11px;text-align:center">${new Date(item.hour * 1000).toLocaleTimeString([], {hour:'numeric'})}</div>
-    </div>`;
-  }).join('') || '<p class="muted">No hourly data yet.</p>';
+  const productivityChart = renderProductivityChart(report);
   const bestTarget = report.targetBreakdown.find(item => item.seconds > 0);
   const mainDistraction = report.topDistractions[0];
   const insights = [
@@ -2143,7 +2759,7 @@ function renderFocusReport(report) {
       <div class="report-card"><span class="muted">Idle</span><strong>${formatDuration(report.idleSeconds)}</strong></div>
     </div>
     <div class="report-card"><h3>Time on focus apps and websites</h3><div class="target-list">${targetBars || '<p class="muted">No target activity yet.</p>'}</div></div>
-    <div class="report-card"><h3>Productive vs distracted by hour</h3><div class="hour-bars">${hours}</div><div id="hourDetail" class="hour-detail"></div></div>
+    <div class="report-card"><h3>${productivityChart.title}</h3><div class="muted">${productivityChart.hint}</div>${productivityChart.html}<div id="hourDetail" class="hour-detail"></div></div>
     <div class="report-two">
       <div class="report-card">
         <h3>Focus split</h3>
@@ -2152,6 +2768,127 @@ function renderFocusReport(report) {
       <div class="report-card"><h3>Analysis</h3><div class="insights">${insights}</div></div>
     </div>
     <div class="report-card"><h3>Top outside-focus activity</h3>${distractionRows}</div>`;
+}
+function renderProductivityChart(report) {
+  const period = report.period || 'day';
+  const buckets = productivityBuckets(report);
+  const maxBucket = Math.max(1, ...buckets.map(item => item.productiveSeconds + item.distractingSeconds + (item.idleSeconds || 0)));
+  const title = period === 'year'
+    ? 'Productive vs distracted by month'
+    : period === 'month' || period === 'week'
+      ? 'Productive vs distracted by day'
+      : 'Productive vs distracted by hour';
+  const hint = period === 'year'
+    ? 'Click a month bar to open that month report.'
+    : period === 'month' || period === 'week'
+      ? 'Click a day bar to open that day report.'
+      : 'Click an hour bar to see what happened in that hour.';
+  const html = buckets.map(item => {
+    const total = item.productiveSeconds + item.distractingSeconds + (item.idleSeconds || 0);
+    const productiveHeight = Math.max(total ? 2 : 0, item.productiveSeconds * 100 / maxBucket);
+    const distractingHeight = Math.max(total ? 2 : 0, item.distractingSeconds * 100 / maxBucket);
+    const idleHeight = Math.max(total ? 2 : 0, (item.idleSeconds || 0) * 100 / maxBucket);
+    const click = item.kind === 'hour'
+      ? `showHourDetails(${item.startSeconds}, this)`
+      : `drillIntoReport('${item.nextPeriod}', ${item.startSeconds})`;
+    const buttonClass = item.kind === 'hour' ? 'hour-click' : 'period-click';
+    return `<div>
+      <button type="button" class="${buttonClass}" onclick="${click}" aria-label="${escapeTextAttr(item.ariaLabel)}">
+      <div class="hour-bar">
+        <div class="hour-segment hour-good" data-tip="Productive: ${formatDuration(item.productiveSeconds)} (${escapeTextAttr(item.rangeLabel)})" aria-label="Productive: ${formatDuration(item.productiveSeconds)} (${escapeTextAttr(item.rangeLabel)})" style="height:${productiveHeight}%"></div>
+        <div class="hour-segment" data-tip="Idle: ${formatDuration(item.idleSeconds || 0)} (${escapeTextAttr(item.rangeLabel)})" aria-label="Idle: ${formatDuration(item.idleSeconds || 0)} (${escapeTextAttr(item.rangeLabel)})" style="background:var(--warn);height:${idleHeight}%"></div>
+        <div class="hour-segment hour-bad" data-tip="Distracted: ${formatDuration(item.distractingSeconds)} (${escapeTextAttr(item.rangeLabel)})" aria-label="Distracted: ${formatDuration(item.distractingSeconds)} (${escapeTextAttr(item.rangeLabel)})" style="height:${distractingHeight}%"></div>
+      </div>
+      </button>
+      <div class="muted" style="font-size:11px;text-align:center">${escapeHtml(item.label)}</div>
+    </div>`;
+  }).join('');
+  return { title, hint, html: html ? `<div class="period-bars">${html}</div>` : '<p class="muted">No productivity data yet.</p>' };
+}
+function productivityBuckets(report) {
+  const period = report.period || 'day';
+  const start = new Date((report.windowStart || 0) * 1000);
+  const hourly = report.hourly || [];
+  if (period === 'year') {
+    return Array.from({length: 12}, (_, month) => {
+      const bucketStart = new Date(start.getFullYear(), month, 1);
+      const bucketEnd = new Date(start.getFullYear(), month + 1, 1);
+      return aggregateProductivityBucket(hourly, bucketStart, bucketEnd, {
+        kind: 'month',
+        nextPeriod: 'month',
+        label: bucketStart.toLocaleDateString([], {month:'short'}),
+        rangeLabel: bucketStart.toLocaleDateString([], {month:'long', year:'numeric'}),
+        ariaLabel: `Open ${bucketStart.toLocaleDateString([], {month:'long', year:'numeric'})} report`
+      });
+    });
+  }
+  if (period === 'month') {
+    const monthStart = new Date(start.getFullYear(), start.getMonth(), 1);
+    const nextMonth = new Date(start.getFullYear(), start.getMonth() + 1, 1);
+    const days = Math.round((nextMonth - monthStart) / 86400000);
+    return Array.from({length: days}, (_, index) => {
+      const bucketStart = new Date(monthStart);
+      bucketStart.setDate(monthStart.getDate() + index);
+      const bucketEnd = new Date(bucketStart);
+      bucketEnd.setDate(bucketStart.getDate() + 1);
+      return aggregateProductivityBucket(hourly, bucketStart, bucketEnd, {
+        kind: 'day',
+        nextPeriod: 'day',
+        label: String(bucketStart.getDate()),
+        rangeLabel: bucketStart.toLocaleDateString([], {weekday:'short', month:'short', day:'numeric'}),
+        ariaLabel: `Open ${bucketStart.toLocaleDateString([], {weekday:'long', month:'long', day:'numeric'})} report`
+      });
+    });
+  }
+  if (period === 'week') {
+    return Array.from({length: 7}, (_, index) => {
+      const bucketStart = new Date(start);
+      bucketStart.setDate(start.getDate() + index);
+      const bucketEnd = new Date(bucketStart);
+      bucketEnd.setDate(bucketStart.getDate() + 1);
+      return aggregateProductivityBucket(hourly, bucketStart, bucketEnd, {
+        kind: 'day',
+        nextPeriod: 'day',
+        label: bucketStart.toLocaleDateString([], {weekday:'short'}),
+        rangeLabel: bucketStart.toLocaleDateString([], {weekday:'short', month:'short', day:'numeric'}),
+        ariaLabel: `Open ${bucketStart.toLocaleDateString([], {weekday:'long', month:'long', day:'numeric'})} report`
+      });
+    });
+  }
+  return Array.from({length: 24}, (_, index) => {
+    const bucketStart = new Date(start);
+    bucketStart.setHours(index, 0, 0, 0);
+    const bucketEnd = new Date(bucketStart);
+    bucketEnd.setHours(bucketStart.getHours() + 1);
+    return aggregateProductivityBucket(hourly, bucketStart, bucketEnd, {
+      kind: 'hour',
+      nextPeriod: 'hour',
+      label: bucketStart.toLocaleTimeString([], {hour:'numeric'}),
+      rangeLabel: `${bucketStart.toLocaleTimeString([], {hour:'numeric'})} to ${bucketEnd.toLocaleTimeString([], {hour:'numeric'})}`,
+      ariaLabel: `Show details for ${bucketStart.toLocaleTimeString([], {hour:'numeric'})}`
+    });
+  });
+}
+function aggregateProductivityBucket(hourly, bucketStart, bucketEnd, meta) {
+  const startSeconds = Math.floor(bucketStart.getTime() / 1000);
+  const endSeconds = Math.floor(bucketEnd.getTime() / 1000);
+  const totals = hourly.reduce((acc, item) => {
+    if (item.hour >= startSeconds && item.hour < endSeconds) {
+      acc.productiveSeconds += item.productiveSeconds || 0;
+      acc.distractingSeconds += item.distractingSeconds || 0;
+      acc.idleSeconds += item.idleSeconds || 0;
+    }
+    return acc;
+  }, {productiveSeconds: 0, distractingSeconds: 0, idleSeconds: 0});
+  return {...meta, ...totals, startSeconds, endSeconds};
+}
+function drillIntoReport(period, startSeconds) {
+  const dateValue = new Date(startSeconds * 1000);
+  selectedReportDate = new Date(dateValue);
+  calendarDate = new Date(dateValue.getFullYear(), dateValue.getMonth(), 1);
+  setActiveCalendarScope(period, dateValue);
+  renderReportCalendar();
+  runCalendarReport(period, dateValue);
 }
 function showHourDetails(hour, button) {
   const panel = document.querySelector('#hourDetail');
@@ -2222,6 +2959,11 @@ async function refresh() {
     </div>`;
   }).join('') || '<div class="muted">No activity yet.</div>';
   document.querySelector('#apps').innerHTML = report.topApps.map((app, index) => `<p><strong>${escapeHtml(app.app)}</strong><br>${sourceMarkup(app.source || 'local', index)}<br><span class="muted">${formatDuration(app.seconds || app.minutes * 60)}</span></p>`).join('') || '<div class="muted">No apps yet.</div>';
+  blockedRules = (state.blockedRules || []).map(rule => ({...rule, target: normalizedBlockValue(rule.target || '')}));
+  document.querySelector('#blockedList').innerHTML = blockedRules.map(rule => `<span class="blocked-chip${rule.target === editingBlockTarget ? ' editing' : ''}" data-target="${escapeTextAttr(rule.target || '')}">${escapeHtml(shortenSource(rule.target || ''))} <small>${rule.mode === 'password' ? 'password' : 'full'}</small><button class="edit-chip" type="button" data-target="${escapeTextAttr(rule.target || '')}" onclick="editBlockFromButton(this)" aria-label="Edit ${escapeTextAttr(rule.target || '')}">edit</button><button type="button" data-target="${escapeTextAttr(rule.target || '')}" onclick="removeBlockFromButton(this)" aria-label="Remove ${escapeTextAttr(rule.target || '')}">x</button></span>`).join('') || '<div class="muted">No blocked apps or sites yet.</div>';
+  syncBlockEditState();
+  document.querySelector('#deviceConnectUrl').textContent = state.deviceConnectUrl || 'http://127.0.0.1:4799/device';
+  document.querySelector('#deviceList').innerHTML = (state.devices || []).map(device => `<div class="device-pill"><strong>${escapeHtml(device.name || 'Device')}</strong><br><span class="muted">${escapeHtml(device.kind || 'device')} - ${escapeHtml(device.endpoint || '')}</span></div>`).join('') || '<div class="muted">No devices added yet.</div>';
   document.querySelector('#historyList').innerHTML = history.map(item => {
     const r = item.report;
     return `<div class="item">
@@ -2357,12 +3099,108 @@ function escapeHtml(value) {
 function escapeAttr(value) {
   return String(value).replace(/[^a-z0-9_-]/gi, '-');
 }
+function escapeTextAttr(value) {
+  return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+}
 restoreFocusDraft();
+syncBlockMode();
 activeReportWeek = isoWeekNumber(selectedReportDate);
 renderReportCalendar();
 setFocusTaskWindow('day', calendarPeriodWindow('day', selectedReportDate));
 refresh();
 setInterval(refresh, 10000);
+</script>
+</body>
+</html>"#
+        .into()
+}
+
+fn device_html() -> String {
+    r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local Focus Device</title>
+<style>
+:root { color-scheme:light dark; --bg:#f6f6f1; --ink:#202124; --muted:#686b63; --line:#d9dbd2; --good:#24734d; --bad:#a8323b; --panel:#ffffff; }
+body { margin:0; font-family:ui-sans-serif, system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+main { max-width:620px; margin:0 auto; padding:24px; display:grid; gap:18px; }
+section { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; display:grid; gap:12px; }
+h1, h2, p { margin:0; }
+.muted { color:var(--muted); }
+label { font-size:12px; font-weight:800; color:var(--muted); }
+input, select, button { width:100%; box-sizing:border-box; border:1px solid var(--line); border-radius:9px; padding:12px; font:inherit; }
+button { background:var(--good); color:white; font-weight:800; cursor:pointer; }
+.row { display:grid; grid-template-columns:1fr 140px; gap:10px; }
+.event { border-top:1px solid var(--line); padding-top:12px; }
+.event strong { color:var(--bad); }
+@media (max-width:560px) { .row { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <section>
+    <h1>Local Focus Device</h1>
+    <p class="muted">Connect this phone, TV, tablet, or laptop to receive same-WiFi focus alerts from Local Focus.</p>
+  </section>
+  <section>
+    <h2>Connect device</h2>
+    <label for="name">Device name</label>
+    <input id="name" placeholder="Mukesh phone">
+    <div class="row">
+      <div>
+        <label for="kind">Device type</label>
+        <select id="kind">
+          <option value="phone">Phone</option>
+          <option value="tv">TV</option>
+          <option value="tablet">Tablet</option>
+          <option value="laptop">Laptop</option>
+          <option value="desktop">Desktop</option>
+          <option value="device">Other</option>
+        </select>
+      </div>
+      <button onclick="connectDevice()">Connect</button>
+    </div>
+    <p id="status" class="muted">Not connected yet.</p>
+  </section>
+  <section>
+    <h2>Alerts</h2>
+    <div id="events" class="muted">No alerts yet.</div>
+  </section>
+</main>
+<script>
+let since = Math.floor(Date.now() / 1000);
+let connected = false;
+async function connectDevice() {
+  const name = encodeURIComponent(document.querySelector('#name').value || 'Device');
+  const kind = encodeURIComponent(document.querySelector('#kind').value || 'device');
+  const response = await fetch(`/api/device/register?name=${name}&kind=${kind}`).then(r => r.json());
+  since = response.since || since;
+  connected = true;
+  document.querySelector('#status').textContent = 'Connected. Keep this page open to receive alerts.';
+  if ('Notification' in window && Notification.permission === 'default') {
+    try { await Notification.requestPermission(); } catch (_) {}
+  }
+}
+async function pollEvents() {
+  if (!connected) return;
+  const events = await fetch(`/api/device/events?since=${since}`).then(r => r.json()).catch(() => []);
+  if (!events.length) return;
+  since = Math.max(...events.map(event => event.timestamp || since), since);
+  const list = document.querySelector('#events');
+  list.className = '';
+  list.innerHTML = events.reverse().map(event => `<div class="event"><strong>${escapeHtml(event.event || 'Alert')}</strong><p>${escapeHtml(event.message || '')}</p><p class="muted">${new Date((event.timestamp || 0) * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</p></div>`).join('') + list.innerHTML;
+  for (const event of events) {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      new Notification('Local Focus', { body: event.message || 'Focus alert' });
+    }
+  }
+}
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+}
+setInterval(pollEvents, 5000);
 </script>
 </body>
 </html>"#
@@ -2379,7 +3217,10 @@ fn data_dir() -> io::Result<PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
-        Ok(PathBuf::from(home).join("AppData").join("Local").join(APP_NAME))
+        Ok(PathBuf::from(home)
+            .join("AppData")
+            .join("Local")
+            .join(APP_NAME))
     }
     #[cfg(target_os = "macos")]
     {
@@ -2390,7 +3231,10 @@ fn data_dir() -> io::Result<PathBuf> {
     }
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
-        Ok(PathBuf::from(home).join(".local").join("share").join(APP_NAME))
+        Ok(PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join(APP_NAME))
     }
 }
 
@@ -2403,7 +3247,8 @@ fn ensure_config(data_dir: &PathBuf) -> io::Result<()> {
         path,
         "productive=code,terminal,editor,docs,figma,notion,calendar,github,jira,linear\n\
 distracting=youtube,netflix,reddit,instagram,tiktok,x.com,twitter,facebook,game,steam\n\
-blocked=\n",
+blocked=\n\
+devices=\n",
     )
 }
 
@@ -2415,29 +3260,80 @@ fn load_config(data_dir: &PathBuf) -> io::Result<Config> {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        let values = value
-            .split(',')
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
         match key.trim() {
-            "productive" => config.productive_keywords = values,
-            "distracting" => config.distracting_keywords = values,
-            "blocked" => config.blocked_keywords = values,
+            "productive" => config.productive_keywords = config_values(value, true),
+            "distracting" => config.distracting_keywords = config_values(value, true),
+            "blocked" => config.blocked_keywords = config_values(value, false),
+            "devices" => config.network_devices = config_values(value, false),
             _ => {}
         }
     }
     Ok(config)
 }
 
+fn config_values(value: &str, lowercase: bool) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if lowercase {
+                s.to_lowercase()
+            } else {
+                s.to_string()
+            }
+        })
+        .collect()
+}
+
+fn parse_block_mode(value: &str) -> BlockMode {
+    if value.trim().eq_ignore_ascii_case("password") {
+        BlockMode::Password
+    } else {
+        BlockMode::Full
+    }
+}
+
+fn block_mode_name(mode: BlockMode) -> &'static str {
+    match mode {
+        BlockMode::Full => "full",
+        BlockMode::Password => "password",
+    }
+}
+
+fn format_block_rule_record(target: &str, mode: BlockMode, password: &str) -> String {
+    format!(
+        "{}|{}|{}",
+        target.trim().replace(['|', ','], " "),
+        block_mode_name(mode),
+        password.trim().replace(['|', ','], " ")
+    )
+}
+
+fn parse_block_rule_record(record: &str) -> BlockRule {
+    let mut parts = record.splitn(3, '|');
+    let target = parts.next().unwrap_or("").trim().to_lowercase();
+    let mode = parts
+        .next()
+        .map(parse_block_mode)
+        .unwrap_or(BlockMode::Full);
+    let password = parts.next().unwrap_or("").trim().to_string();
+    BlockRule {
+        target,
+        mode,
+        password,
+    }
+}
+
 fn save_config(data_dir: &PathBuf, config: &Config) -> io::Result<()> {
     fs::write(
         data_dir.join("config.txt"),
         format!(
-            "productive={}\ndistracting={}\nblocked={}\n",
+            "productive={}\ndistracting={}\nblocked={}\ndevices={}\n",
             config.productive_keywords.join(","),
             config.distracting_keywords.join(","),
-            config.blocked_keywords.join(",")
+            config.blocked_keywords.join(","),
+            config.network_devices.join(",")
         ),
     )
 }
@@ -2533,6 +3429,142 @@ fn notify(title: &str, message: &str) {
     let _ = Command::new("notify-send").arg(title).arg(message).output();
 }
 
+fn send_device_notifications(
+    devices: &[String],
+    event: &str,
+    message: &str,
+    sample: &ActivitySample,
+) {
+    let devices = devices.to_vec();
+    let event = event.to_string();
+    let message = message.to_string();
+    let sample = sample.clone();
+    thread::spawn(move || {
+        for device in devices {
+            let device = parse_network_device_record(&device);
+            if !device.endpoint.starts_with("browser:") {
+                let _ = post_device_notification(&device.endpoint, &event, &message, &sample);
+            }
+        }
+    });
+}
+
+fn post_device_notification(
+    device: &str,
+    event: &str,
+    message: &str,
+    sample: &ActivitySample,
+) -> io::Result<()> {
+    let Some((host, port, path)) = parse_device_endpoint(device) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid device endpoint",
+        ));
+    };
+    let body = format!(
+        "{{\"app\":\"{}\",\"title\":\"{}\",\"source\":\"{}\",\"category\":\"{}\",\"event\":\"{}\",\"message\":\"{}\",\"timestamp\":{}}}",
+        json_escape(&sample.app),
+        json_escape(&sample.title),
+        json_escape(&sample.source),
+        json_escape(&sample.category),
+        json_escape(event),
+        json_escape(message),
+        sample.timestamp
+    );
+    let mut stream = TcpStream::connect((host.as_str(), port))?;
+    let timeout = Some(Duration::from_secs(2));
+    let _ = stream.set_read_timeout(timeout);
+    let _ = stream.set_write_timeout(timeout);
+    let request = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path,
+        host,
+        body.len(),
+        body
+    );
+    stream.write_all(request.as_bytes())
+}
+
+fn parse_device_endpoint(device: &str) -> Option<(String, u16, String)> {
+    let trimmed = device.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_scheme = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed);
+    let (authority, path_part) = without_scheme
+        .split_once('/')
+        .map(|(authority, path)| (authority, format!("/{path}")))
+        .unwrap_or((without_scheme, "/".to_string()));
+    let (host, port) = authority
+        .rsplit_once(':')
+        .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)))
+        .unwrap_or((authority, 80));
+    let host = host.trim().trim_matches(['[', ']']).to_string();
+    if host.is_empty() {
+        None
+    } else {
+        Some((host, port, path_part))
+    }
+}
+
+fn normalize_device_endpoint(device: &str) -> String {
+    let trimmed = device.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with("browser:") {
+        return trimmed.to_string();
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    }
+}
+
+fn normalize_device_kind(kind: &str) -> String {
+    match kind.trim().to_lowercase().as_str() {
+        "phone" | "tv" | "tablet" | "laptop" | "desktop" => kind.trim().to_lowercase(),
+        _ => "device".into(),
+    }
+}
+
+fn format_device_record(name: &str, kind: &str, endpoint: &str) -> String {
+    format!(
+        "{}|{}|{}",
+        name.trim().replace('|', " "),
+        normalize_device_kind(kind),
+        normalize_device_endpoint(endpoint)
+    )
+}
+
+fn parse_network_device_record(record: &str) -> NetworkDevice {
+    let mut parts = record.splitn(3, '|');
+    let first = parts.next().unwrap_or("").trim();
+    let second = parts.next().map(str::trim);
+    let third = parts.next().map(str::trim);
+    if let (Some(kind), Some(endpoint)) = (second, third) {
+        return NetworkDevice {
+            name: if first.is_empty() {
+                "Device".into()
+            } else {
+                first.to_string()
+            },
+            kind: normalize_device_kind(kind),
+            endpoint: normalize_device_endpoint(endpoint),
+        };
+    }
+
+    NetworkDevice {
+        name: "Device".into(),
+        kind: "device".into(),
+        endpoint: normalize_device_endpoint(record),
+    }
+}
+
 fn os_alert(title: &str, message: &str) {
     #[cfg(target_os = "macos")]
     {
@@ -2569,10 +3601,7 @@ fn os_alert(title: &str, message: &str) {
             shell_escape(&alert_title),
             shell_escape(message)
         );
-        let _ = Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .spawn();
+        let _ = Command::new("sh").arg("-c").arg(script).spawn();
     }
 }
 
@@ -2581,35 +3610,263 @@ fn os_alert_then_activate(title: &str, message: &str, app_name: &str) {
     let message = message.to_string();
     let app_name = app_name.trim().to_string();
 
-    #[cfg(target_os = "macos")]
-    {
-        let alert_title = format!("FOCUS WARNING - {}", title.to_uppercase());
-        let script = format!(
-            "set targetApp to \"{}\"\n\
-             display dialog \"{}\" with title \"{}\" buttons {{\"OK\"}} default button \"OK\" with icon caution\n\
-             do shell script \"open -a \" & quoted form of targetApp\n\
-             delay 0.4\n\
-             try\n\
-             \ttell application targetApp to activate\n\
-             end try\n\
-             try\n\
-             \ttell application \"System Events\" to set frontmost of first process whose name is targetApp to true\n\
-             end try",
-            apple_escape(&app_name),
-            apple_escape(&message),
-            apple_escape(&alert_title)
-        );
-        spawn_macos_focus_alert(script);
-        return;
-    }
-
-    #[cfg(not(target_os = "macos"))]
     thread::spawn(move || {
-        let acknowledged = os_alert_blocking(&title, &message);
-        if acknowledged {
+        #[cfg(target_os = "macos")]
+        {
+            close_existing_focus_alert();
+            if notify_then_activate_macos(&title, &message, &app_name).is_err() {
+                notify(
+                    &format!("FOCUS WARNING - {}", title.to_uppercase()),
+                    &message,
+                );
+                thread::sleep(Duration::from_secs(2));
+                let _ = activate_app(&app_name);
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            notify(
+                &format!("FOCUS WARNING - {}", title.to_uppercase()),
+                &message,
+            );
+            thread::sleep(Duration::from_secs(2));
             let _ = activate_app(&app_name);
         }
     });
+}
+
+#[cfg(target_os = "macos")]
+fn notify_then_activate_macos(title: &str, message: &str, app_name: &str) -> io::Result<()> {
+    let alert_title = format!("FOCUS WARNING - {}", title.to_uppercase());
+    let script = format!(
+        "set targetApp to \"{}\"\n\
+         display notification \"{}\" with title \"{}\" sound name \"Glass\"\n\
+         delay 2\n\
+         do shell script \"open -a \" & quoted form of targetApp\n\
+         delay 0.2\n\
+         try\n\
+         \ttell application targetApp to activate\n\
+         end try\n\
+         try\n\
+         \ttell application \"System Events\" to set frontmost of first process whose name is targetApp to true\n\
+         end try",
+        apple_escape(app_name),
+        apple_escape(message),
+        apple_escape(&alert_title)
+    );
+    let status = Command::new("osascript").arg("-e").arg(script).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("could not notify before activating app"))
+    }
+}
+
+fn block_activity_access(sample: &ActivitySample, keyword: &str, rule_kind: BlockRuleKind) {
+    let sample = sample.clone();
+    let keyword = keyword.trim().to_string();
+    thread::spawn(move || match rule_kind {
+        BlockRuleKind::Website => {
+            if close_active_browser_tab(&sample.app).is_err() {
+                let _ = quit_app(&sample.app);
+            }
+        }
+        BlockRuleKind::App => {
+            if should_quit_blocked_app(&sample, &keyword) {
+                let _ = quit_app(&sample.app);
+            }
+        }
+    });
+}
+
+fn password_block_activity_access(sample: &ActivitySample, rule: &BlockRule, message: &str) {
+    let rule = rule.clone();
+    let sample = sample.clone();
+    let message = message.to_string();
+    thread::spawn(move || {
+        let allowed = prompt_for_block_password(&rule, &message);
+        if !allowed {
+            notify(
+                "Password block",
+                "Incorrect password. Access remains blocked.",
+            );
+            if let Some(kind) = blocked_rule_match(&sample, &rule.target) {
+                block_activity_access(&sample, &rule.target, kind);
+            }
+        }
+    });
+}
+
+fn prompt_for_block_password(rule: &BlockRule, message: &str) -> bool {
+    if rule.password.is_empty() {
+        notify("Password block", message);
+        return true;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "display dialog \"{}\" default answer \"\" with title \"Local Focus Password Block\" buttons {{\"Continue\"}} default button \"Continue\" with hidden answer",
+            apple_escape(message)
+        );
+        let output = Command::new("osascript").arg("-e").arg(script).output();
+        if let Ok(output) = output {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let answer = text
+                .split("text returned:")
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            return answer == rule.password;
+        }
+        return false;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "$p = Read-Host '{}' -AsSecureString; \
+             $b=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($p); \
+             [Runtime.InteropServices.Marshal]::PtrToStringAuto($b)",
+            ps_escape(message)
+        );
+        return Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .ok()
+            .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == rule.password);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let script = format!(
+            "if command -v zenity >/dev/null 2>&1; then zenity --password --title='Local Focus Password Block' --text='{}'; else exit 1; fi",
+            shell_escape(message)
+        );
+        return Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .ok()
+            .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == rule.password);
+    }
+}
+
+fn should_quit_blocked_app(sample: &ActivitySample, keyword: &str) -> bool {
+    let normalized_keyword = normalize_match_text(keyword);
+    if normalized_keyword.is_empty() || domain_from_url(keyword).is_some() || keyword.contains('.')
+    {
+        return false;
+    }
+    normalize_match_text(&sample.app).contains(&normalized_keyword)
+}
+
+fn close_active_browser_tab(app_name: &str) -> io::Result<()> {
+    let app_name = app_name.trim();
+    if app_name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing browser app name",
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let script = if app_name.eq_ignore_ascii_case("safari") {
+            format!(
+                "tell application \"{}\" to if (count of windows) > 0 then close current tab of front window",
+                apple_escape(app_name)
+            )
+        } else {
+            format!(
+                "tell application \"{}\" to if (count of windows) > 0 then close active tab of front window",
+                apple_escape(app_name)
+            )
+        };
+        let status = Command::new("osascript").arg("-e").arg(script).status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let status = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "$shell = New-Object -ComObject WScript.Shell; $shell.SendKeys('^w')",
+            ])
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg("if command -v xdotool >/dev/null 2>&1; then xdotool key Ctrl+w; else exit 1; fi")
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    Err(io::Error::other("could not close blocked browser tab"))
+}
+
+fn quit_app(app_name: &str) -> io::Result<()> {
+    let app_name = app_name.trim();
+    if app_name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing app name",
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!("tell application \"{}\" to quit", apple_escape(app_name));
+        let status = Command::new("osascript").arg("-e").arg(script).status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "Get-Process -Name '{}' -ErrorAction SilentlyContinue | Stop-Process",
+            ps_escape(app_name)
+        );
+        let status = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "if command -v wmctrl >/dev/null 2>&1; then wmctrl -c '{}'; else pkill -x '{}'; fi",
+                shell_escape(app_name),
+                shell_escape(app_name)
+            ))
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    Err(io::Error::other("could not quit blocked app"))
 }
 
 #[cfg(target_os = "macos")]
@@ -2620,9 +3877,15 @@ fn active_alert_pid() -> &'static Mutex<Option<u32>> {
 
 #[cfg(target_os = "macos")]
 fn close_existing_focus_alert() {
-    let pid = active_alert_pid().lock().ok().and_then(|mut active| active.take());
+    let pid = active_alert_pid()
+        .lock()
+        .ok()
+        .and_then(|mut active| active.take());
     if let Some(pid) = pid {
-        let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
     }
 }
 
@@ -2682,11 +3945,13 @@ fn os_alert_blocking(title: &str, message: &str) -> bool {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
 fn activate_app(app_name: &str) -> io::Result<()> {
     let app_name = app_name.trim();
     if app_name.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing app name"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing app name",
+        ));
     }
 
     #[cfg(target_os = "macos")]
@@ -2704,7 +3969,10 @@ fn activate_app(app_name: &str) -> io::Result<()> {
             return Ok(());
         }
 
-        let script = format!("tell application \"{}\" to activate", apple_escape(app_name));
+        let script = format!(
+            "tell application \"{}\" to activate",
+            apple_escape(app_name)
+        );
         let status = Command::new("osascript").arg("-e").arg(script).status()?;
         if status.success() {
             return Ok(());
