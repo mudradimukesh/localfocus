@@ -508,11 +508,7 @@ fn enforce_high_focus_block(
         return Ok(false);
     }
 
-    let rule_kind = if sample.source != "local" && website_rule_domain(&sample.source).is_some() {
-        BlockRuleKind::Website
-    } else {
-        BlockRuleKind::App
-    };
+    let rule_kind = high_focus_block_rule_kind(sample);
     let block_key = format!(
         "high-focus|{}|{}|{}",
         normalize_match_text(&sample.app),
@@ -550,6 +546,16 @@ fn high_focus_should_block(focus: &FocusSession, sample: &ActivitySample) -> boo
         && !matches_focus_target(focus, sample)
         && !is_local_focus_control_activity(sample)
         && !is_system_connection_activity(sample)
+}
+
+fn high_focus_block_rule_kind(sample: &ActivitySample) -> BlockRuleKind {
+    if is_browser_app(&sample.app)
+        || (sample.source != "local" && website_rule_domain(&sample.source).is_some())
+    {
+        BlockRuleKind::Website
+    } else {
+        BlockRuleKind::App
+    }
 }
 
 fn is_local_focus_control_activity(sample: &ActivitySample) -> bool {
@@ -4612,7 +4618,7 @@ fn block_high_focus_activity_access(sample: &ActivitySample, rule_kind: BlockRul
     let sample = sample.clone();
     thread::spawn(move || match rule_kind {
         BlockRuleKind::Website => {
-            if close_active_browser_tab(&sample.app).is_err() {
+            if close_active_browser_tab(&sample.app).is_err() && !is_browser_app(&sample.app) {
                 let _ = force_quit_app(&sample.app);
             }
         }
@@ -4705,6 +4711,28 @@ fn should_quit_blocked_app(sample: &ActivitySample, keyword: &str) -> bool {
     normalize_match_text(&sample.app).contains(&normalized_keyword)
 }
 
+fn is_browser_app(app_name: &str) -> bool {
+    let app = app_name.trim().to_lowercase();
+    app == "arc"
+        || app == "chrome"
+        || app == "chrome.exe"
+        || app == "firefox"
+        || app == "firefox.exe"
+        || app == "safari"
+        || app.contains("arc browser")
+        || app.contains("brave")
+        || app.contains("chromium")
+        || app.contains("firefox")
+        || app.contains("google chrome")
+        || app.contains("google-chrome")
+        || app.contains("librewolf")
+        || app.contains("microsoft edge")
+        || app.contains("msedge")
+        || app.contains("opera")
+        || app.contains("vivaldi")
+        || app.contains("zen browser")
+}
+
 fn close_active_browser_tab(app_name: &str) -> io::Result<()> {
     let app_name = app_name.trim();
     if app_name.is_empty() {
@@ -4729,6 +4757,10 @@ fn close_active_browser_tab(app_name: &str) -> io::Result<()> {
         };
         let status = Command::new("osascript").arg("-e").arg(script).status()?;
         if status.success() {
+            return Ok(());
+        }
+
+        if is_browser_app(app_name) && close_active_tab_with_keyboard_macos(app_name).is_ok() {
             return Ok(());
         }
     }
@@ -4759,6 +4791,25 @@ fn close_active_browser_tab(app_name: &str) -> io::Result<()> {
     }
 
     Err(io::Error::other("could not close blocked browser tab"))
+}
+
+#[cfg(target_os = "macos")]
+fn close_active_tab_with_keyboard_macos(app_name: &str) -> io::Result<()> {
+    let script = format!(
+        "tell application \"System Events\"\n\
+         set frontmost of first process whose name is \"{}\" to true\n\
+         keystroke \"w\" using command down\n\
+         end tell",
+        apple_escape(app_name)
+    );
+    let status = Command::new("osascript").arg("-e").arg(script).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "could not close active browser tab with keyboard",
+        ))
+    }
 }
 
 fn quit_app(app_name: &str) -> io::Result<()> {
@@ -5247,6 +5298,24 @@ mod tests {
         active.category = "idle".into();
 
         assert!(high_focus_should_block(&session, &active));
+    }
+
+    #[test]
+    fn high_focus_empty_browser_tab_is_tab_level_block() {
+        let session = focus("Pages, https://claude.ai/, https://chatgpt.com");
+        let active = sample("Google Chrome", "New Tab", "chrome://newtab/");
+
+        assert!(high_focus_should_block(&session, &active));
+        assert_eq!(high_focus_block_rule_kind(&active), BlockRuleKind::Website);
+    }
+
+    #[test]
+    fn high_focus_blank_safari_tab_is_tab_level_block() {
+        let session = focus("Pages, https://claude.ai/, https://chatgpt.com");
+        let active = sample("Safari", "Favorites", "about:blank");
+
+        assert!(high_focus_should_block(&session, &active));
+        assert_eq!(high_focus_block_rule_kind(&active), BlockRuleKind::Website);
     }
 
     #[test]
