@@ -168,6 +168,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        stopExistingDashboardServer()
+
         let serverURL = executableDirectory.appendingPathComponent("local-focus-bin")
         let process = Process()
         process.executableURL = serverURL
@@ -180,6 +182,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             serverProcess = process
         } catch {
             showError("Could not start Local Focus: \(error.localizedDescription)")
+        }
+    }
+
+    private func stopExistingDashboardServer() {
+        let lsof = Process()
+        let output = Pipe()
+        lsof.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        lsof.arguments = ["-tiTCP:4799", "-sTCP:LISTEN"]
+        lsof.standardOutput = output
+        lsof.standardError = Pipe()
+
+        do {
+            try lsof.run()
+            lsof.waitUntilExit()
+        } catch {
+            return
+        }
+
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let pids = String(data: data, encoding: .utf8)?
+            .split(whereSeparator: \.isNewline)
+            .map(String.init) ?? []
+
+        for pid in pids where Int32(pid) != getpid() {
+            let kill = Process()
+            kill.executableURL = URL(fileURLWithPath: "/bin/kill")
+            kill.arguments = ["-TERM", pid]
+            kill.standardOutput = Pipe()
+            kill.standardError = Pipe()
+            try? kill.run()
+            kill.waitUntilExit()
+        }
+
+        if !pids.isEmpty {
+            Thread.sleep(forTimeInterval: 0.25)
         }
     }
 

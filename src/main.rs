@@ -2678,6 +2678,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .focus-paused { background:var(--warn); border-color:var(--warn); color:white; }
 .focus-stop-active { border-color:var(--bad); color:var(--bad); }
 .grid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; }
+.focus-summary-grid { gap:8px; }
 .metric, .timeline, .apps, .explain, .history, .report { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
 .metric strong { display:block; font-size:28px; }
 .muted { color:var(--muted); }
@@ -2687,6 +2688,8 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .history.open { display:block; }
 .report { display:none; }
 .report.open { display:grid; gap:16px; }
+.report-inline { background:transparent; border:0; border-radius:0; padding:0; }
+.report-inline.open { border-top:1px solid var(--line); padding-top:16px; }
 .report-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
 .report-close { min-width:40px; padding:7px 10px; }
 .explain-grid { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:12px; }
@@ -2813,6 +2816,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
       <div class="quick-metric"><span>Warn after</span><strong id="quickDelay">1m</strong></div>
       <div class="quick-metric"><span>Action</span><strong id="quickAction">Alert</strong></div>
     </div>
+    <section class="grid focus-summary-grid" id="metrics" aria-label="Current focus summary"></section>
     <div class="high-focus-control">
       <div class="high-focus-row">
         <label class="high-focus-check" for="highFocusMode">
@@ -2852,6 +2856,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
         <div id="focusSessionList" class="focus-session-list"></div>
       </div>
     </div>
+    <section class="report report-inline" id="focusReportPanel" aria-live="polite"></section>
   </section>
   <section id="distractionCard" class="control-shell distraction-card" aria-label="Distraction rules">
     <div>
@@ -2926,8 +2931,6 @@ button:disabled { cursor:not-allowed; opacity:.55; }
       <div><h3>Blocked</h3><p>Blocked apps or sites are actively closed when detected, and the blocked time is tracked as distracted.</p></div>
     </div>
   </section>
-  <section class="grid" id="metrics"></section>
-  <section class="report" id="focusReportPanel" aria-live="polite"></section>
   <section class="bar">
     <button id="historyToggle" onclick="toggleHistory()" aria-expanded="false">Previous reports</button>
   </section>
@@ -3306,13 +3309,8 @@ function closeFocusReport() {
 }
 function moveDistractionCard(afterReport) {
   const card = document.querySelector('#distractionCard');
-  const reportPanel = document.querySelector('#focusReportPanel');
   const reportsCard = document.querySelector('#reportsCard');
-  if (afterReport) {
-    reportPanel.insertAdjacentElement('afterend', card);
-  } else {
-    reportsCard.insertAdjacentElement('afterend', card);
-  }
+  reportsCard.insertAdjacentElement('afterend', card);
 }
 function calendarPeriodWindow(period, dateValue) {
   const start = new Date(dateValue);
