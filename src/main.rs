@@ -17,6 +17,7 @@ const DISTRACTION_SECONDS: i64 = 90;
 const BLOCK_COOLDOWN_SECONDS: i64 = 10;
 const DEVICE_NOTIFY_COOLDOWN_SECONDS: i64 = 60;
 const DEFAULT_ALERT_DELAY_SECONDS: u64 = 60;
+const DEFAULT_ALERT_MESSAGE_TEMPLATE: &str = "You have been outside your focus apps/sites for over {delay}. Allowed: '{targets}'. Current activity: {app}";
 const IDLE_SECONDS: u64 = 60;
 const MAX_FOCUS_TARGETS: usize = 15;
 
@@ -49,6 +50,7 @@ struct FocusSession {
     pomodoro_alerted_at: Option<i64>,
     alert_delay_seconds: u64,
     alert_action: String,
+    alert_message: String,
     redirect_app: String,
     high_focus_mode: bool,
 }
@@ -329,6 +331,7 @@ fn start_focus(
         pomodoro_alerted_at: None,
         alert_delay_seconds: DEFAULT_ALERT_DELAY_SECONDS,
         alert_action: "alert".into(),
+        alert_message: DEFAULT_ALERT_MESSAGE_TEMPLATE.into(),
         redirect_app: String::new(),
         high_focus_mode: false,
     };
@@ -395,12 +398,7 @@ fn detect_distraction(
 
         if mismatch_duration >= alert_delay && alert_cooldown_passed {
             let focus = guard.focus.as_ref().expect("focus checked above");
-            let message = format!(
-                "You have been outside your focus apps/sites for over {}. Allowed: '{}'. Current activity: {}",
-                human_duration(alert_delay as u64),
-                focus.target,
-                sample.app
-            );
+            let message = focus_alert_message(focus, sample);
             if focus.alert_action == "switch" && !focus.redirect_app.trim().is_empty() {
                 os_alert_then_activate("Focus warning", &message, &focus.redirect_app);
             } else {
@@ -429,6 +427,25 @@ fn detect_distraction(
     }
 
     Ok(())
+}
+
+fn focus_alert_message(focus: &FocusSession, sample: &ActivitySample) -> String {
+    let template = clean_alert_message_template(&focus.alert_message);
+    template
+        .replace("{delay}", &human_duration(focus.alert_delay_seconds.max(1)))
+        .replace("{targets}", &focus.target)
+        .replace("{app}", &sample.app)
+        .replace("{title}", &sample.title)
+        .replace("{url}", &sample.source)
+}
+
+fn clean_alert_message_template(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        DEFAULT_ALERT_MESSAGE_TEMPLATE.into()
+    } else {
+        trimmed.into()
+    }
 }
 
 fn enforce_blocked_access(
@@ -1246,13 +1263,14 @@ fn append_focus_session(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<
         .open(data_dir.join("focus_sessions.jsonl"))?;
     writeln!(
         file,
-        "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{}}}",
+        "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{}}}",
         json_escape(&focus.task),
         json_escape(&focus.target),
         focus.started_at,
         focus.duration_minutes,
         focus.alert_delay_seconds,
         json_escape(&focus.alert_action),
+        json_escape(&clean_alert_message_template(&focus.alert_message)),
         json_escape(&focus.redirect_app),
         focus.high_focus_mode
     )
@@ -1288,13 +1306,14 @@ fn focus_sessions_json(
                 .any(|line| json_number(line, "startedAt") == Some(focus.started_at))
         {
             rows.push(format!(
-                "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{}}}",
+                "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{}}}",
                 json_escape(&focus.task),
                 json_escape(&focus.target),
                 focus.started_at,
                 focus.duration_minutes,
                 focus.alert_delay_seconds,
                 json_escape(&focus.alert_action),
+                json_escape(&clean_alert_message_template(&focus.alert_message)),
                 json_escape(&focus.redirect_app),
                 focus.high_focus_mode
             ));
@@ -1370,6 +1389,10 @@ fn handle_http(
             .filter(|action| action.as_str() == "switch")
             .cloned()
             .unwrap_or_else(|| "alert".into());
+        let alert_message = params
+            .get("alertMessage")
+            .map(|message| clean_alert_message_template(message))
+            .unwrap_or_else(|| DEFAULT_ALERT_MESSAGE_TEMPLATE.into());
         let redirect_app = params
             .get("redirectApp")
             .map(|s| s.trim().to_string())
@@ -1385,6 +1408,7 @@ fn handle_http(
             pomodoro_alerted_at: None,
             alert_delay_seconds,
             alert_action,
+            alert_message,
             redirect_app,
             high_focus_mode: false,
         };
@@ -2492,13 +2516,14 @@ fn state_json(focus: Option<FocusSession>, devices: &[String], blocks: &[String]
             let elapsed = focus_elapsed_seconds(&focus, now());
             let remaining = ((focus.duration_minutes * 60) as i64 - elapsed).max(0);
             format!(
-                "{{\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"paused\":{},\"remainingSeconds\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
+                "{{\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"paused\":{},\"remainingSeconds\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
                 json_escape(&focus.task),
                 json_escape(&focus.target),
                 focus.started_at,
                 focus.duration_minutes,
                 focus.alert_delay_seconds,
                 json_escape(&focus.alert_action),
+                json_escape(&clean_alert_message_template(&focus.alert_message)),
                 json_escape(&focus.redirect_app),
                 focus.high_focus_mode,
                 focus.paused_at.is_some(),
@@ -2631,6 +2656,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .focus-layout.editor-collapsed .focus-form { display:none; }
 .focus-form { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; align-items:end; }
 .focus-form .field-wide { grid-column:1 / -1; }
+.alert-message-field textarea { min-height:78px; }
 .target-builder { display:grid; gap:8px; }
 .target-entry { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; }
 .target-entry button { min-width:96px; }
@@ -2805,6 +2831,11 @@ button:disabled { cursor:not-allowed; opacity:.55; }
           <option value="switch">Move to app</option>
         </select></div>
         <div class="field"><label for="redirectApp">App to move to</label><input id="redirectApp" placeholder="Pages" aria-label="Move focus to app"></div>
+        <div class="field field-wide alert-message-field">
+          <label for="alertMessage">Alert message</label>
+          <textarea id="alertMessage" aria-label="Alert message">You have been outside your focus apps/sites for over {delay}. Allowed: '{targets}'. Current activity: {app}</textarea>
+          <div class="muted">Use {delay}, {targets}, {app}, {title}, or {url}.</div>
+        </div>
       </div>
     </div>
   </section>
@@ -2960,6 +2991,7 @@ let deviceQrUrls = {};
 let activeDeviceQrKind = 'install';
 let activeFocusSession = null;
 const MAX_FOCUS_TARGETS = 15;
+const DEFAULT_ALERT_MESSAGE_TEMPLATE = `You have been outside your focus apps/sites for over {delay}. Allowed: '{targets}'. Current activity: {app}`;
 const fmtTime = seconds => new Date(seconds * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 const minutes = seconds => Math.max(1, Math.round(seconds / 60));
 async function startFocus() {
@@ -2969,8 +3001,9 @@ async function startFocus() {
   const mins = encodeURIComponent(document.querySelector('#minutes').value || '25');
   const alertSeconds = encodeURIComponent(Math.max(1, Number(document.querySelector('#alertMinutes').value || '1')) * 60);
   const alertAction = encodeURIComponent(document.querySelector('#alertAction').value || 'alert');
+  const alertMessage = encodeURIComponent(document.querySelector('#alertMessage').value || DEFAULT_ALERT_MESSAGE_TEMPLATE);
   const redirectApp = encodeURIComponent(document.querySelector('#redirectApp').value || '');
-  await fetch(`/api/focus/start?task=${task}&target=${target}&minutes=${mins}&alertSeconds=${alertSeconds}&alertAction=${alertAction}&redirectApp=${redirectApp}`);
+  await fetch(`/api/focus/start?task=${task}&target=${target}&minutes=${mins}&alertSeconds=${alertSeconds}&alertAction=${alertAction}&alertMessage=${alertMessage}&redirectApp=${redirectApp}`);
   refresh();
 }
 async function stopFocus() { await fetch('/api/focus/stop'); refresh(); }
@@ -3186,6 +3219,7 @@ function saveFocusDraft() {
     minutes: document.querySelector('#minutes').value,
     alertMinutes: document.querySelector('#alertMinutes').value,
     alertAction: document.querySelector('#alertAction').value,
+    alertMessage: document.querySelector('#alertMessage').value,
     redirectApp: document.querySelector('#redirectApp').value
   }));
 }
@@ -3197,9 +3231,10 @@ function restoreFocusDraft() {
     if (draft.minutes) document.querySelector('#minutes').value = draft.minutes;
     if (draft.alertMinutes) document.querySelector('#alertMinutes').value = draft.alertMinutes;
     if (draft.alertAction) document.querySelector('#alertAction').value = draft.alertAction;
+    if (draft.alertMessage) document.querySelector('#alertMessage').value = draft.alertMessage;
     if (draft.redirectApp) document.querySelector('#redirectApp').value = draft.redirectApp;
   } catch {}
-  ['#task', '#minutes', '#alertMinutes', '#alertAction', '#redirectApp'].forEach(selector => {
+  ['#task', '#minutes', '#alertMinutes', '#alertAction', '#alertMessage', '#redirectApp'].forEach(selector => {
     document.querySelector(selector).addEventListener('input', saveFocusDraft);
     document.querySelector(selector).addEventListener('change', saveFocusDraft);
   });
@@ -3741,6 +3776,7 @@ function updateFocusSummary(focus) {
   chip.textContent = paused ? 'Focus paused' : 'Focus active';
   chip.className = `status-chip ${paused ? 'paused' : 'running'}`;
   const action = focus.alertAction === 'switch' && focus.redirectApp ? `move to ${focus.redirectApp}` : 'show alert';
+  const alertMessage = focus.alertMessage || DEFAULT_ALERT_MESSAGE_TEMPLATE;
   const targets = String(focus.target || '').split(/[,\n]/).map(value => value.trim()).filter(Boolean);
   const targetChips = targets.map(value => `<span class="target-chip">${escapeHtml(shortenSource(value))}</span>`).join('') || '<span class="target-chip">No target set</span>';
   details.innerHTML = `
@@ -3749,6 +3785,7 @@ function updateFocusSummary(focus) {
       <div class="detail-card"><span>Full focus list</span><strong>${escapeHtml(focus.target || 'No target set')}</strong></div>
       <div class="detail-card"><span>Warning delay</span><strong>${formatDuration(focus.alertDelaySeconds || 60)} outside focus</strong></div>
       <div class="detail-card"><span>Notification action</span><strong>${escapeHtml(action)}</strong></div>
+      <div class="detail-card"><span>Alert message</span><strong>${escapeHtml(alertMessage)}</strong></div>
     </div>`;
   quickTask.textContent = focus.task || 'Focus session';
   quickStatus.textContent = paused ? 'Paused' : 'Active';
@@ -3777,12 +3814,14 @@ function seedFocusInputsFromActiveSession(focus) {
   const minutesInput = document.querySelector('#minutes');
   const alertInput = document.querySelector('#alertMinutes');
   const actionInput = document.querySelector('#alertAction');
+  const messageInput = document.querySelector('#alertMessage');
   const redirectInput = document.querySelector('#redirectApp');
   if (focus.task) taskInput.value = focus.task;
   if (focus.target && targetInput.value !== focus.target) setFocusTargets(focus.target);
   if (focus.durationMinutes) minutesInput.value = focus.durationMinutes;
   if (focus.alertDelaySeconds) alertInput.value = Math.max(1, Math.round(focus.alertDelaySeconds / 60));
   if (focus.alertAction) actionInput.value = focus.alertAction;
+  messageInput.value = focus.alertMessage || DEFAULT_ALERT_MESSAGE_TEMPLATE;
   redirectInput.value = focus.redirectApp || '';
   saveFocusDraft();
 }
@@ -4219,7 +4258,7 @@ fn save_focus(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<()> {
     fs::write(
         data_dir.join("focus.json"),
         format!(
-            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{}}}",
+            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{}}}",
             json_escape(&focus.task),
             json_escape(&focus.target),
             focus.started_at,
@@ -4230,6 +4269,7 @@ fn save_focus(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<()> {
             pomodoro_alerted_at,
             focus.alert_delay_seconds,
             json_escape(&focus.alert_action),
+            json_escape(&clean_alert_message_template(&focus.alert_message)),
             json_escape(&focus.redirect_app),
             focus.high_focus_mode
         ),
@@ -4251,6 +4291,9 @@ fn load_focus(data_dir: &PathBuf) -> Option<FocusSession> {
             .map(|value| value.max(1) as u64)
             .unwrap_or(DEFAULT_ALERT_DELAY_SECONDS),
         alert_action: json_string(&value, "alertAction").unwrap_or_else(|| "alert".into()),
+        alert_message: json_string(&value, "alertMessage")
+            .map(|message| clean_alert_message_template(&message))
+            .unwrap_or_else(|| DEFAULT_ALERT_MESSAGE_TEMPLATE.into()),
         redirect_app: json_string(&value, "redirectApp").unwrap_or_default(),
         high_focus_mode: json_bool(&value, "highFocusMode").unwrap_or(false),
     })
@@ -5223,9 +5266,30 @@ mod tests {
             pomodoro_alerted_at: None,
             alert_delay_seconds: DEFAULT_ALERT_DELAY_SECONDS,
             alert_action: "alert".into(),
+            alert_message: DEFAULT_ALERT_MESSAGE_TEMPLATE.into(),
             redirect_app: String::new(),
             high_focus_mode: true,
         }
+    }
+
+    #[test]
+    fn focus_alert_message_uses_custom_template_and_default_fallback() {
+        let active = sample("Safari", "News", "https://www.nytimes.com/");
+        let mut session = focus("Pages, https://claude.ai/");
+        session.alert_delay_seconds = 180;
+        session.alert_message =
+            "Return to {targets}. Current: {app} at {url} after {delay}.".into();
+
+        assert_eq!(
+            focus_alert_message(&session, &active),
+            "Return to Pages, https://claude.ai/. Current: Safari at https://www.nytimes.com/ after 3 minutes."
+        );
+
+        session.alert_message = "   ".into();
+        assert_eq!(
+            focus_alert_message(&session, &active),
+            "You have been outside your focus apps/sites for over 3 minutes. Allowed: 'Pages, https://claude.ai/'. Current activity: Safari"
+        );
     }
 
     #[test]
