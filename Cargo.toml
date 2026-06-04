@@ -5,6 +5,9 @@ edition = "2021"
 description = "Privacy-first local activity tracker with focus mode and reports"
 license = "MIT"
 
+[dependencies]
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+
 [profile.release]
 strip = true
 lto = true

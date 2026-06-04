@@ -7,9 +7,120 @@ struct LocalFocusHost {
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
+        app.mainMenu = AppMenu.build()
         app.setActivationPolicy(.regular)
         app.activate(ignoringOtherApps: true)
         app.run()
+    }
+}
+
+enum AppMenu {
+    static func build() -> NSMenu {
+        let mainMenu = NSMenu()
+        mainMenu.addItem(appMenuItem())
+        mainMenu.addItem(editMenuItem())
+        mainMenu.addItem(viewMenuItem())
+        mainMenu.addItem(windowMenuItem())
+        return mainMenu
+    }
+
+    private static func appMenuItem() -> NSMenuItem {
+        let appName = appDisplayName()
+        let item = NSMenuItem(title: appName, action: nil, keyEquivalent: "")
+        let menu = NSMenu()
+
+        menu.addItem(NSMenuItem(title: "About \(appName)", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: ""))
+        menu.addItem(.separator())
+
+        let services = NSMenu()
+        let servicesItem = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
+        servicesItem.submenu = services
+        menu.addItem(servicesItem)
+        NSApplication.shared.servicesMenu = services
+
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Hide \(appName)", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
+
+        let hideOthers = NSMenuItem(title: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+        hideOthers.keyEquivalentModifierMask = [.command, .option]
+        menu.addItem(hideOthers)
+
+        menu.addItem(NSMenuItem(title: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: ""))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit \(appName)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+
+        item.submenu = menu
+        return item
+    }
+
+    private static func editMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+        let menu = NSMenu(title: "Edit")
+
+        menu.addItem(NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z"))
+
+        let redo = NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(redo)
+
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        menu.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        menu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+
+        let pasteAndMatchStyle = NSMenuItem(title: "Paste and Match Style", action: Selector(("pasteAsPlainText:")), keyEquivalent: "V")
+        pasteAndMatchStyle.keyEquivalentModifierMask = [.command, .option, .shift]
+        menu.addItem(pasteAndMatchStyle)
+
+        menu.addItem(NSMenuItem(title: "Delete", action: #selector(NSText.delete(_:)), keyEquivalent: ""))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+
+        menu.addItem(.separator())
+        let findMenuItem = NSMenuItem(title: "Find", action: nil, keyEquivalent: "")
+        let findMenu = NSMenu(title: "Find")
+        findMenu.addItem(NSMenuItem(title: "Find...", action: Selector(("performFindPanelAction:")), keyEquivalent: "f"))
+
+        let findNext = NSMenuItem(title: "Find Next", action: Selector(("performFindPanelAction:")), keyEquivalent: "g")
+        findNext.tag = NSTextFinder.Action.nextMatch.rawValue
+        findMenu.addItem(findNext)
+
+        let findPrevious = NSMenuItem(title: "Find Previous", action: Selector(("performFindPanelAction:")), keyEquivalent: "G")
+        findPrevious.keyEquivalentModifierMask = [.command, .shift]
+        findPrevious.tag = NSTextFinder.Action.previousMatch.rawValue
+        findMenu.addItem(findPrevious)
+
+        findMenuItem.submenu = findMenu
+        menu.addItem(findMenuItem)
+
+        item.submenu = menu
+        return item
+    }
+
+    private static func viewMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "View", action: nil, keyEquivalent: "")
+        let menu = NSMenu(title: "View")
+        menu.addItem(NSMenuItem(title: "Reload", action: #selector(WKWebView.reload(_:)), keyEquivalent: "r"))
+        item.submenu = menu
+        return item
+    }
+
+    private static func windowMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "Window", action: nil, keyEquivalent: "")
+        let menu = NSMenu(title: "Window")
+        menu.addItem(NSMenuItem(title: "Minimize", action: #selector(NSWindow.miniaturize(_:)), keyEquivalent: "m"))
+        menu.addItem(NSMenuItem(title: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: ""))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
+        item.submenu = menu
+        NSApplication.shared.windowsMenu = menu
+        return item
+    }
+
+    private static func appDisplayName() -> String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+            ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String
+            ?? "Local Focus"
     }
 }
 

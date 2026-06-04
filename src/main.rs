@@ -1,8 +1,10 @@
+use qrcode::render::svg;
+use qrcode::QrCode;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -16,6 +18,7 @@ const BLOCK_COOLDOWN_SECONDS: i64 = 10;
 const DEVICE_NOTIFY_COOLDOWN_SECONDS: i64 = 60;
 const DEFAULT_ALERT_DELAY_SECONDS: u64 = 60;
 const IDLE_SECONDS: u64 = 60;
+const MAX_FOCUS_TARGETS: usize = 15;
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -47,6 +50,7 @@ struct FocusSession {
     alert_delay_seconds: u64,
     alert_action: String,
     redirect_app: String,
+    high_focus_mode: bool,
 }
 
 #[derive(Default)]
@@ -86,6 +90,14 @@ struct NetworkDevice {
     name: String,
     kind: String,
     endpoint: String,
+    selected: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UrlMatchParts {
+    host: String,
+    path: String,
+    port: Option<String>,
 }
 
 impl Default for Config {
@@ -198,7 +210,7 @@ fn run_app(data_dir: PathBuf) -> io::Result<()> {
     let listener = TcpListener::bind("0.0.0.0:4799")?;
     println!("Local Focus is running at http://127.0.0.1:4799");
     if let Some(url) = local_network_url() {
-        println!("Same-WiFi devices can connect at {url}/device");
+        println!("Device QR receiver URL: {url}/device");
     }
     println!("Data stays on this machine: {}", data_dir.display());
 
@@ -318,6 +330,7 @@ fn start_focus(
         alert_delay_seconds: DEFAULT_ALERT_DELAY_SECONDS,
         alert_action: "alert".into(),
         redirect_app: String::new(),
+        high_focus_mode: false,
     };
     save_focus(&data_dir, &session)?;
     append_focus_session(&data_dir, &session)?;
@@ -424,6 +437,14 @@ fn enforce_blocked_access(
     config: &Config,
     sample: &ActivitySample,
 ) -> io::Result<()> {
+    if activity_is_block_exempt(state, sample) {
+        return Ok(());
+    }
+
+    if enforce_high_focus_block(data_dir, state, sample)? {
+        return Ok(());
+    }
+
     let Some((rule, rule_kind)) = blocked_keyword_match(config, sample) else {
         return Ok(());
     };
@@ -458,6 +479,106 @@ fn enforce_blocked_access(
         BlockMode::Password => password_block_activity_access(sample, &rule, &message),
     }
     append_event(data_dir, "blocked_access", &message)
+}
+
+fn activity_is_block_exempt(state: &Arc<Mutex<AppState>>, sample: &ActivitySample) -> bool {
+    if is_local_focus_control_activity(sample) || is_system_connection_activity(sample) {
+        return true;
+    }
+
+    state
+        .lock()
+        .ok()
+        .and_then(|guard| guard.focus.clone())
+        .filter(|focus| focus.paused_at.is_none())
+        .filter(|focus| !focus_targets(focus).is_empty())
+        .is_some_and(|focus| matches_focus_target(&focus, sample))
+}
+
+fn enforce_high_focus_block(
+    data_dir: &PathBuf,
+    state: &Arc<Mutex<AppState>>,
+    sample: &ActivitySample,
+) -> io::Result<bool> {
+    let focus = state.lock().ok().and_then(|guard| guard.focus.clone());
+    let Some(focus) = focus else {
+        return Ok(false);
+    };
+    if !high_focus_should_block(&focus, sample) {
+        return Ok(false);
+    }
+
+    let rule_kind = if sample.source != "local" && website_rule_domain(&sample.source).is_some() {
+        BlockRuleKind::Website
+    } else {
+        BlockRuleKind::App
+    };
+    let block_key = format!(
+        "high-focus|{}|{}|{}",
+        normalize_match_text(&sample.app),
+        normalize_match_text(&sample.source),
+        normalize_match_text(&sample.title)
+    );
+    {
+        let mut guard = match state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return Ok(true),
+        };
+        let within_cooldown = sample.timestamp - guard.last_blocked_at < BLOCK_COOLDOWN_SECONDS;
+        if within_cooldown && guard.last_blocked_key == block_key {
+            return Ok(true);
+        }
+        guard.last_blocked_at = sample.timestamp;
+        guard.last_blocked_key = block_key;
+    }
+
+    let message = format!(
+        "High Focus blocked '{}' because it is outside your focus apps/sites '{}'.",
+        blocked_activity_label(sample),
+        focus.target
+    );
+    notify("High Focus block", &message);
+    block_high_focus_activity_access(sample, rule_kind);
+    append_event(data_dir, "high_focus_blocked_access", &message)?;
+    Ok(true)
+}
+
+fn high_focus_should_block(focus: &FocusSession, sample: &ActivitySample) -> bool {
+    focus.high_focus_mode
+        && focus.paused_at.is_none()
+        && !focus_targets(focus).is_empty()
+        && !matches_focus_target(focus, sample)
+        && !is_local_focus_control_activity(sample)
+        && !is_system_connection_activity(sample)
+}
+
+fn is_local_focus_control_activity(sample: &ActivitySample) -> bool {
+    let haystack = normalize_match_text(&format!(
+        "{} {} {}",
+        sample.app, sample.title, sample.source
+    ));
+    haystack.contains("local-focus")
+        || haystack.contains("local focus")
+        || haystack.contains("127.0.0.1:4799")
+        || haystack.contains("localhost:4799")
+        || sample_url_parts(sample)
+            .iter()
+            .any(|part| part.port.as_deref() == Some("4799"))
+        || local_network_url()
+            .map(|url| haystack.contains(&normalize_match_text(&url)))
+            .unwrap_or(false)
+}
+
+fn is_system_connection_activity(sample: &ActivitySample) -> bool {
+    let haystack = normalize_match_text(&format!(
+        "{} {} {}",
+        sample.app, sample.title, sample.source
+    ))
+    .replace('-', " ");
+    haystack.contains("wi fi")
+        || haystack.contains("wifi")
+        || haystack.contains("network settings")
+        || haystack.contains("network connection")
 }
 
 fn blocked_keyword_match(
@@ -542,18 +663,64 @@ fn notify_devices_for_attention_event(
     config: &Config,
     sample: &ActivitySample,
 ) -> io::Result<()> {
-    if config.network_devices.is_empty()
-        || !matches!(sample.category.as_str(), "idle" | "distracting")
-    {
+    if !matches!(sample.category.as_str(), "idle" | "distracting") {
         return Ok(());
     }
 
-    let event_key = format!(
-        "{}|{}|{}",
-        sample.category,
-        normalize_match_text(&sample.app),
-        normalize_match_text(&sample.source)
-    );
+    let (devices, event_key, message) = if sample.category == "idle" {
+        let focus = state.lock().ok().and_then(|guard| guard.focus.clone());
+        let Some(focus) = focus.filter(|focus| focus.paused_at.is_none()) else {
+            return Ok(());
+        };
+        let mobile_reported_idle = sample.source.starts_with("mobile:");
+        let idle_seconds = if mobile_reported_idle {
+            focus.alert_delay_seconds.max(1)
+        } else {
+            system_idle_seconds().unwrap_or(0)
+        };
+        let warn_seconds = focus.alert_delay_seconds.max(1);
+        if idle_seconds < warn_seconds {
+            return Ok(());
+        }
+        let devices = idle_warning_devices(&config.network_devices);
+        if devices.is_empty() {
+            return Ok(());
+        }
+        (
+            devices,
+            format!("idle_after_warn|{}", idle_seconds / warn_seconds),
+            format!(
+                "Idle warning: {} has been idle for {} during '{}'.",
+                if mobile_reported_idle {
+                    blocked_activity_label(sample)
+                } else {
+                    "this laptop".into()
+                },
+                human_duration(idle_seconds),
+                focus.task
+            ),
+        )
+    } else {
+        let devices = selected_network_devices(&config.network_devices);
+        if devices.is_empty() {
+            return Ok(());
+        }
+        (
+            devices,
+            format!(
+                "{}|{}|{}",
+                sample.category,
+                normalize_match_text(&sample.app),
+                normalize_match_text(&sample.source)
+            ),
+            format!(
+                "Distracted activity detected on this machine: {} - {}",
+                sample.app,
+                blocked_activity_label(sample)
+            ),
+        )
+    };
+
     {
         let mut guard = match state.lock() {
             Ok(guard) => guard,
@@ -568,17 +735,8 @@ fn notify_devices_for_attention_event(
         guard.last_device_notify_key = event_key;
     }
 
-    let message = if sample.category == "idle" {
-        format!("This machine is idle. Last active app: {}", sample.app)
-    } else {
-        format!(
-            "Distracted activity detected on this machine: {} - {}",
-            sample.app,
-            blocked_activity_label(sample)
-        )
-    };
-    send_device_notifications(&config.network_devices, &sample.category, &message, sample);
-    append_device_notification(data_dir, &sample.category, &message, sample)?;
+    send_device_notifications(&devices, &sample.category, &message, sample);
+    append_device_notification(data_dir, &sample.category, &message, sample, &devices)?;
     append_event(data_dir, "device_notification", &message)
 }
 
@@ -588,19 +746,9 @@ fn matches_focus_target(focus: &FocusSession, sample: &ActivitySample) -> bool {
         return true;
     }
 
-    let haystack = normalize_match_text(&format!(
-        "{} {} {}",
-        sample.app, sample.title, sample.source
-    ));
-
-    targets.iter().any(|target| {
-        let normalized = normalize_match_text(target);
-        let domain = domain_from_url(target).map(|domain| normalize_match_text(&domain));
-        haystack.contains(&normalized)
-            || domain
-                .as_ref()
-                .is_some_and(|domain| !domain.is_empty() && haystack.contains(domain))
-    })
+    targets
+        .iter()
+        .any(|target| sample_matches_target_text(sample, target))
 }
 
 fn apply_focus_productivity_gate(focus: &Option<FocusSession>, sample: &mut ActivitySample) {
@@ -693,6 +841,26 @@ fn focus_targets(focus: &FocusSession) -> Vec<String> {
         .collect()
 }
 
+fn normalize_focus_target_text(value: &str) -> String {
+    let mut targets = Vec::new();
+    for target in value
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+    {
+        if targets.len() >= MAX_FOCUS_TARGETS {
+            break;
+        }
+        if !targets
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(target))
+        {
+            targets.push(target.to_string());
+        }
+    }
+    targets.join(", ")
+}
+
 fn human_duration(seconds: u64) -> String {
     if seconds == 60 {
         "1 minute".into()
@@ -716,15 +884,104 @@ fn normalize_match_text(value: &str) -> String {
 }
 
 fn domain_from_url(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    let without_scheme = trimmed
-        .strip_prefix("https://")
-        .or_else(|| trimmed.strip_prefix("http://"))?;
-    without_scheme
-        .split('/')
+    url_match_parts_from_text(value).map(|parts| parts.host)
+}
+
+fn sample_url_parts(sample: &ActivitySample) -> Vec<UrlMatchParts> {
+    let mut parts = Vec::new();
+    push_url_parts_from_text(&mut parts, &sample.source);
+    push_url_parts_from_text(&mut parts, &sample.title);
+    push_url_parts_from_text(&mut parts, &sample.app);
+    parts
+}
+
+fn push_url_parts_from_text(parts: &mut Vec<UrlMatchParts>, value: &str) {
+    if let Some(part) = url_match_parts_from_text(value) {
+        push_unique_url_part(parts, part);
+    }
+
+    for token in value.split_whitespace() {
+        if let Some(part) = url_match_parts_from_text(token) {
+            push_unique_url_part(parts, part);
+        }
+    }
+}
+
+fn push_unique_url_part(parts: &mut Vec<UrlMatchParts>, part: UrlMatchParts) {
+    if !parts.iter().any(|existing| existing == &part) {
+        parts.push(part);
+    }
+}
+
+fn url_match_parts_from_text(value: &str) -> Option<UrlMatchParts> {
+    let trimmed = trim_url_candidate(value);
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let without_scheme = if lower.starts_with("https://") {
+        &trimmed[8..]
+    } else if lower.starts_with("http://") {
+        &trimmed[7..]
+    } else {
+        trimmed
+    };
+    let without_query = without_scheme
+        .split(['?', '#'])
         .next()
-        .map(|domain| domain.trim_start_matches("www.").to_string())
-        .filter(|domain| !domain.is_empty())
+        .unwrap_or(without_scheme);
+    let (host_port, raw_path) = without_query.split_once('/').unwrap_or((without_query, ""));
+    let (host, port) = split_host_port(host_port);
+    if !looks_like_host(&host) {
+        return None;
+    }
+
+    let path = if raw_path.is_empty() {
+        "/".into()
+    } else {
+        format!("/{}", raw_path.trim_matches('/')).to_ascii_lowercase()
+    };
+
+    Some(UrlMatchParts { host, path, port })
+}
+
+fn trim_url_candidate(value: &str) -> &str {
+    value.trim().trim_matches(|c: char| {
+        matches!(
+            c,
+            '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
+        )
+    })
+}
+
+fn split_host_port(value: &str) -> (String, Option<String>) {
+    let host_port = value.trim().trim_start_matches("www.");
+    if let Some((host, port)) = host_port.rsplit_once(':') {
+        if !host.contains(':') && port.chars().all(|c| c.is_ascii_digit()) {
+            return (host.to_ascii_lowercase(), Some(port.to_string()));
+        }
+    }
+    (host_port.to_ascii_lowercase(), None)
+}
+
+fn looks_like_host(host: &str) -> bool {
+    host == "localhost" || host.parse::<IpAddr>().is_ok() || host.contains('.')
+}
+
+fn url_parts_match(target: &UrlMatchParts, sample: &UrlMatchParts) -> bool {
+    let host_matches =
+        sample.host == target.host || sample.host.ends_with(&format!(".{}", target.host));
+    if !host_matches {
+        return false;
+    }
+
+    let target_path = target.path.trim_end_matches('/');
+    if target_path.is_empty() {
+        return true;
+    }
+    let sample_path = sample.path.trim_end_matches('/');
+    sample_path == target_path || sample_path.starts_with(&format!("{target_path}/"))
 }
 
 fn foreground_activity() -> (String, String, String) {
@@ -733,13 +990,17 @@ fn foreground_activity() -> (String, String, String) {
 }
 
 fn local_network_url() -> Option<String> {
+    local_network_ip().map(|ip| format!("http://{ip}:4799"))
+}
+
+fn local_network_ip() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     let ip = socket.local_addr().ok()?.ip();
     if ip.is_loopback() {
         None
     } else {
-        Some(format!("http://{ip}:4799"))
+        Some(ip.to_string())
     }
 }
 
@@ -946,22 +1207,29 @@ fn append_device_notification(
     event: &str,
     message: &str,
     sample: &ActivitySample,
+    devices: &[NetworkDevice],
 ) -> io::Result<()> {
     let timestamp = now();
+    let device_targets = devices
+        .iter()
+        .map(|device| device.endpoint.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(data_dir.join("device_notifications.jsonl"))?;
     writeln!(
         file,
-        "{{\"timestamp\":{},\"event\":\"{}\",\"message\":\"{}\",\"app\":\"{}\",\"title\":\"{}\",\"source\":\"{}\",\"category\":\"{}\"}}",
+        "{{\"timestamp\":{},\"event\":\"{}\",\"message\":\"{}\",\"app\":\"{}\",\"title\":\"{}\",\"source\":\"{}\",\"category\":\"{}\",\"devices\":\"{}\"}}",
         timestamp,
         json_escape(event),
         json_escape(message),
         json_escape(&sample.app),
         json_escape(&sample.title),
         json_escape(&sample.source),
-        json_escape(&sample.category)
+        json_escape(&sample.category),
+        json_escape(&device_targets)
     )
 }
 
@@ -972,14 +1240,15 @@ fn append_focus_session(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<
         .open(data_dir.join("focus_sessions.jsonl"))?;
     writeln!(
         file,
-        "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\"}}",
+        "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{}}}",
         json_escape(&focus.task),
         json_escape(&focus.target),
         focus.started_at,
         focus.duration_minutes,
         focus.alert_delay_seconds,
         json_escape(&focus.alert_action),
-        json_escape(&focus.redirect_app)
+        json_escape(&focus.redirect_app),
+        focus.high_focus_mode
     )
 }
 
@@ -1013,14 +1282,15 @@ fn focus_sessions_json(
                 .any(|line| json_number(line, "startedAt") == Some(focus.started_at))
         {
             rows.push(format!(
-                "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\"}}",
+                "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{}}}",
                 json_escape(&focus.task),
                 json_escape(&focus.target),
                 focus.started_at,
                 focus.duration_minutes,
                 focus.alert_delay_seconds,
                 json_escape(&focus.alert_action),
-                json_escape(&focus.redirect_app)
+                json_escape(&focus.redirect_app),
+                focus.high_focus_mode
             ));
         }
     }
@@ -1082,7 +1352,7 @@ fn handle_http(
             .unwrap_or(25);
         let target = params
             .get("target")
-            .map(|s| s.trim().to_string())
+            .map(|s| normalize_focus_target_text(s))
             .unwrap_or_default();
         let alert_delay_seconds = params
             .get("alertSeconds")
@@ -1110,6 +1380,7 @@ fn handle_http(
             alert_delay_seconds,
             alert_action,
             redirect_app,
+            high_focus_mode: false,
         };
         save_focus(&data_dir, &session)?;
         append_focus_session(&data_dir, &session)?;
@@ -1150,6 +1421,60 @@ fn handle_http(
 
         if let Some(focus) = updated {
             save_focus(&data_dir, &focus)?;
+        }
+        write_response(&mut stream, "application/json", "{\"ok\":true}")?;
+    } else if path.starts_with("/api/focus/targets") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let target = params
+            .get("target")
+            .map(|s| normalize_focus_target_text(s))
+            .unwrap_or_default();
+        let updated = {
+            let mut guard = state
+                .lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "state lock poisoned"))?;
+            if let Some(mut focus) = guard.focus.clone() {
+                focus.target = target.clone();
+                guard.focus = Some(focus.clone());
+                Some(focus)
+            } else {
+                None
+            }
+        };
+        if let Some(focus) = updated {
+            save_focus(&data_dir, &focus)?;
+            append_event(&data_dir, "focus_targets_updated", &target)?;
+        }
+        write_response(&mut stream, "application/json", "{\"ok\":true}")?;
+    } else if path.starts_with("/api/focus/high-focus") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let enabled = params
+            .get("enabled")
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"));
+        let updated = {
+            let mut guard = state
+                .lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "state lock poisoned"))?;
+            if let Some(mut focus) = guard.focus.clone() {
+                focus.high_focus_mode = enabled;
+                guard.focus = Some(focus.clone());
+                Some(focus)
+            } else {
+                None
+            }
+        };
+        if let Some(focus) = updated {
+            save_focus(&data_dir, &focus)?;
+            notify(
+                "High Focus mode",
+                if enabled {
+                    "Outside-focus apps and websites will be fully blocked."
+                } else {
+                    "Outside-focus apps and websites will only be tracked and warned."
+                },
+            );
         }
         write_response(&mut stream, "application/json", "{\"ok\":true}")?;
     } else if path.starts_with("/api/focus/stop") {
@@ -1216,43 +1541,6 @@ fn handle_http(
             append_event(&data_dir, "blocked_keyword_removed", &keyword)?;
         }
         write_response(&mut stream, "application/json", "{\"ok\":true}")?;
-    } else if path.starts_with("/api/device/add") {
-        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-        let params = parse_query(query);
-        let endpoint = params
-            .get("url")
-            .map(|s| normalize_device_endpoint(s))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_default();
-        let name = params
-            .get("name")
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "Device".into());
-        let kind = params
-            .get("kind")
-            .map(|s| normalize_device_kind(s))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "device".into());
-
-        if !endpoint.is_empty() {
-            let device = format_device_record(&name, &kind, &endpoint);
-            let mut config = load_config(&data_dir).unwrap_or_default();
-            if !config
-                .network_devices
-                .iter()
-                .any(|item| parse_network_device_record(item).endpoint == endpoint)
-            {
-                config.network_devices.push(device.clone());
-                save_config(&data_dir, &config)?;
-            }
-            if let Ok(mut state) = state.lock() {
-                state.config = config;
-            }
-            append_event(&data_dir, "device_added", &device)?;
-        }
-
-        write_response(&mut stream, "application/json", "{\"ok\":true}")?;
     } else if path.starts_with("/api/device/register") {
         let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
         let params = parse_query(query);
@@ -1267,7 +1555,7 @@ fn handle_http(
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "device".into());
         let endpoint = format!("browser:{}", now());
-        let device = format_device_record(&name, &kind, &endpoint);
+        let device = format_device_record_selected(&name, &kind, &endpoint, true);
         let mut config = load_config(&data_dir).unwrap_or_default();
         config.network_devices.push(device.clone());
         save_config(&data_dir, &config)?;
@@ -1279,9 +1567,98 @@ fn handle_http(
             &mut stream,
             "application/json",
             &format!(
-                "{{\"ok\":true,\"device\":\"{}\",\"since\":{}}}",
+                "{{\"ok\":true,\"device\":\"{}\",\"endpoint\":\"{}\",\"since\":{}}}",
                 json_escape(&device),
+                json_escape(&endpoint),
                 now()
+            ),
+        )?;
+    } else if path.starts_with("/api/mobile/register") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or("");
+        let name = request_value(&params, body, "name")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Phone".into());
+        let kind = request_value(&params, body, "kind")
+            .map(|s| normalize_device_kind(&s))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "phone".into());
+        let endpoint = request_value(&params, body, "endpoint")
+            .map(|s| normalize_device_endpoint(&s))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("mobile:{}", now()));
+        let device = format_device_record_selected(&name, &kind, &endpoint, true);
+        let mut config = load_config(&data_dir).unwrap_or_default();
+        config
+            .network_devices
+            .retain(|item| parse_network_device_record(item).endpoint != endpoint);
+        config.network_devices.push(device.clone());
+        save_config(&data_dir, &config)?;
+        if let Ok(mut state) = state.lock() {
+            state.config = config;
+        }
+        append_event(&data_dir, "mobile_device_registered", &device)?;
+        write_response(
+            &mut stream,
+            "application/json",
+            &format!(
+                "{{\"ok\":true,\"device\":\"{}\",\"endpoint\":\"{}\",\"eventsUrl\":\"/api/device/events?device={}\"}}",
+                json_escape(&device),
+                json_escape(&endpoint),
+                json_escape(&url_encode(&endpoint))
+            ),
+        )?;
+    } else if path.starts_with("/api/mobile/activity") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or("");
+        let device = request_value(&params, body, "device").unwrap_or_else(|| "Phone".into());
+        let app =
+            request_value(&params, body, "app").unwrap_or_else(|| "Unknown mobile app".into());
+        let title = request_value(&params, body, "title").unwrap_or_default();
+        let source = request_value(&params, body, "source")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("mobile:{}", device));
+        let timestamp = request_value(&params, body, "timestamp")
+            .and_then(|value| value.parse::<i64>().ok())
+            .or_else(|| json_number(body, "timestamp"))
+            .unwrap_or_else(now);
+        let (config, focus) = state
+            .lock()
+            .map(|guard| (guard.config.clone(), guard.focus.clone()))
+            .unwrap_or_default();
+        let category = request_value(&params, body, "category")
+            .filter(|value| matches!(value.as_str(), "productive" | "distracting" | "idle"))
+            .unwrap_or_else(|| classify(&config, &app, &format!("{title} {source}")));
+        let mut sample = ActivitySample {
+            timestamp,
+            app,
+            title: if title.trim().is_empty() {
+                format!("{} activity", device)
+            } else {
+                format!("{} - {}", device, title)
+            },
+            source,
+            category,
+        };
+        apply_focus_productivity_gate(&focus, &mut sample);
+        append_sample(&data_dir, &sample)?;
+        detect_distraction(&data_dir, &state, &sample)?;
+        notify_devices_for_attention_event(&data_dir, &state, &config, &sample)?;
+        write_response(
+            &mut stream,
+            "application/json",
+            &format!(
+                "{{\"ok\":true,\"category\":\"{}\",\"timestamp\":{}}}",
+                json_escape(&sample.category),
+                sample.timestamp
             ),
         )?;
     } else if path.starts_with("/api/device/events") {
@@ -1291,10 +1668,46 @@ fn handle_http(
             .get("since")
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
+        let device = params.get("device").map(String::as_str).unwrap_or("");
         write_response(
             &mut stream,
             "application/json",
-            &device_notifications_json(&data_dir, since)?,
+            &device_notifications_json(&data_dir, since, device)?,
+        )?;
+    } else if path.starts_with("/api/native/notify") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or("");
+        let message = params
+            .get("message")
+            .cloned()
+            .or_else(|| json_string(body, "message"))
+            .unwrap_or_else(|| "Focus alert".into());
+        let title = params
+            .get("title")
+            .cloned()
+            .or_else(|| json_string(body, "event"))
+            .unwrap_or_else(|| "Local Focus".into());
+        notify(&title, &message);
+        write_response(&mut stream, "application/json", "{\"ok\":true}")?;
+    } else if path.starts_with("/api/qr.svg") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let Some(value) = params.get("value").filter(|value| !value.trim().is_empty()) else {
+            write_not_found(&mut stream, "Missing QR value.")?;
+            return Ok(());
+        };
+        let label = params
+            .get("label")
+            .map(String::as_str)
+            .unwrap_or("Local Focus connection QR");
+        write_response(
+            &mut stream,
+            "image/svg+xml; charset=utf-8",
+            &qr_svg(value, label)?,
         )?;
     } else if path == "/api/timeline" {
         write_response(&mut stream, "application/json", &timeline_json(&data_dir)?)?;
@@ -1362,6 +1775,38 @@ fn handle_http(
             "application/json",
             &state_json(focus, &devices, &blocks),
         )?;
+    } else if path == "/connect" || path.starts_with("/connect?") {
+        write_response(
+            &mut stream,
+            "text/html; charset=utf-8",
+            &connect_device_html(),
+        )?;
+    } else if path.starts_with("/download/local-focus-mobile.apk") {
+        write_artifact_response(
+            &mut stream,
+            "application/vnd.android.package-archive",
+            "local-focus-mobile.apk",
+            &["mobile/local_focus_mobile/build/app/outputs/flutter-apk/app-debug.apk"],
+        )?;
+    } else if path.starts_with("/download/local-focus-macos.dmg") {
+        write_artifact_response(
+            &mut stream,
+            "application/x-apple-diskimage",
+            "LocalFocus.dmg",
+            &["target/macos/LocalFocus.dmg"],
+        )?;
+    } else if path == "/device-sw.js" {
+        write_response(
+            &mut stream,
+            "application/javascript; charset=utf-8",
+            &device_service_worker_js(),
+        )?;
+    } else if path == "/device-manifest.json" {
+        write_response(
+            &mut stream,
+            "application/manifest+json",
+            &device_manifest_json(),
+        )?;
     } else if path == "/device" || path.starts_with("/device?") {
         write_response(&mut stream, "text/html; charset=utf-8", &device_html())?;
     } else {
@@ -1378,6 +1823,91 @@ fn write_response(stream: &mut TcpStream, content_type: &str, body: &str) -> io:
         body.len(),
         body
     )
+}
+
+fn write_binary_response(
+    stream: &mut TcpStream,
+    content_type: &str,
+    filename: &str,
+    body: &[u8],
+) -> io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n",
+        filename.replace('"', ""),
+        body.len()
+    )?;
+    stream.write_all(body)
+}
+
+fn write_not_found(stream: &mut TcpStream, message: &str) -> io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
+        message.len(),
+        message
+    )
+}
+
+fn write_artifact_response(
+    stream: &mut TcpStream,
+    content_type: &str,
+    filename: &str,
+    relative_paths: &[&str],
+) -> io::Result<()> {
+    if let Some(path) = find_artifact_path(relative_paths) {
+        let body = fs::read(path)?;
+        write_binary_response(stream, content_type, filename, &body)
+    } else {
+        write_not_found(
+            stream,
+            "Local Focus installer artifact has not been built yet.",
+        )
+    }
+}
+
+fn qr_svg(value: &str, label: &str) -> io::Result<String> {
+    let code = QrCode::new(value.as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let mut image = code
+        .render::<svg::Color>()
+        .min_dimensions(410, 410)
+        .dark_color(svg::Color("#000000"))
+        .light_color(svg::Color("#ffffff"))
+        .build();
+    image = image.replacen(
+        "<svg",
+        &format!(
+            "<svg role=\"img\" aria-label=\"{}\"",
+            html_attr_escape(label)
+        ),
+        1,
+    );
+    Ok(image)
+}
+
+fn find_artifact_path(relative_paths: &[&str]) -> Option<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(current_dir) = env::current_dir() {
+        roots.push(current_dir);
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            roots.push(dir.to_path_buf());
+            if let Some(parent) = dir.parent() {
+                roots.push(parent.to_path_buf());
+            }
+        }
+    }
+
+    roots
+        .into_iter()
+        .flat_map(|root| {
+            relative_paths
+                .iter()
+                .map(move |relative| root.join(relative))
+        })
+        .find(|path| path.exists())
 }
 
 fn timeline_json(data_dir: &PathBuf) -> io::Result<String> {
@@ -1682,16 +2212,35 @@ fn target_list_from_text(target_text: &str) -> Vec<String> {
 }
 
 fn sample_matches_target_text(sample: &ActivitySample, target: &str) -> bool {
+    let target = target.trim();
+    if target.is_empty() {
+        return false;
+    }
+
+    if let Some(target_parts) = url_match_parts_from_text(target) {
+        let sample_parts = sample_url_parts(sample);
+        if sample_parts
+            .iter()
+            .any(|sample_parts| url_parts_match(&target_parts, sample_parts))
+        {
+            return true;
+        }
+    }
+
     let haystack = normalize_match_text(&format!(
         "{} {} {}",
         sample.app, sample.title, sample.source
     ));
     let normalized = normalize_match_text(target);
-    let domain = domain_from_url(target).map(|domain| normalize_match_text(&domain));
-    haystack.contains(&normalized)
-        || domain
-            .as_ref()
-            .is_some_and(|domain| !domain.is_empty() && haystack.contains(domain))
+    if !normalized.is_empty() && haystack.contains(&normalized) {
+        return true;
+    }
+
+    let Some(domain) = website_rule_domain(target) else {
+        return false;
+    };
+    let domain = normalize_match_text(&domain);
+    !domain.is_empty() && haystack.contains(&domain)
 }
 
 fn report_activity_key(sample: &ActivitySample) -> (String, String) {
@@ -1755,7 +2304,7 @@ fn report_history_json(data_dir: &PathBuf) -> io::Result<String> {
     Ok(format!("[{}]", lines.join(",")))
 }
 
-fn device_notifications_json(data_dir: &PathBuf, since: i64) -> io::Result<String> {
+fn device_notifications_json(data_dir: &PathBuf, since: i64, device: &str) -> io::Result<String> {
     let path = data_dir.join("device_notifications.jsonl");
     if !path.exists() {
         return Ok("[]".into());
@@ -1765,6 +2314,15 @@ fn device_notifications_json(data_dir: &PathBuf, since: i64) -> io::Result<Strin
         .lines()
         .map_while(Result::ok)
         .filter(|line| json_number(line, "timestamp").is_some_and(|timestamp| timestamp > since))
+        .filter(|line| {
+            let target_devices = json_string(line, "devices").unwrap_or_default();
+            if device.is_empty() {
+                true
+            } else {
+                !target_devices.is_empty()
+                    && target_devices.split(';').any(|target| target == device)
+            }
+        })
         .collect::<Vec<_>>();
     Ok(format!("[{}]", rows.join(",")))
 }
@@ -1888,15 +2446,24 @@ fn report_window_start(data_dir: &PathBuf) -> io::Result<i64> {
 
 fn state_json(focus: Option<FocusSession>, devices: &[String], blocks: &[String]) -> String {
     let lan_url = local_network_url().unwrap_or_else(|| "http://127.0.0.1:4799".into());
+    let device_connect_url = format!("{lan_url}/device");
+    let device_install_url = format!("{lan_url}/connect");
+    let android_app_url = format!("{lan_url}/download/local-focus-mobile.apk");
+    let mac_app_url = format!("{lan_url}/download/local-focus-macos.dmg");
     let devices_json = devices
         .iter()
         .map(|device| {
             let device = parse_network_device_record(device);
+            device
+        })
+        .filter(is_qr_connected_device)
+        .map(|device| {
             format!(
-                "{{\"name\":\"{}\",\"kind\":\"{}\",\"endpoint\":\"{}\"}}",
+                "{{\"name\":\"{}\",\"kind\":\"{}\",\"endpoint\":\"{}\",\"selected\":{}}}",
                 json_escape(&device.name),
                 json_escape(&device.kind),
-                json_escape(&device.endpoint)
+                json_escape(&device.endpoint),
+                device.selected
             )
         })
         .collect::<Vec<_>>()
@@ -1919,7 +2486,7 @@ fn state_json(focus: Option<FocusSession>, devices: &[String], blocks: &[String]
             let elapsed = focus_elapsed_seconds(&focus, now());
             let remaining = ((focus.duration_minutes * 60) as i64 - elapsed).max(0);
             format!(
-                "{{\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\",\"paused\":{},\"remainingSeconds\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"deviceConnectUrl\":\"{}/device\"}}",
+                "{{\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"paused\":{},\"remainingSeconds\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
                 json_escape(&focus.task),
                 json_escape(&focus.target),
                 focus.started_at,
@@ -1927,18 +2494,25 @@ fn state_json(focus: Option<FocusSession>, devices: &[String], blocks: &[String]
                 focus.alert_delay_seconds,
                 json_escape(&focus.alert_action),
                 json_escape(&focus.redirect_app),
+                focus.high_focus_mode,
                 focus.paused_at.is_some(),
                 remaining,
                 devices_json,
                 blocks_json,
-                json_escape(&lan_url)
+                json_escape(&device_connect_url),
+                json_escape(&device_install_url),
+                json_escape(&android_app_url),
+                json_escape(&mac_app_url)
             )
         }
         None => format!(
-            "{{\"focus\":null,\"devices\":[{}],\"blockedRules\":[{}],\"deviceConnectUrl\":\"{}/device\"}}",
+            "{{\"focus\":null,\"devices\":[{}],\"blockedRules\":[{}],\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
             devices_json,
             blocks_json,
-            json_escape(&lan_url)
+            json_escape(&device_connect_url),
+            json_escape(&device_install_url),
+            json_escape(&android_app_url),
+            json_escape(&mac_app_url)
         ),
     }
 }
@@ -2012,9 +2586,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .focus-session-list { display:grid; gap:8px; }
 .focus-session-row { border:1px solid var(--line); border-radius:8px; padding:9px; background:var(--panel); }
 .block-fields { border:1px solid var(--line); border-radius:10px; padding:12px; background:var(--panel-soft); display:grid; grid-template-columns:minmax(0, 1fr); gap:12px; align-items:start; }
-.device-fields { display:grid; grid-template-columns:minmax(120px, 1fr) minmax(110px, .7fr) minmax(180px, 1.4fr) auto; gap:12px; align-items:end; }
 .block-fields button { min-height:42px; min-width:140px; white-space:nowrap; }
-.device-fields button { min-height:42px; min-width:130px; white-space:nowrap; }
 .check-field { display:grid; gap:7px; }
 .block-type-options { display:grid; grid-template-columns:repeat(2, minmax(140px, 1fr)); gap:8px; max-width:520px; }
 .block-password-field { max-width:520px; }
@@ -2025,6 +2597,23 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .password-hidden { display:none !important; }
 .device-list { display:grid; gap:8px; margin-top:10px; }
 .device-pill { border:1px solid var(--line); border-radius:8px; padding:8px 10px; background:var(--panel); overflow-wrap:anywhere; }
+.device-row { display:grid; grid-template-columns:auto 1fr; gap:10px; align-items:start; }
+.device-row input { width:18px; height:18px; min-width:18px; margin-top:2px; accent-color:var(--accent); }
+.device-connect-actions { display:flex; flex-wrap:wrap; gap:10px; }
+.device-connect-actions button:first-child { background:var(--good); border-color:var(--good); color:white; }
+.device-qr-panel { border:1px solid var(--line); border-radius:10px; padding:14px; background:var(--panel-soft); display:grid; gap:12px; }
+.device-qr-panel.hidden { display:none; }
+.qr-type-grid { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:8px; }
+.qr-type-grid button { min-height:42px; padding:8px; }
+.qr-type-grid button.active { background:var(--accent); border-color:var(--accent); color:white; }
+.device-qr-body { display:grid; grid-template-columns:auto minmax(0, 1fr); gap:14px; align-items:center; }
+.device-qr-code { width:432px; min-height:432px; border:1px solid var(--line); border-radius:10px; padding:10px; background:#fff; display:grid; place-items:center; max-width:100%; }
+.device-qr-code svg, .device-qr-code img { width:410px; max-width:100%; height:auto; display:block; shape-rendering:crispEdges; image-rendering:pixelated; }
+.device-qr-meta { display:grid; gap:8px; min-width:0; }
+.device-qr-meta a { overflow-wrap:anywhere; color:var(--accent); font-weight:800; }
+.device-qr-url { border:1px solid var(--line); border-radius:8px; background:var(--panel); padding:10px; display:grid; gap:6px; }
+.device-qr-url code { display:block; font-size:16px; font-weight:850; color:var(--ink); overflow-wrap:anywhere; user-select:all; }
+.device-qr-url button { justify-self:start; padding:7px 10px; }
 .blocked-list { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
 .blocked-chip { display:inline-flex; align-items:center; gap:8px; border:1px solid color-mix(in srgb, var(--bad) 38%, var(--line)); border-radius:999px; padding:6px 10px; background:color-mix(in srgb, var(--bad) 7%, transparent); color:var(--ink); font-weight:700; max-width:100%; overflow-wrap:anywhere; }
 .blocked-chip.editing { border-color:color-mix(in srgb, var(--accent) 65%, var(--line)); background:color-mix(in srgb, var(--accent) 12%, transparent); }
@@ -2040,7 +2629,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .target-entry { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; }
 .target-entry button { min-width:96px; }
 .target-list-editor { display:flex; flex-wrap:wrap; gap:8px; min-height:38px; padding:8px; border:1px solid var(--line); border-radius:8px; background:var(--panel-soft); }
-.target-list-editor.empty::before { content:"Add up to 10 focus apps or websites."; color:var(--muted); }
+.target-list-editor.empty::before { content:"Add up to 15 focus apps or websites."; color:var(--muted); }
 .target-remove { display:inline-flex; align-items:center; gap:6px; max-width:100%; border:1px solid color-mix(in srgb, var(--accent) 35%, var(--line)); border-radius:999px; padding:5px 9px; background:var(--panel); color:var(--ink); font:inherit; font-weight:650; overflow-wrap:anywhere; }
 .target-remove span { color:var(--muted); font-weight:850; }
 .focus-actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:flex-end; }
@@ -2050,6 +2639,13 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .quick-metric { border:1px solid var(--line); border-radius:8px; padding:10px; background:var(--panel); }
 .quick-metric span { color:var(--muted); display:block; font-size:11px; font-weight:700; }
 .quick-metric strong { display:block; margin-top:2px; font-size:16px; }
+.high-focus-control { border:1px solid var(--line); border-radius:8px; padding:10px; background:var(--panel); display:grid; gap:8px; }
+.high-focus-row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; }
+.high-focus-check { display:flex; align-items:center; gap:8px; font-weight:800; }
+.high-focus-check input { width:18px; height:18px; accent-color:var(--bad); }
+.high-focus-check input:disabled { opacity:.55; }
+.high-focus-explain { display:none; color:var(--muted); font-size:12px; }
+.high-focus-explain.open { display:block; }
 .status-chip { border:1px solid var(--line); border-radius:999px; padding:6px 10px; background:color-mix(in srgb, var(--line) 25%, transparent); color:var(--muted); font-weight:700; }
 .status-chip.running { color:var(--good); border-color:color-mix(in srgb, var(--good) 45%, var(--line)); background:color-mix(in srgb, var(--good) 10%, transparent); }
 .status-chip.paused { color:var(--warn); border-color:color-mix(in srgb, var(--warn) 45%, var(--line)); background:color-mix(in srgb, var(--warn) 12%, transparent); }
@@ -2157,7 +2753,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .two { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
 @media (max-width:980px) { .focus-layout, .control-shell { grid-template-columns:1fr; } .focus-actions { justify-content:flex-start; } }
 @media (max-width:900px) { .focus-shell-head { align-items:start; display:grid; } .top-actions { justify-content:flex-start; } }
-@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid, .block-fields, .device-fields, .activity-row, .calendar-actions { grid-template-columns:1fr; display:grid; } header { align-items:start; } .header-actions { justify-items:start; } .hour-bars, .period-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } .calendar-grid { grid-template-columns:48px repeat(7, minmax(28px, 1fr)); gap:4px; } .block-type-options { grid-template-columns:1fr; } .block-password-field { grid-column:auto; } }
+@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid, .block-fields, .activity-row, .calendar-actions, .device-qr-body { grid-template-columns:1fr; display:grid; } header { align-items:start; } .header-actions { justify-items:start; } .hour-bars, .period-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } .calendar-grid { grid-template-columns:48px repeat(7, minmax(28px, 1fr)); gap:4px; } .block-type-options, .qr-type-grid { grid-template-columns:1fr; } .block-password-field { grid-column:auto; } .device-qr-code { width:100%; max-width:432px; justify-self:center; } }
 </style>
 </head>
 <body>
@@ -2210,6 +2806,16 @@ button:disabled { cursor:not-allowed; opacity:.55; }
       <div class="quick-metric"><span>Status</span><strong id="quickStatus">Off</strong></div>
       <div class="quick-metric"><span>Warn after</span><strong id="quickDelay">1m</strong></div>
       <div class="quick-metric"><span>Action</span><strong id="quickAction">Alert</strong></div>
+    </div>
+    <div class="high-focus-control">
+      <div class="high-focus-row">
+        <label class="high-focus-check" for="highFocusMode">
+          <input id="highFocusMode" type="checkbox" onchange="toggleHighFocusMode()" disabled>
+          High focus mode
+        </label>
+        <button id="highFocusExplainToggle" type="button" onclick="toggleHighFocusExplanation()" aria-expanded="false">Explain</button>
+      </div>
+      <div id="highFocusExplanation" class="high-focus-explain">When High Focus is checked, Local Focus fully blocks active apps or websites outside the current focus list. Your Local Focus dashboard stays allowed so you can turn this off.</div>
     </div>
     <div class="focus-actions">
       <button id="startFocus" class="focus-btn focus-idle" onclick="startFocus()">Start focus</button>
@@ -2264,26 +2870,45 @@ button:disabled { cursor:not-allowed; opacity:.55; }
       <button id="blockSubmit" class="block-submit" onclick="addBlock()">Add block</button>
     </div>
   </section>
-  <section id="devicesCard" class="control-shell" aria-label="Network devices">
+  <section id="devicesCard" class="control-shell" aria-label="Connect to device">
     <div>
-      <h2>Devices</h2>
-      <div class="muted">Open the connect link on a same-WiFi phone, TV, tablet, or laptop. Webhook URL is optional.</div>
+      <h2>Connect to device</h2>
+      <div class="muted">All device setup starts from a QR code. Scan it from the phone, tablet, laptop, or receiver browser you want to connect.</div>
     </div>
     <div class="device-pill"><strong>Connect link</strong><br><span id="deviceConnectUrl" class="muted">Loading...</span></div>
-    <div class="device-fields">
-      <div class="field"><label for="deviceName">Device name</label><input id="deviceName" placeholder="Mukesh phone" aria-label="Device name"></div>
-      <div class="field"><label for="deviceKind">Device type</label><select id="deviceKind" aria-label="Device type">
-        <option value="phone">Phone</option>
-        <option value="tv">TV</option>
-        <option value="tablet">Tablet</option>
-        <option value="laptop">Laptop</option>
-        <option value="desktop">Desktop</option>
-        <option value="device">Other</option>
-      </select></div>
-      <div class="field"><label for="deviceUrl">Webhook URL optional</label><input id="deviceUrl" placeholder="Optional: 192.168.1.25:8080/notify" aria-label="Device webhook URL"></div>
-      <button onclick="addDevice()">Add webhook</button>
+    <div class="device-connect-actions">
+      <button type="button" onclick="openDeviceQrPanel('install')">Show QR code</button>
     </div>
-    <div id="deviceList" class="device-list"></div>
+    <div id="deviceQrPanel" class="device-qr-panel hidden" aria-live="polite">
+      <div>
+        <strong>Download or connect with QR</strong>
+        <div class="muted">Choose the device type, then scan the QR code from that device. iPhone cannot install an unsigned local app from QR; it can connect as a receiver.</div>
+      </div>
+      <div class="qr-type-grid" role="group" aria-label="QR destination">
+        <button id="qrInstallButton" type="button" onclick="renderDeviceQr('install')">Any device</button>
+        <button id="qrAndroidButton" type="button" onclick="renderDeviceQr('android')">Android app</button>
+        <button id="qrIphoneButton" type="button" onclick="renderDeviceQr('iphone')">iPhone/iPad</button>
+        <button id="qrLaptopButton" type="button" onclick="renderDeviceQr('laptop')">Mac laptop app</button>
+        <button id="qrReceiverButton" type="button" onclick="renderDeviceQr('receiver')">Receiver link</button>
+      </div>
+      <div class="device-qr-body">
+        <div id="deviceQrCode" class="device-qr-code"></div>
+        <div class="device-qr-meta">
+          <strong id="deviceQrTitle">Local Focus</strong>
+          <p id="deviceQrHint" class="muted"></p>
+          <div class="device-qr-url">
+            <span class="muted">If iPhone Camera does not show the QR URL, type this on the iPhone:</span>
+            <code id="deviceQrPlainUrl"></code>
+            <button type="button" onclick="copyDeviceQrUrl()">Copy URL</button>
+          </div>
+          <a id="deviceQrLink" href="" target="_blank" rel="noreferrer"></a>
+        </div>
+      </div>
+    </div>
+    <div>
+      <strong>QR-connected devices</strong>
+      <div id="deviceList" class="device-list"></div>
+    </div>
   </section>
   <section class="explain" id="explainPanel">
     <h2>Report meaning</h2>
@@ -2322,6 +2947,10 @@ let activeReportMonth = selectedReportDate.getMonth();
 let activeReportWeek = 0;
 let blockedRules = [];
 let editingBlockTarget = '';
+let deviceQrUrls = {};
+let activeDeviceQrKind = 'install';
+let activeFocusSession = null;
+const MAX_FOCUS_TARGETS = 15;
 const fmtTime = seconds => new Date(seconds * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 const minutes = seconds => Math.max(1, Math.round(seconds / 60));
 async function startFocus() {
@@ -2337,6 +2966,19 @@ async function startFocus() {
 }
 async function stopFocus() { await fetch('/api/focus/stop'); refresh(); }
 async function pauseFocus() { await fetch('/api/focus/pause'); refresh(); }
+async function toggleHighFocusMode() {
+  const checkbox = document.querySelector('#highFocusMode');
+  checkbox.disabled = true;
+  await fetch(`/api/focus/high-focus?enabled=${checkbox.checked ? '1' : '0'}`);
+  refresh();
+}
+function toggleHighFocusExplanation() {
+  const panel = document.querySelector('#highFocusExplanation');
+  const button = document.querySelector('#highFocusExplainToggle');
+  const open = panel.classList.toggle('open');
+  button.setAttribute('aria-expanded', String(open));
+  button.textContent = open ? 'Hide explanation' : 'Explain';
+}
 async function resetReport() {
   await fetch('/api/report/reset');
   closeFocusReport();
@@ -2447,18 +3089,86 @@ async function removeBlock(target) {
 function removeBlockFromButton(button) {
   removeBlock(button.dataset.target || '');
 }
-async function addDevice() {
-  const nameInput = document.querySelector('#deviceName');
-  const kindInput = document.querySelector('#deviceKind');
-  const urlInput = document.querySelector('#deviceUrl');
-  const name = encodeURIComponent(nameInput.value || '');
-  const kind = encodeURIComponent(kindInput.value || 'device');
-  const url = encodeURIComponent(urlInput.value || '');
-  if (!url) return;
-  await fetch(`/api/device/add?name=${name}&kind=${kind}&url=${url}`);
-  nameInput.value = '';
-  urlInput.value = '';
-  refresh();
+function qrDeviceRowMarkup(device) {
+  const endpoint = device.endpoint || '';
+  const note = endpoint.startsWith('browser:')
+    ? 'Receiver browser connected from QR.'
+    : 'Mobile app connected from QR.';
+  const kind = device.kind || 'device';
+  return `<div class="device-pill"><strong>${escapeHtml(device.name || 'Device')}</strong><br><span class="muted">${escapeHtml(deviceKindLabel(kind))}<br>${escapeHtml(note)}</span></div>`;
+}
+function deviceKindLabel(kind) {
+  const labels = {phone:'Phone', tv:'TV', tablet:'Tablet', laptop:'Laptop', desktop:'Desktop', router:'Router', device:'Device'};
+  return labels[kind] || 'Device';
+}
+function openDeviceQrPanel(kind = 'install') {
+  document.querySelector('#deviceQrPanel').classList.remove('hidden');
+  renderDeviceQr(kind);
+}
+function renderDeviceQr(kind = 'install') {
+  activeDeviceQrKind = kind;
+  const option = deviceQrOption(kind);
+  ['install', 'android', 'iphone', 'laptop', 'receiver'].forEach(name => {
+    const button = document.querySelector(`#qr${name[0].toUpperCase()}${name.slice(1)}Button`);
+    if (button) button.classList.toggle('active', name === kind);
+  });
+  document.querySelector('#deviceQrTitle').textContent = option.title;
+  document.querySelector('#deviceQrHint').textContent = option.hint;
+  const link = document.querySelector('#deviceQrLink');
+  link.href = option.url;
+  link.textContent = `Open ${option.url}`;
+  const plainUrl = document.querySelector('#deviceQrPlainUrl');
+  if (plainUrl) plainUrl.textContent = option.url;
+  const qrSrc = `/api/qr.svg?value=${encodeURIComponent(option.url)}&label=${encodeURIComponent(option.title)}`;
+  document.querySelector('#deviceQrCode').innerHTML = `<img src="${qrSrc}" alt="${escapeTextAttr(option.title)} QR code" width="410" height="410">`;
+}
+async function copyDeviceQrUrl() {
+  const value = document.querySelector('#deviceQrPlainUrl')?.textContent || '';
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+    document.querySelector('#deviceQrHint').textContent = `Copied. Open this URL on the device: ${value}`;
+  } catch {
+    const range = document.createRange();
+    range.selectNodeContents(document.querySelector('#deviceQrPlainUrl'));
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+}
+function deviceQrOption(kind) {
+  const installUrl = deviceQrUrls.install || `${location.origin}/connect`;
+  const receiverUrl = deviceQrUrls.receiver || document.querySelector('#deviceConnectUrl')?.textContent || `${location.origin}/device`;
+  const androidUrl = deviceQrUrls.android || `${location.origin}/download/local-focus-mobile.apk`;
+  const macUrl = deviceQrUrls.mac || `${location.origin}/download/local-focus-macos.dmg`;
+  const options = {
+    install: {
+      title: 'Choose install or receiver option',
+      hint: 'Scan from any device. Android can download the APK, Mac can download the DMG, and iPhone/iPad can connect as a receiver. Native iPhone install requires Xcode, TestFlight, or App Store signing.',
+      url: installUrl
+    },
+    android: {
+      title: 'Android phone or tablet app',
+      hint: 'Scan from an Android phone or tablet to download the Local Focus APK. After installing, open Tracking and allow Usage Access.',
+      url: androidUrl
+    },
+    iphone: {
+      title: 'iPhone or iPad receiver',
+      hint: 'Scan from iPhone or iPad to connect as a receiver. This does not install a native iPhone app; native install requires Xcode, TestFlight, or App Store signing.',
+      url: receiverUrl
+    },
+    laptop: {
+      title: 'Mac laptop app',
+      hint: 'Scan from a Mac to download the Local Focus DMG. Other laptops can use the receiver link.',
+      url: macUrl
+    },
+    receiver: {
+      title: 'Receiver connection',
+      hint: 'Scan from any phone, tablet, TV, or laptop browser to receive Local Focus alerts from this machine.',
+      url: receiverUrl
+    }
+  };
+  return options[kind] || options.install;
 }
 function saveFocusDraft() {
   localStorage.setItem(focusDraftKey, JSON.stringify({
@@ -2492,7 +3202,7 @@ function restoreFocusDraft() {
   });
 }
 function setFocusTargets(value) {
-  focusTargets = String(value || '').split(/[,\n]/).map(item => item.trim()).filter(Boolean).slice(0, 10);
+  focusTargets = String(value || '').split(/[,\n]/).map(item => item.trim()).filter(Boolean).slice(0, MAX_FOCUS_TARGETS);
   syncFocusTargets();
 }
 function syncFocusTargets() {
@@ -2504,22 +3214,31 @@ function syncFocusTargets() {
   `).join('');
   saveFocusDraft();
 }
+async function saveActiveFocusTargets() {
+  if (!activeFocusSession) return;
+  const target = document.querySelector('#target').value || '';
+  activeFocusSession = {...activeFocusSession, target};
+  await fetch(`/api/focus/targets?target=${encodeURIComponent(target)}`);
+  refresh();
+}
 function addFocusTarget() {
   const input = document.querySelector('#targetInput');
   const value = input.value.trim();
-  if (!value || focusTargets.length >= 10) return;
+  if (!value || focusTargets.length >= MAX_FOCUS_TARGETS) return;
   for (const target of value.split(/[,\n]/).map(item => item.trim()).filter(Boolean)) {
-    if (focusTargets.length >= 10) break;
+    if (focusTargets.length >= MAX_FOCUS_TARGETS) break;
     if (!focusTargets.some(existing => existing.toLowerCase() === target.toLowerCase())) {
       focusTargets.push(target);
     }
   }
   input.value = '';
   syncFocusTargets();
+  saveActiveFocusTargets();
 }
 function removeFocusTarget(index) {
   focusTargets.splice(index, 1);
   syncFocusTargets();
+  saveActiveFocusTargets();
 }
 function toggleExplain() {
   const panel = document.querySelector('#explainPanel');
@@ -2941,6 +3660,7 @@ async function refresh() {
     fetch('/api/state').then(r => r.json()),
     fetch('/api/report/history').then(r => r.json())
   ]);
+  activeFocusSession = state.focus || null;
   const totalSeconds = reportTotalSeconds(report);
   document.querySelector('#metrics').innerHTML = `
     <div class="metric"><span class="muted">Total time</span><strong>${formatDuration(totalSeconds)}</strong></div>
@@ -2963,7 +3683,15 @@ async function refresh() {
   document.querySelector('#blockedList').innerHTML = blockedRules.map(rule => `<span class="blocked-chip${rule.target === editingBlockTarget ? ' editing' : ''}" data-target="${escapeTextAttr(rule.target || '')}">${escapeHtml(shortenSource(rule.target || ''))} <small>${rule.mode === 'password' ? 'password' : 'full'}</small><button class="edit-chip" type="button" data-target="${escapeTextAttr(rule.target || '')}" onclick="editBlockFromButton(this)" aria-label="Edit ${escapeTextAttr(rule.target || '')}">edit</button><button type="button" data-target="${escapeTextAttr(rule.target || '')}" onclick="removeBlockFromButton(this)" aria-label="Remove ${escapeTextAttr(rule.target || '')}">x</button></span>`).join('') || '<div class="muted">No blocked apps or sites yet.</div>';
   syncBlockEditState();
   document.querySelector('#deviceConnectUrl').textContent = state.deviceConnectUrl || 'http://127.0.0.1:4799/device';
-  document.querySelector('#deviceList').innerHTML = (state.devices || []).map(device => `<div class="device-pill"><strong>${escapeHtml(device.name || 'Device')}</strong><br><span class="muted">${escapeHtml(device.kind || 'device')} - ${escapeHtml(device.endpoint || '')}</span></div>`).join('') || '<div class="muted">No devices added yet.</div>';
+  deviceQrUrls = {
+    install: state.deviceInstallUrl || `${location.origin}/connect`,
+    receiver: state.deviceConnectUrl || `${location.origin}/device`,
+    android: state.androidAppUrl || `${location.origin}/download/local-focus-mobile.apk`,
+    mac: state.macAppUrl || `${location.origin}/download/local-focus-macos.dmg`
+  };
+  if (!document.querySelector('#deviceQrPanel').classList.contains('hidden')) renderDeviceQr(activeDeviceQrKind);
+  const qrDevices = (state.devices || []).filter(device => String(device.endpoint || '').startsWith('browser:') || String(device.endpoint || '').startsWith('mobile:'));
+  document.querySelector('#deviceList').innerHTML = qrDevices.map(qrDeviceRowMarkup).join('') || '<div class="muted">No QR-connected devices yet.</div>';
   document.querySelector('#historyList').innerHTML = history.map(item => {
     const r = item.report;
     return `<div class="item">
@@ -2988,6 +3716,7 @@ function updateFocusSummary(focus) {
   const quickStatus = document.querySelector('#quickStatus');
   const quickDelay = document.querySelector('#quickDelay');
   const quickAction = document.querySelector('#quickAction');
+  updateHighFocusControls(focus);
   if (!focus) {
     chip.textContent = 'Focus off';
     chip.className = 'status-chip';
@@ -3022,6 +3751,20 @@ function updateFocusSummary(focus) {
   quickDelay.textContent = formatDuration(focus.alertDelaySeconds || 60);
   quickAction.textContent = focus.alertAction === 'switch' && focus.redirectApp ? `Move` : 'Alert';
   if (!focusEditorManuallyOpened) setFocusEditorOpen(false);
+}
+function updateHighFocusControls(focus) {
+  const checkbox = document.querySelector('#highFocusMode');
+  if (!checkbox) return;
+  const targets = String(focus?.target || '').split(/[,\n]/).map(value => value.trim()).filter(Boolean);
+  checkbox.checked = Boolean(focus?.highFocusMode);
+  checkbox.disabled = !focus || Boolean(focus.paused) || targets.length === 0;
+  checkbox.title = !focus
+    ? 'Start a focus session first.'
+    : targets.length === 0
+      ? 'Add focus apps or websites before enabling High Focus mode.'
+      : checkbox.disabled
+        ? 'Resume focus to change High Focus mode.'
+        : 'Block every active app or website outside the focus list.';
 }
 function seedFocusInputsFromActiveSession(focus) {
   if (!focus) return;
@@ -3115,12 +3858,73 @@ setInterval(refresh, 10000);
         .into()
 }
 
+fn connect_device_html() -> String {
+    let lan_url = local_network_url().unwrap_or_else(|| "http://127.0.0.1:4799".into());
+    let android_url = format!("{lan_url}/download/local-focus-mobile.apk");
+    let mac_url = format!("{lan_url}/download/local-focus-macos.dmg");
+    let receiver_url = format!("{lan_url}/device");
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect Local Focus</title>
+<style>
+:root {{ color-scheme:light dark; --bg:#f6f7f2; --ink:#202124; --muted:#686b63; --line:#d9dbd2; --panel:#ffffff; --good:#24734d; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg:#121512; --ink:#f1f1e9; --muted:#aeb0a8; --line:#34362f; --panel:#22231f; }} }}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; font:16px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--ink); }}
+main {{ max-width:720px; margin:0 auto; padding:22px; display:grid; gap:14px; }}
+section {{ background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; display:grid; gap:10px; }}
+h1, h2, p {{ margin:0; }}
+h1 {{ font-size:24px; }}
+h2 {{ font-size:17px; }}
+.muted {{ color:var(--muted); }}
+.actions {{ display:grid; gap:10px; }}
+a.button {{ display:block; text-align:center; text-decoration:none; border:1px solid var(--good); background:var(--good); color:white; border-radius:10px; padding:13px; font-weight:850; }}
+a.secondary {{ border-color:var(--line); background:transparent; color:var(--ink); }}
+code {{ overflow-wrap:anywhere; }}
+</style>
+</head>
+<body>
+<main>
+  <section>
+    <h1>Connect Local Focus</h1>
+    <p class="muted">Choose this device type from the QR page. Android and Mac can download installers; iPhone/iPad connects as a receiver unless the app is installed through Xcode, TestFlight, or the App Store.</p>
+    <p><code>{lan_url}</code></p>
+  </section>
+  <section>
+    <h2>Android phone or tablet</h2>
+    <p class="muted">Download the installable APK. After installing, open Local Focus, connect, and allow Usage Access for app tracking.</p>
+    <div class="actions"><a class="button" href="{android_url}">Download Android app</a></div>
+  </section>
+  <section>
+    <h2>iPhone or iPad receiver</h2>
+    <p class="muted">This QR cannot install a native iPhone app. Apple requires Xcode, TestFlight, App Store, or a signed enterprise/ad-hoc package for iOS app installation. Use this receiver link now to receive Local Focus alerts.</p>
+    <div class="actions"><a class="button secondary" href="{receiver_url}">Connect iPhone as receiver</a></div>
+  </section>
+  <section>
+    <h2>Mac laptop</h2>
+    <p class="muted">Download the Mac DMG from this laptop. Other computers can use the receiver link.</p>
+    <div class="actions">
+      <a class="button" href="{mac_url}">Download Mac app</a>
+      <a class="button secondary" href="{receiver_url}">Open receiver link</a>
+    </div>
+  </section>
+</main>
+</body>
+</html>"#
+    )
+}
+
 fn device_html() -> String {
     r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="manifest" href="/device-manifest.json">
 <title>Local Focus Device</title>
 <style>
 :root { color-scheme:light dark; --bg:#f6f6f1; --ink:#202124; --muted:#686b63; --line:#d9dbd2; --good:#24734d; --bad:#a8323b; --panel:#ffffff; }
@@ -3142,7 +3946,7 @@ button { background:var(--good); color:white; font-weight:800; cursor:pointer; }
 <main>
   <section>
     <h1>Local Focus Device</h1>
-    <p class="muted">Connect this phone, TV, tablet, or laptop to receive same-WiFi focus alerts from Local Focus.</p>
+    <p class="muted">Connect this phone, TV, tablet, or laptop to receive Local Focus alerts. Browser devices use a service worker for OS-style notifications; laptops/desktops running Local Focus use native OS notifications.</p>
   </section>
   <section>
     <h2>Connect device</h2>
@@ -3172,39 +3976,100 @@ button { background:var(--good); color:white; font-weight:800; cursor:pointer; }
 <script>
 let since = Math.floor(Date.now() / 1000);
 let connected = false;
+let deviceEndpoint = '';
+let serviceWorkerReady = null;
+async function setupServiceWorker() {
+  if (!('serviceWorker' in navigator)) return null;
+  try {
+    const registration = await navigator.serviceWorker.register('/device-sw.js');
+    serviceWorkerReady = navigator.serviceWorker.ready;
+    return registration;
+  } catch (_) {
+    return null;
+  }
+}
 async function connectDevice() {
   const name = encodeURIComponent(document.querySelector('#name').value || 'Device');
   const kind = encodeURIComponent(document.querySelector('#kind').value || 'device');
-  const response = await fetch(`/api/device/register?name=${name}&kind=${kind}`).then(r => r.json());
-  since = response.since || since;
-  connected = true;
-  document.querySelector('#status').textContent = 'Connected. Keep this page open to receive alerts.';
+  const registration = await setupServiceWorker();
   if ('Notification' in window && Notification.permission === 'default') {
     try { await Notification.requestPermission(); } catch (_) {}
   }
+  const response = await fetch(`/api/device/register?name=${name}&kind=${kind}`).then(r => r.json());
+  since = response.since || since;
+  deviceEndpoint = response.endpoint || '';
+  connected = true;
+  const notificationState = registration && Notification.permission === 'granted' ? 'OS notifications enabled.' : 'Alerts will show on this page.';
+  document.querySelector('#status').textContent = `Connected. ${notificationState}`;
 }
 async function pollEvents() {
   if (!connected) return;
-  const events = await fetch(`/api/device/events?since=${since}`).then(r => r.json()).catch(() => []);
+  const events = await fetch(`/api/device/events?since=${since}&device=${encodeURIComponent(deviceEndpoint)}`).then(r => r.json()).catch(() => []);
   if (!events.length) return;
   since = Math.max(...events.map(event => event.timestamp || since), since);
   const list = document.querySelector('#events');
   list.className = '';
   list.innerHTML = events.reverse().map(event => `<div class="event"><strong>${escapeHtml(event.event || 'Alert')}</strong><p>${escapeHtml(event.message || '')}</p><p class="muted">${new Date((event.timestamp || 0) * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</p></div>`).join('') + list.innerHTML;
   for (const event of events) {
-    if ('Notification' in window && Notification.permission === 'granted') {
-      new Notification('Local Focus', { body: event.message || 'Focus alert' });
-    }
+    showDeviceNotification(event);
   }
+}
+async function showDeviceNotification(event) {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  try {
+    const registration = await (serviceWorkerReady || navigator.serviceWorker.ready);
+    if (registration.active) {
+      registration.active.postMessage({type:'focus-alert', title:'Local Focus', message:event.message || 'Focus alert'});
+    } else {
+      registration.showNotification('Local Focus', {body:event.message || 'Focus alert', tag:'local-focus-alert', renotify:true});
+    }
+  } catch (_) {}
 }
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
 }
 setInterval(pollEvents, 5000);
+setupServiceWorker();
 </script>
 </body>
 </html>"#
         .into()
+}
+
+fn device_service_worker_js() -> String {
+    r#"self.addEventListener('install', event => {
+  self.skipWaiting();
+});
+self.addEventListener('activate', event => {
+  event.waitUntil(self.clients.claim());
+});
+self.addEventListener('message', event => {
+  if (!event.data || event.data.type !== 'focus-alert') return;
+  const title = event.data.title || 'Local Focus';
+  const body = event.data.message || 'Focus alert';
+  event.waitUntil(self.registration.showNotification(title, {
+    body,
+    tag: 'local-focus-alert',
+    renotify: true,
+    requireInteraction: true
+  }));
+});
+self.addEventListener('notificationclick', event => {
+  event.notification.close();
+  event.waitUntil((async () => {
+    const clients = await self.clients.matchAll({type:'window', includeUncontrolled:true});
+    for (const client of clients) {
+      if (client.url.includes('/device')) return client.focus();
+    }
+    return self.clients.openWindow('/device');
+  })());
+});
+"#
+    .into()
+}
+
+fn device_manifest_json() -> String {
+    r##"{"name":"Local Focus Device","short_name":"Local Focus","start_url":"/device","display":"standalone","background_color":"#f6f6f1","theme_color":"#24734d"}"##.into()
 }
 
 fn data_dir() -> io::Result<PathBuf> {
@@ -3350,7 +4215,7 @@ fn save_focus(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<()> {
     fs::write(
         data_dir.join("focus.json"),
         format!(
-            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\"}}",
+            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{}}}",
             json_escape(&focus.task),
             json_escape(&focus.target),
             focus.started_at,
@@ -3361,7 +4226,8 @@ fn save_focus(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<()> {
             pomodoro_alerted_at,
             focus.alert_delay_seconds,
             json_escape(&focus.alert_action),
-            json_escape(&focus.redirect_app)
+            json_escape(&focus.redirect_app),
+            focus.high_focus_mode
         ),
     )
 }
@@ -3382,6 +4248,7 @@ fn load_focus(data_dir: &PathBuf) -> Option<FocusSession> {
             .unwrap_or(DEFAULT_ALERT_DELAY_SECONDS),
         alert_action: json_string(&value, "alertAction").unwrap_or_else(|| "alert".into()),
         redirect_app: json_string(&value, "redirectApp").unwrap_or_default(),
+        high_focus_mode: json_bool(&value, "highFocusMode").unwrap_or(false),
     })
 }
 
@@ -3430,7 +4297,7 @@ fn notify(title: &str, message: &str) {
 }
 
 fn send_device_notifications(
-    devices: &[String],
+    devices: &[NetworkDevice],
     event: &str,
     message: &str,
     sample: &ActivitySample,
@@ -3441,12 +4308,24 @@ fn send_device_notifications(
     let sample = sample.clone();
     thread::spawn(move || {
         for device in devices {
-            let device = parse_network_device_record(&device);
-            if !device.endpoint.starts_with("browser:") {
-                let _ = post_device_notification(&device.endpoint, &event, &message, &sample);
+            if !device.selected || device.endpoint.starts_with("browser:") {
+                continue;
+            }
+            if let Some(endpoint) = native_notification_endpoint(&device.endpoint) {
+                let _ = post_device_notification(&endpoint, &event, &message, &sample);
             }
         }
     });
+}
+
+fn native_notification_endpoint(endpoint: &str) -> Option<String> {
+    if let Some(ip) = endpoint.strip_prefix("lan:") {
+        return Some(format!("http://{ip}:4799/api/native/notify"));
+    }
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        return Some(endpoint.to_string());
+    }
+    None
 }
 
 fn post_device_notification(
@@ -3515,7 +4394,10 @@ fn normalize_device_endpoint(device: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    if trimmed.starts_with("browser:") {
+    if trimmed.starts_with("browser:")
+        || trimmed.starts_with("lan:")
+        || trimmed.starts_with("mobile:")
+    {
         return trimmed.to_string();
     }
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
@@ -3532,20 +4414,22 @@ fn normalize_device_kind(kind: &str) -> String {
     }
 }
 
-fn format_device_record(name: &str, kind: &str, endpoint: &str) -> String {
+fn format_device_record_selected(name: &str, kind: &str, endpoint: &str, selected: bool) -> String {
     format!(
-        "{}|{}|{}",
+        "{}|{}|{}|{}",
         name.trim().replace('|', " "),
         normalize_device_kind(kind),
-        normalize_device_endpoint(endpoint)
+        normalize_device_endpoint(endpoint),
+        if selected { "selected" } else { "off" }
     )
 }
 
 fn parse_network_device_record(record: &str) -> NetworkDevice {
-    let mut parts = record.splitn(3, '|');
+    let mut parts = record.splitn(4, '|');
     let first = parts.next().unwrap_or("").trim();
     let second = parts.next().map(str::trim);
     let third = parts.next().map(str::trim);
+    let fourth = parts.next().map(str::trim);
     if let (Some(kind), Some(endpoint)) = (second, third) {
         return NetworkDevice {
             name: if first.is_empty() {
@@ -3555,6 +4439,7 @@ fn parse_network_device_record(record: &str) -> NetworkDevice {
             },
             kind: normalize_device_kind(kind),
             endpoint: normalize_device_endpoint(endpoint),
+            selected: !matches!(fourth, Some("off" | "false" | "0")),
         };
     }
 
@@ -3562,7 +4447,50 @@ fn parse_network_device_record(record: &str) -> NetworkDevice {
         name: "Device".into(),
         kind: "device".into(),
         endpoint: normalize_device_endpoint(record),
+        selected: true,
     }
+}
+
+fn selected_network_devices(records: &[String]) -> Vec<NetworkDevice> {
+    records
+        .iter()
+        .map(|record| parse_network_device_record(record))
+        .filter(|device| device.selected && is_qr_connected_device(device))
+        .collect()
+}
+
+fn idle_warning_devices(records: &[String]) -> Vec<NetworkDevice> {
+    let mut devices = Vec::new();
+    for device in records
+        .iter()
+        .map(|record| parse_network_device_record(record))
+        .filter(|device| {
+            device.selected && is_qr_connected_device(device) && is_phone_or_tv_device(device)
+        })
+    {
+        push_unique_device(&mut devices, device.clone());
+    }
+    devices
+}
+
+fn is_qr_connected_device(device: &NetworkDevice) -> bool {
+    device.endpoint.starts_with("browser:") || device.endpoint.starts_with("mobile:")
+}
+
+fn push_unique_device(devices: &mut Vec<NetworkDevice>, device: NetworkDevice) {
+    if !devices
+        .iter()
+        .any(|existing| existing.endpoint == device.endpoint)
+    {
+        devices.push(device);
+    }
+}
+
+fn is_phone_or_tv_device(device: &NetworkDevice) -> bool {
+    matches!(device.kind.as_str(), "phone" | "tv")
+        || device.name.to_lowercase().contains("iphone")
+        || device.name.to_lowercase().contains("phone")
+        || device.name.to_lowercase().contains("tv")
 }
 
 fn os_alert(title: &str, message: &str) {
@@ -3676,6 +4604,20 @@ fn block_activity_access(sample: &ActivitySample, keyword: &str, rule_kind: Bloc
             if should_quit_blocked_app(&sample, &keyword) {
                 let _ = quit_app(&sample.app);
             }
+        }
+    });
+}
+
+fn block_high_focus_activity_access(sample: &ActivitySample, rule_kind: BlockRuleKind) {
+    let sample = sample.clone();
+    thread::spawn(move || match rule_kind {
+        BlockRuleKind::Website => {
+            if close_active_browser_tab(&sample.app).is_err() {
+                let _ = force_quit_app(&sample.app);
+            }
+        }
+        BlockRuleKind::App => {
+            let _ = force_quit_app(&sample.app);
         }
     });
 }
@@ -3869,6 +4811,54 @@ fn quit_app(app_name: &str) -> io::Result<()> {
     Err(io::Error::other("could not quit blocked app"))
 }
 
+fn force_quit_app(app_name: &str) -> io::Result<()> {
+    if quit_app(app_name).is_ok() {
+        return Ok(());
+    }
+
+    let app_name = app_name.trim();
+    if app_name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing app name",
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("pkill").args(["-x", app_name]).status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "Get-Process -Name '{}' -ErrorAction SilentlyContinue | Stop-Process -Force",
+            ps_escape(app_name)
+        );
+        let status = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let status = Command::new("pkill")
+            .args(["-KILL", "-x", app_name])
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    Err(io::Error::other("could not force quit blocked app"))
+}
+
 #[cfg(target_os = "macos")]
 fn active_alert_pid() -> &'static Mutex<Option<u32>> {
     static ACTIVE_ALERT_PID: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
@@ -4025,6 +5015,15 @@ fn parse_query(query: &str) -> HashMap<String, String> {
     map
 }
 
+fn request_value(params: &HashMap<String, String>, body: &str, key: &str) -> Option<String> {
+    params
+        .get(key)
+        .cloned()
+        .or_else(|| json_string(body, key))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn percent_decode(value: &str) -> String {
     let mut result = String::new();
     let mut chars = value.as_bytes().iter().copied();
@@ -4044,6 +5043,19 @@ fn percent_decode(value: &str) -> String {
     result
 }
 
+fn url_encode(value: &str) -> String {
+    let mut result = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                result.push(byte as char)
+            }
+            _ => result.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    result
+}
+
 fn json_escape(value: &str) -> String {
     value
         .chars()
@@ -4053,6 +5065,20 @@ fn json_escape(value: &str) -> String {
             '\n' => "\\n".chars().collect(),
             '\r' => "\\r".chars().collect(),
             '\t' => "\\t".chars().collect(),
+            _ => vec![c],
+        })
+        .collect()
+}
+
+fn html_attr_escape(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|c| match c {
+            '&' => "&amp;".chars().collect::<Vec<_>>(),
+            '<' => "&lt;".chars().collect(),
+            '>' => "&gt;".chars().collect(),
+            '"' => "&quot;".chars().collect(),
+            '\'' => "&#039;".chars().collect(),
             _ => vec![c],
         })
         .collect()
@@ -4093,6 +5119,19 @@ fn json_number(value: &str, key: &str) -> Option<i64> {
     number.parse().ok()
 }
 
+fn json_bool(value: &str, key: &str) -> Option<bool> {
+    let marker = format!("\"{key}\":");
+    let start = value.find(&marker)? + marker.len();
+    let tail = value[start..].trim_start();
+    if tail.starts_with("true") {
+        Some(true)
+    } else if tail.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4106,6 +5145,130 @@ fn clean(value: &str) -> String {
         "Unknown".into()
     } else {
         trimmed.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(app: &str, title: &str, source: &str) -> ActivitySample {
+        ActivitySample {
+            timestamp: 1,
+            app: app.into(),
+            title: title.into(),
+            source: source.into(),
+            category: "distracting".into(),
+        }
+    }
+
+    fn focus(target: &str) -> FocusSession {
+        FocusSession {
+            task: "Deep work".into(),
+            target: target.into(),
+            started_at: 1,
+            duration_minutes: 25,
+            break_minutes: 5,
+            paused_at: None,
+            paused_total_seconds: 0,
+            pomodoro_alerted_at: None,
+            alert_delay_seconds: DEFAULT_ALERT_DELAY_SECONDS,
+            alert_action: "alert".into(),
+            redirect_app: String::new(),
+            high_focus_mode: true,
+        }
+    }
+
+    #[test]
+    fn focus_target_allows_claude_new_tab() {
+        let session = focus("https://claude.ai/");
+        let active = sample("Safari", "Claude", "https://claude.ai/new");
+
+        assert!(matches_focus_target(&session, &active));
+    }
+
+    #[test]
+    fn focus_target_allows_chatgpt_conversation() {
+        let session = focus("https://chatgpt.com");
+        let active = sample("Google Chrome", "ChatGPT", "https://chatgpt.com/c/abc123");
+
+        assert!(matches_focus_target(&session, &active));
+    }
+
+    #[test]
+    fn focus_target_allows_app_name() {
+        let session = focus("Claude, Pages");
+        let active = sample("Claude", "Claude", "local");
+
+        assert!(matches_focus_target(&session, &active));
+    }
+
+    #[test]
+    fn local_focus_connect_pages_are_exempt_from_blocking() {
+        let active = sample(
+            "Safari",
+            "Local Focus Connect",
+            "http://192.168.4.22:4799/connect",
+        );
+
+        assert!(is_local_focus_control_activity(&active));
+    }
+
+    #[test]
+    fn wifi_connection_pages_are_exempt_from_blocking() {
+        let active = sample("System Settings", "Wi-Fi connection", "local");
+
+        assert!(is_system_connection_activity(&active));
+    }
+
+    #[test]
+    fn active_focus_target_is_exempt_from_block_rules() {
+        let state = Arc::new(Mutex::new(AppState {
+            focus: Some(focus("https://claude.ai/")),
+            ..Default::default()
+        }));
+        let active = sample("Safari", "Claude", "https://claude.ai/new");
+
+        assert!(activity_is_block_exempt(&state, &active));
+    }
+
+    #[test]
+    fn high_focus_blocks_outside_desktop_apps() {
+        let session = focus("Pages, https://claude.ai/, https://chatgpt.com");
+        let active = sample("VLC", "VLC media player", "local");
+
+        assert!(high_focus_should_block(&session, &active));
+    }
+
+    #[test]
+    fn high_focus_blocks_outside_desktop_apps_even_when_idle() {
+        let session = focus("Pages, https://claude.ai/, https://chatgpt.com");
+        let mut active = sample("TV", "Apple TV", "local");
+        active.category = "idle".into();
+
+        assert!(high_focus_should_block(&session, &active));
+    }
+
+    #[test]
+    fn high_focus_does_not_block_focus_desktop_apps() {
+        let session = focus("Pages, https://claude.ai/, https://chatgpt.com");
+        let active = sample("Pages", "Writing", "local");
+
+        assert!(!high_focus_should_block(&session, &active));
+    }
+
+    #[test]
+    fn focus_target_text_keeps_first_fifteen_unique_targets() {
+        let targets = (1..=18)
+            .map(|index| format!("App{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let normalized = normalize_focus_target_text(&format!("{targets}, App1, app2"));
+        let values = target_list_from_text(&normalized);
+
+        assert_eq!(values.len(), MAX_FOCUS_TARGETS);
+        assert_eq!(values.first().map(String::as_str), Some("App1"));
+        assert_eq!(values.last().map(String::as_str), Some("App15"));
     }
 }
 

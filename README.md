@@ -13,6 +13,7 @@ No cloud account is used. No data is sent off the machine. The app records local
 - Optional focus targets, such as `Code`, `Pages`, `github.com`, `https://claude.ai/chat`, or a project name.
 - Distraction detection during focus sessions.
 - User-editable productive, distracting, and blocked keyword rules, including adding blocks from the dashboard.
+- Same-WiFi phone, tablet, TV, and laptop receiver alerts, plus a mobile companion protocol for native phone activity tracking.
 - Productivity report for the last 24 hours.
 - Cross-platform Rust binary with no third-party crates.
 
@@ -77,6 +78,10 @@ sudo apt install xdotool x11-utils libnotify-bin
 ```
 
 Windows uses PowerShell and Win32 APIs for active-window metadata. Notification support may vary by system policy.
+
+## Phone and Tablet Companion
+
+Phones and tablets can connect to the laptop over the same Wi-Fi network. Open the dashboard's device connect link for receiver-only alerts, or build a native companion app against the protocol in `mobile/README.md` to track phone apps, browser activity, idle time, and receive focus alerts.
 
 ## Run at Login
 
