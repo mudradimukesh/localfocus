@@ -5,7 +5,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, UdpSocket};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -20,6 +20,10 @@ const DEFAULT_ALERT_DELAY_SECONDS: u64 = 60;
 const DEFAULT_ALERT_MESSAGE_TEMPLATE: &str = "You have been outside your focus apps/sites for over {delay}. Allowed: '{targets}'. Current activity: {app}";
 const IDLE_SECONDS: u64 = 60;
 const MAX_FOCUS_TARGETS: usize = 15;
+const MAX_HEADER_BYTES: usize = 32 * 1024;
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+const SOCKET_TIMEOUT_SECONDS: u64 = 15;
+const SAMPLE_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -66,6 +70,9 @@ struct AppState {
     last_blocked_key: String,
     last_device_notify_at: i64,
     last_device_notify_key: String,
+    // Master switch. When true, the whole app is stopped: no tracking, blocking,
+    // alerts, device notifications, or journal reminders until it is resumed.
+    stopped: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,6 +100,44 @@ struct NetworkDevice {
     kind: String,
     endpoint: String,
     selected: bool,
+}
+
+#[derive(Clone, Debug)]
+struct JournalSettings {
+    enabled: bool,
+    reminder_mode: String,
+}
+
+#[derive(Clone, Debug)]
+struct JournalReminderDue {
+    date: String,
+    label: String,
+    message: String,
+    marker_key: String,
+}
+
+#[derive(Clone, Debug)]
+struct JournalTaskReminder {
+    id: String,
+    task: String,
+    time: String,
+}
+
+#[derive(Clone, Debug)]
+struct LocalClock {
+    today: String,
+    yesterday: String,
+    hour: u32,
+    minute: u32,
+}
+
+impl Default for JournalSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reminder_mode: "evening".into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,6 +178,13 @@ impl Default for Config {
             network_devices: Vec::new(),
         }
     }
+}
+
+/// Lock the shared state, recovering the inner value if a previous holder
+/// panicked. This avoids silently swapping in empty/default state (which would
+/// disable tracking or config) just because some unrelated thread paniced.
+fn lock_state(state: &Mutex<AppState>) -> std::sync::MutexGuard<'_, AppState> {
+    state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn main() -> io::Result<()> {
@@ -177,6 +229,7 @@ fn run_app(data_dir: PathBuf) -> io::Result<()> {
         last_blocked_key: String::new(),
         last_device_notify_at: 0,
         last_device_notify_key: String::new(),
+        stopped: false,
     }));
 
     {
@@ -205,6 +258,16 @@ fn run_app(data_dir: PathBuf) -> io::Result<()> {
         thread::spawn(move || {
             if let Err(error) = daily_report_loop(daily_dir, daily_state) {
                 eprintln!("daily report logger stopped: {error}");
+            }
+        });
+    }
+
+    {
+        let journal_dir = data_dir.clone();
+        let journal_state = Arc::clone(&state);
+        thread::spawn(move || {
+            if let Err(error) = journal_reminder_loop(journal_dir, journal_state) {
+                eprintln!("journal reminder stopped: {error}");
             }
         });
     }
@@ -245,17 +308,25 @@ fn run_tracker(data_dir: PathBuf) -> io::Result<()> {
         last_blocked_key: String::new(),
         last_device_notify_at: 0,
         last_device_notify_key: String::new(),
+        stopped: false,
     }));
     tracking_loop(data_dir, state)
 }
 
 fn tracking_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<()> {
     loop {
+        // Master switch: when stopped, do nothing — no sampling, no blocking,
+        // no alerts — until the app is resumed.
+        let (config, focus) = {
+            let guard = lock_state(&state);
+            if guard.stopped {
+                drop(guard);
+                thread::sleep(Duration::from_secs(SAMPLE_SECONDS));
+                continue;
+            }
+            (guard.config.clone(), guard.focus.clone())
+        };
         let raw = foreground_activity();
-        let (config, focus) = state
-            .lock()
-            .map(|s| (s.config.clone(), s.focus.clone()))
-            .unwrap_or_default();
         let category = classify(&config, &raw.0, &raw.1);
         let mut sample = ActivitySample {
             timestamp: now(),
@@ -280,7 +351,13 @@ fn tracking_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<(
 fn focus_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<()> {
     loop {
         thread::sleep(Duration::from_secs(10));
-        let focus = state.lock().ok().and_then(|s| s.focus.clone());
+        let focus = {
+            let guard = lock_state(&state);
+            if guard.stopped {
+                continue;
+            }
+            guard.focus.clone()
+        };
         if let Some(session) = focus {
             if session.paused_at.is_some() {
                 continue;
@@ -298,9 +375,7 @@ fn focus_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<()> 
                 let mut completed = session.clone();
                 completed.pomodoro_alerted_at = Some(now());
                 save_focus(&data_dir, &completed)?;
-                if let Ok(mut state) = state.lock() {
-                    state.focus = Some(completed);
-                }
+                lock_state(&state).focus = Some(completed);
             }
         }
     }
@@ -308,8 +383,57 @@ fn focus_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<()> 
 
 fn daily_report_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<()> {
     loop {
-        maybe_log_previous_day_report(&data_dir, &state)?;
+        if !lock_state(&state).stopped {
+            maybe_log_previous_day_report(&data_dir, &state)?;
+        }
+        prune_old_records(&data_dir)?;
         thread::sleep(Duration::from_secs(5 * 60));
+    }
+}
+
+/// Keep the high-frequency activity and notification logs bounded so the files
+/// (and the per-request parse cost) do not grow without limit. Daily report
+/// archives retain long-term history beyond the retention window.
+fn prune_old_records(data_dir: &Path) -> io::Result<()> {
+    let cutoff = now() - SAMPLE_RETENTION_SECONDS;
+    prune_jsonl_by_timestamp(&data_dir.join("activity.jsonl"), cutoff)?;
+    prune_jsonl_by_timestamp(&data_dir.join("device_notifications.jsonl"), cutoff)?;
+    Ok(())
+}
+
+fn prune_jsonl_by_timestamp(path: &Path, cutoff: i64) -> io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let reader = BufReader::new(File::open(path)?);
+    let mut kept = Vec::new();
+    let mut dropped = false;
+    for line in reader.lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match json_number(&line, "timestamp") {
+            Some(timestamp) if timestamp < cutoff => dropped = true,
+            _ => kept.push(line),
+        }
+    }
+    if !dropped {
+        return Ok(());
+    }
+    let mut content = kept.join("\n");
+    content.push('\n');
+    let tmp = path.with_extension("jsonl.tmp");
+    fs::write(&tmp, content)?;
+    fs::rename(tmp, path)
+}
+
+fn journal_reminder_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<()> {
+    loop {
+        if !lock_state(&state).stopped {
+            maybe_send_journal_reminder(&data_dir)?;
+            maybe_send_journal_task_reminders(&data_dir)?;
+        }
+        thread::sleep(Duration::from_secs(30));
     }
 }
 
@@ -354,14 +478,11 @@ fn start_focus(
 }
 
 fn detect_distraction(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     state: &Arc<Mutex<AppState>>,
     sample: &ActivitySample,
 ) -> io::Result<()> {
-    let mut guard = match state.lock() {
-        Ok(guard) => guard,
-        Err(_) => return Ok(()),
-    };
+    let mut guard = lock_state(state);
 
     let focused = guard.focus.is_some();
     let paused = guard
@@ -449,7 +570,7 @@ fn clean_alert_message_template(value: &str) -> String {
 }
 
 fn enforce_blocked_access(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     state: &Arc<Mutex<AppState>>,
     config: &Config,
     sample: &ActivitySample,
@@ -473,10 +594,7 @@ fn enforce_blocked_access(
     );
 
     {
-        let mut guard = match state.lock() {
-            Ok(guard) => guard,
-            Err(_) => return Ok(()),
-        };
+        let mut guard = lock_state(state);
         let within_cooldown = sample.timestamp - guard.last_blocked_at < BLOCK_COOLDOWN_SECONDS;
         if within_cooldown && guard.last_blocked_key == blocked_key {
             return Ok(());
@@ -503,21 +621,20 @@ fn activity_is_block_exempt(state: &Arc<Mutex<AppState>>, sample: &ActivitySampl
         return true;
     }
 
-    state
-        .lock()
-        .ok()
-        .and_then(|guard| guard.focus.clone())
+    lock_state(state)
+        .focus
+        .clone()
         .filter(|focus| focus.paused_at.is_none())
         .filter(|focus| !focus_targets(focus).is_empty())
         .is_some_and(|focus| matches_focus_target(&focus, sample))
 }
 
 fn enforce_high_focus_block(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     state: &Arc<Mutex<AppState>>,
     sample: &ActivitySample,
 ) -> io::Result<bool> {
-    let focus = state.lock().ok().and_then(|guard| guard.focus.clone());
+    let focus = lock_state(state).focus.clone();
     let Some(focus) = focus else {
         return Ok(false);
     };
@@ -533,10 +650,7 @@ fn enforce_high_focus_block(
         normalize_match_text(&sample.title)
     );
     {
-        let mut guard = match state.lock() {
-            Ok(guard) => guard,
-            Err(_) => return Ok(true),
-        };
+        let mut guard = lock_state(state);
         let within_cooldown = sample.timestamp - guard.last_blocked_at < BLOCK_COOLDOWN_SECONDS;
         if within_cooldown && guard.last_blocked_key == block_key {
             return Ok(true);
@@ -681,7 +795,7 @@ fn blocked_activity_label(sample: &ActivitySample) -> String {
 }
 
 fn notify_devices_for_attention_event(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     state: &Arc<Mutex<AppState>>,
     config: &Config,
     sample: &ActivitySample,
@@ -691,7 +805,7 @@ fn notify_devices_for_attention_event(
     }
 
     let (devices, event_key, message) = if sample.category == "idle" {
-        let focus = state.lock().ok().and_then(|guard| guard.focus.clone());
+        let focus = lock_state(state).focus.clone();
         let Some(focus) = focus.filter(|focus| focus.paused_at.is_none()) else {
             return Ok(());
         };
@@ -745,10 +859,7 @@ fn notify_devices_for_attention_event(
     };
 
     {
-        let mut guard = match state.lock() {
-            Ok(guard) => guard,
-            Err(_) => return Ok(()),
-        };
+        let mut guard = lock_state(state);
         let within_cooldown =
             sample.timestamp - guard.last_device_notify_at < DEVICE_NOTIFY_COOLDOWN_SECONDS;
         if within_cooldown && guard.last_device_notify_key == event_key {
@@ -787,8 +898,6 @@ fn apply_focus_productivity_gate(focus: &Option<FocusSession>, sample: &mut Acti
 
     if matches_focus_target(focus, sample) {
         sample.category = "productive".into();
-    } else if sample.category == "productive" {
-        sample.category = "distracting".into();
     } else {
         sample.category = "distracting".into();
     }
@@ -887,7 +996,7 @@ fn normalize_focus_target_text(value: &str) -> String {
 fn human_duration(seconds: u64) -> String {
     if seconds == 60 {
         "1 minute".into()
-    } else if seconds % 60 == 0 {
+    } else if seconds.is_multiple_of(60) {
         format!("{} minutes", seconds / 60)
     } else if seconds == 1 {
         "1 second".into()
@@ -1195,7 +1304,7 @@ fn classify(config: &Config, app: &str, title: &str) -> String {
     "distracting".into()
 }
 
-fn append_sample(data_dir: &PathBuf, sample: &ActivitySample) -> io::Result<()> {
+fn append_sample(data_dir: &Path, sample: &ActivitySample) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -1211,7 +1320,7 @@ fn append_sample(data_dir: &PathBuf, sample: &ActivitySample) -> io::Result<()> 
     )
 }
 
-fn append_event(data_dir: &PathBuf, kind: &str, message: &str) -> io::Result<()> {
+fn append_event(data_dir: &Path, kind: &str, message: &str) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -1226,7 +1335,7 @@ fn append_event(data_dir: &PathBuf, kind: &str, message: &str) -> io::Result<()>
 }
 
 fn append_device_notification(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     event: &str,
     message: &str,
     sample: &ActivitySample,
@@ -1256,7 +1365,7 @@ fn append_device_notification(
     )
 }
 
-fn append_focus_session(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<()> {
+fn append_focus_session(data_dir: &Path, focus: &FocusSession) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -1277,7 +1386,7 @@ fn append_focus_session(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<
 }
 
 fn focus_sessions_json(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     since: Option<i64>,
     until: Option<i64>,
     current_focus: Option<FocusSession>,
@@ -1299,8 +1408,8 @@ fn focus_sessions_json(
     }
 
     if let Some(focus) = current_focus {
-        if since.map_or(true, |value| focus.started_at >= value)
-            && until.map_or(true, |value| focus.started_at < value)
+        if since.is_none_or(|value| focus.started_at >= value)
+            && until.is_none_or(|value| focus.started_at < value)
             && !rows
                 .iter()
                 .any(|line| json_number(line, "startedAt") == Some(focus.started_at))
@@ -1324,7 +1433,7 @@ fn focus_sessions_json(
     Ok(format!("[{}]", rows.join(",")))
 }
 
-fn load_samples(data_dir: &PathBuf) -> io::Result<Vec<ActivitySample>> {
+fn load_samples(data_dir: &Path) -> io::Result<Vec<ActivitySample>> {
     let path = data_dir.join("activity.jsonl");
     if !path.exists() {
         return Ok(Vec::new());
@@ -1350,19 +1459,98 @@ fn parse_sample(line: &str) -> Option<ActivitySample> {
     })
 }
 
+fn read_http_request(stream: &mut TcpStream) -> io::Result<String> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0; 8192];
+
+    // Keep reading until the full header block has arrived. A single read() is
+    // not guaranteed to deliver the whole header, and the cap prevents a slow or
+    // malicious client from making us buffer without bound.
+    let header_end = loop {
+        if let Some(header_end) = find_header_end(&buffer) {
+            break header_end;
+        }
+        if buffer.len() > MAX_HEADER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request headers too large",
+            ));
+        }
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            // Connection closed before the headers completed.
+            return Ok(String::from_utf8_lossy(&buffer).into_owned());
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    };
+
+    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    if content_length > MAX_BODY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request body too large",
+        ));
+    }
+
+    let target_len = header_end + 4 + content_length;
+    while buffer.len() < target_len {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+
+    Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
 fn handle_http(
     mut stream: TcpStream,
     data_dir: PathBuf,
     state: Arc<Mutex<AppState>>,
 ) -> io::Result<()> {
-    let mut buffer = [0; 4096];
-    let read = stream.read(&mut buffer)?;
-    let request = String::from_utf8_lossy(&buffer[..read]);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECONDS)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECONDS)));
+    let is_loopback = stream
+        .peer_addr()
+        .map(|addr| addr.ip().is_loopback())
+        .unwrap_or(false);
+
+    let request = read_http_request(&mut stream)?;
     let path = request
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/");
+    let route = path.split(['?', '#']).next().unwrap_or(path);
+
+    // The private dashboard and all control/data endpoints are localhost-only.
+    // Only the device-companion surface is reachable from other LAN machines.
+    if !is_loopback && !remote_path_allowed(route) {
+        return write_forbidden(&mut stream, "This endpoint is only available on this device.");
+    }
+
+    // Block cross-site (CSRF) calls to state-changing endpoints. Browsers tag
+    // cross-origin requests with Sec-Fetch-Site / Origin; native companions send
+    // neither and are therefore unaffected.
+    if is_mutation_path(route) && request_is_cross_site(&request) {
+        return write_forbidden(&mut stream, "Cross-site requests are not allowed.");
+    }
 
     if path.starts_with("/api/focus/start") {
         let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
@@ -1414,8 +1602,11 @@ fn handle_http(
         };
         save_focus(&data_dir, &session)?;
         append_focus_session(&data_dir, &session)?;
-        if let Ok(mut state) = state.lock() {
-            state.focus = Some(session.clone());
+        {
+            let mut guard = lock_state(&state);
+            guard.focus = Some(session.clone());
+            // Starting a focus session also resumes the app if it was stopped.
+            guard.stopped = false;
         }
         let target_note = if session.target.trim().is_empty() {
             String::new()
@@ -1429,9 +1620,7 @@ fn handle_http(
         write_response(&mut stream, "application/json", "{\"ok\":true}")?;
     } else if path.starts_with("/api/focus/pause") {
         let updated = {
-            let mut guard = state
-                .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "state lock poisoned"))?;
+            let mut guard = lock_state(&state);
             if let Some(mut focus) = guard.focus.clone() {
                 let current = now();
                 if let Some(paused_at) = focus.paused_at {
@@ -1461,9 +1650,7 @@ fn handle_http(
             .map(|s| normalize_focus_target_text(s))
             .unwrap_or_default();
         let updated = {
-            let mut guard = state
-                .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "state lock poisoned"))?;
+            let mut guard = lock_state(&state);
             if let Some(mut focus) = guard.focus.clone() {
                 focus.target = target.clone();
                 guard.focus = Some(focus.clone());
@@ -1484,9 +1671,7 @@ fn handle_http(
             .get("enabled")
             .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"));
         let updated = {
-            let mut guard = state
-                .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "state lock poisoned"))?;
+            let mut guard = lock_state(&state);
             if let Some(mut focus) = guard.focus.clone() {
                 focus.high_focus_mode = enabled;
                 guard.focus = Some(focus.clone());
@@ -1508,11 +1693,30 @@ fn handle_http(
         }
         write_response(&mut stream, "application/json", "{\"ok\":true}")?;
     } else if path.starts_with("/api/focus/stop") {
+        // Stop is the master off switch: end the focus session and halt all
+        // tracking, blocking, alerts, device notifications, and reminders until
+        // the app is resumed (Resume button, a new focus session, or relaunch).
         clear_focus(&data_dir)?;
-        if let Ok(mut state) = state.lock() {
-            state.focus = None;
+        {
+            let mut guard = lock_state(&state);
+            guard.focus = None;
+            guard.stopped = true;
         }
-        write_response(&mut stream, "application/json", "{\"ok\":true}")?;
+        notify(
+            "Local Focus stopped",
+            "Tracking, blocking, alerts, and reminders are paused until you resume.",
+        );
+        write_response(&mut stream, "application/json", "{\"ok\":true,\"stopped\":true}")?;
+    } else if path.starts_with("/api/app/resume") {
+        {
+            let mut guard = lock_state(&state);
+            guard.stopped = false;
+        }
+        notify(
+            "Local Focus resumed",
+            "Tracking, blocking, alerts, and reminders are active again.",
+        );
+        write_response(&mut stream, "application/json", "{\"ok\":true,\"stopped\":false}")?;
     } else if path.starts_with("/api/block/add") {
         let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
         let params = parse_query(query);
@@ -1544,9 +1748,7 @@ fn handle_http(
             });
             config.blocked_keywords.push(record.clone());
             save_config(&data_dir, &config)?;
-            if let Ok(mut state) = state.lock() {
-                state.config = config;
-            }
+            lock_state(&state).config = config;
             append_event(&data_dir, "blocked_keyword_added", &keyword)?;
         }
 
@@ -1565,9 +1767,7 @@ fn handle_http(
                 .blocked_keywords
                 .retain(|item| parse_block_rule_record(item).target != keyword);
             save_config(&data_dir, &config)?;
-            if let Ok(mut state) = state.lock() {
-                state.config = config;
-            }
+            lock_state(&state).config = config;
             append_event(&data_dir, "blocked_keyword_removed", &keyword)?;
         }
         write_response(&mut stream, "application/json", "{\"ok\":true}")?;
@@ -1589,9 +1789,7 @@ fn handle_http(
         let mut config = load_config(&data_dir).unwrap_or_default();
         config.network_devices.push(device.clone());
         save_config(&data_dir, &config)?;
-        if let Ok(mut state) = state.lock() {
-            state.config = config;
-        }
+        lock_state(&state).config = config;
         append_event(&data_dir, "browser_device_connected", &device)?;
         write_response(
             &mut stream,
@@ -1628,9 +1826,7 @@ fn handle_http(
             .retain(|item| parse_network_device_record(item).endpoint != endpoint);
         config.network_devices.push(device.clone());
         save_config(&data_dir, &config)?;
-        if let Ok(mut state) = state.lock() {
-            state.config = config;
-        }
+        lock_state(&state).config = config;
         append_event(&data_dir, "mobile_device_registered", &device)?;
         write_response(
             &mut stream,
@@ -1643,6 +1839,14 @@ fn handle_http(
             ),
         )?;
     } else if path.starts_with("/api/mobile/activity") {
+        if lock_state(&state).stopped {
+            write_response(
+                &mut stream,
+                "application/json",
+                "{\"ok\":false,\"stopped\":true}",
+            )?;
+            return Ok(());
+        }
         let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
         let params = parse_query(query);
         let body = request
@@ -1660,10 +1864,10 @@ fn handle_http(
             .and_then(|value| value.parse::<i64>().ok())
             .or_else(|| json_number(body, "timestamp"))
             .unwrap_or_else(now);
-        let (config, focus) = state
-            .lock()
-            .map(|guard| (guard.config.clone(), guard.focus.clone()))
-            .unwrap_or_default();
+        let (config, focus) = {
+            let guard = lock_state(&state);
+            (guard.config.clone(), guard.focus.clone())
+        };
         let category = request_value(&params, body, "category")
             .filter(|value| matches!(value.as_str(), "productive" | "distracting" | "idle"))
             .unwrap_or_else(|| classify(&config, &app, &format!("{title} {source}")));
@@ -1739,12 +1943,120 @@ fn handle_http(
             "image/svg+xml; charset=utf-8",
             &qr_svg(value, label)?,
         )?;
-    } else if path == "/api/timeline" {
+    } else if path.starts_with("/api/journal/settings") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let enabled = params
+            .get("enabled")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "on" | "yes"))
+            .unwrap_or(true);
+        let reminder_mode = params
+            .get("reminderMode")
+            .map(|value| normalize_journal_reminder_mode(value))
+            .unwrap_or_else(|| "evening".into());
+        let settings = JournalSettings {
+            enabled,
+            reminder_mode,
+        };
+        save_journal_settings(&data_dir, &settings)?;
+        append_event(
+            &data_dir,
+            "journal_settings_updated",
+            if settings.enabled {
+                "Daily journaling reminders enabled."
+            } else {
+                "Daily journaling reminders disabled."
+            },
+        )?;
+        write_response(
+            &mut stream,
+            "application/json",
+            &journal_settings_json(&settings),
+        )?;
+    } else if path.starts_with("/api/journal/reminders/add") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or("");
+        let task = request_value(&params, body, "task").unwrap_or_default();
+        let time = request_value(&params, body, "time").unwrap_or_default();
+        if let Some(reminder) = add_journal_task_reminder(&data_dir, &task, &time)? {
+            append_event(
+                &data_dir,
+                "journal_task_reminder_added",
+                &format!("{} - {}", reminder.time, reminder.task),
+            )?;
+        }
+        write_response(
+            &mut stream,
+            "application/json",
+            &journal_task_reminders_json(&data_dir)?,
+        )?;
+    } else if path.starts_with("/api/journal/reminders/remove") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        if let Some(id) = params.get("id").filter(|value| !value.trim().is_empty()) {
+            if remove_journal_task_reminder(&data_dir, id)? {
+                append_event(&data_dir, "journal_task_reminder_removed", id)?;
+            }
+        }
+        write_response(
+            &mut stream,
+            "application/json",
+            &journal_task_reminders_json(&data_dir)?,
+        )?;
+    } else if path.starts_with("/api/journal/reminders") {
+        write_response(
+            &mut stream,
+            "application/json",
+            &journal_task_reminders_json(&data_dir)?,
+        )?;
+    } else if path.starts_with("/api/journal/entry") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let date = params
+            .get("date")
+            .and_then(|value| clean_journal_date(value))
+            .or_else(local_today)
+            .unwrap_or_default();
+        write_response(
+            &mut stream,
+            "application/json",
+            &journal_entry_json(&data_dir, &date)?,
+        )?;
+    } else if path.starts_with("/api/journal/save") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or("");
+        let date = request_value(&params, body, "date")
+            .and_then(|value| clean_journal_date(&value))
+            .or_else(local_today)
+            .unwrap_or_default();
+        let text = json_string(body, "text")
+            .or_else(|| params.get("text").cloned())
+            .unwrap_or_default();
+        save_journal_entry(&data_dir, &date, &text)?;
+        append_event(
+            &data_dir,
+            "journal_saved",
+            &format!("Journal saved for {date}."),
+        )?;
+        write_response(
+            &mut stream,
+            "application/json",
+            &journal_entry_json(&data_dir, &date)?,
+        )?;
+    } else if route == "/api/timeline" {
         write_response(&mut stream, "application/json", &timeline_json(&data_dir)?)?;
-    } else if path == "/api/report/reset" {
+    } else if route == "/api/report/reset" {
         reset_report(&data_dir)?;
         write_response(&mut stream, "application/json", "{\"ok\":true}")?;
-    } else if path == "/api/report/history" {
+    } else if route == "/api/report/history" {
         write_response(
             &mut stream,
             "application/json",
@@ -1759,7 +2071,7 @@ fn handle_http(
         let until = params
             .get("until")
             .and_then(|value| value.parse::<i64>().ok());
-        let focus = state.lock().ok().and_then(|s| s.focus.clone());
+        let focus = lock_state(&state).focus.clone();
         write_response(
             &mut stream,
             "application/json",
@@ -1787,25 +2099,24 @@ fn handle_http(
             "application/json",
             &focus_report_json(&data_dir, &target, since, until, period)?,
         )?;
-    } else if path == "/api/report" {
+    } else if route == "/api/report" {
         write_response(&mut stream, "application/json", &report_json(&data_dir)?)?;
-    } else if path == "/api/state" {
-        let (focus, devices, blocks) = state
-            .lock()
-            .map(|s| {
-                (
-                    s.focus.clone(),
-                    s.config.network_devices.clone(),
-                    s.config.blocked_keywords.clone(),
-                )
-            })
-            .unwrap_or_default();
+    } else if route == "/api/state" {
+        let (focus, devices, blocks, stopped) = {
+            let guard = lock_state(&state);
+            (
+                guard.focus.clone(),
+                guard.config.network_devices.clone(),
+                guard.config.blocked_keywords.clone(),
+                guard.stopped,
+            )
+        };
         write_response(
             &mut stream,
             "application/json",
-            &state_json(focus, &devices, &blocks),
+            &state_json(&data_dir, focus, &devices, &blocks, stopped),
         )?;
-    } else if path == "/connect" || path.starts_with("/connect?") {
+    } else if route == "/connect" {
         write_response(
             &mut stream,
             "text/html; charset=utf-8",
@@ -1825,19 +2136,19 @@ fn handle_http(
             "LocalFocus.dmg",
             &["target/macos/LocalFocus.dmg"],
         )?;
-    } else if path == "/device-sw.js" {
+    } else if route == "/device-sw.js" {
         write_response(
             &mut stream,
             "application/javascript; charset=utf-8",
             &device_service_worker_js(),
         )?;
-    } else if path == "/device-manifest.json" {
+    } else if route == "/device-manifest.json" {
         write_response(
             &mut stream,
             "application/manifest+json",
             &device_manifest_json(),
         )?;
-    } else if path == "/device" || path.starts_with("/device?") {
+    } else if route == "/device" {
         write_response(&mut stream, "text/html; charset=utf-8", &device_html())?;
     } else {
         write_response(&mut stream, "text/html; charset=utf-8", &index_html())?;
@@ -1877,6 +2188,95 @@ fn write_not_found(stream: &mut TcpStream, message: &str) -> io::Result<()> {
         message.len(),
         message
     )
+}
+
+fn write_forbidden(stream: &mut TcpStream, message: &str) -> io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
+        message.len(),
+        message
+    )
+}
+
+/// Endpoints reachable from other machines on the LAN: only the device-companion
+/// surface (receiver pages, QR images, downloads, and the mobile/native APIs).
+/// Everything else — dashboard, timeline, reports, journal, focus/block control —
+/// stays restricted to loopback.
+fn remote_path_allowed(route: &str) -> bool {
+    const ALLOWED_PREFIXES: [&str; 8] = [
+        "/api/mobile/register",
+        "/api/mobile/activity",
+        "/api/device/register",
+        "/api/device/events",
+        "/api/native/notify",
+        "/api/qr.svg",
+        "/connect",
+        "/download/",
+    ];
+    // `/device`, `/device-sw.js`, and `/device-manifest.json` all share this prefix.
+    route.starts_with("/device") || ALLOWED_PREFIXES.iter().any(|prefix| route.starts_with(prefix))
+}
+
+/// State-changing endpoints that must reject cross-site browser requests.
+fn is_mutation_path(route: &str) -> bool {
+    const MUTATION_PREFIXES: [&str; 12] = [
+        "/api/focus/",
+        "/api/app/",
+        "/api/block/",
+        "/api/device/register",
+        "/api/mobile/register",
+        "/api/mobile/activity",
+        "/api/native/notify",
+        "/api/report/reset",
+        "/api/journal/settings",
+        "/api/journal/reminders/add",
+        "/api/journal/reminders/remove",
+        "/api/journal/save",
+    ];
+    MUTATION_PREFIXES
+        .iter()
+        .any(|prefix| route.starts_with(prefix))
+}
+
+/// Detect a cross-origin (CSRF) request using the browser-supplied
+/// `Sec-Fetch-Site` header, falling back to `Origin` vs `Host`. Native clients
+/// send neither header and are treated as same-site.
+fn request_is_cross_site(request: &str) -> bool {
+    let mut sec_fetch_site: Option<String> = None;
+    let mut origin: Option<String> = None;
+    let mut host: Option<String> = None;
+    for line in request.lines() {
+        if line.is_empty() {
+            break; // end of headers
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("sec-fetch-site") {
+            sec_fetch_site = Some(value.to_ascii_lowercase());
+        } else if name.eq_ignore_ascii_case("origin") {
+            origin = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("host") {
+            host = Some(value.to_string());
+        }
+    }
+
+    if let Some(site) = sec_fetch_site {
+        return !matches!(site.as_str(), "same-origin" | "same-site" | "none");
+    }
+
+    match (origin, host) {
+        (Some(origin), Some(host)) if !origin.is_empty() && origin != "null" => {
+            let origin_host = origin
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or(origin.as_str());
+            origin_host != host
+        }
+        _ => false,
+    }
 }
 
 fn write_artifact_response(
@@ -1940,7 +2340,7 @@ fn find_artifact_path(relative_paths: &[&str]) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
-fn timeline_json(data_dir: &PathBuf) -> io::Result<String> {
+fn timeline_json(data_dir: &Path) -> io::Result<String> {
     let samples = load_samples(data_dir)?;
     let mut segments = Vec::new();
     let mut current: Option<ActivitySample> = None;
@@ -1984,7 +2384,7 @@ fn timeline_json(data_dir: &PathBuf) -> io::Result<String> {
     Ok(format!("[{}]", segments.join(",")))
 }
 
-fn report_json(data_dir: &PathBuf) -> io::Result<String> {
+fn report_json(data_dir: &Path) -> io::Result<String> {
     let samples = load_samples(data_dir)?;
     let since = report_window_start(data_dir)?.max(now() - 24 * 60 * 60);
     let recent: Vec<_> = samples
@@ -2009,7 +2409,7 @@ fn report_json(data_dir: &PathBuf) -> io::Result<String> {
             .or_default() += 1;
     }
     let mut apps: Vec<_> = app_counts.into_iter().collect();
-    apps.sort_by(|a, b| b.1.cmp(&a.1));
+    apps.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     let app_json = apps
         .into_iter()
         .take(10)
@@ -2036,7 +2436,7 @@ fn report_json(data_dir: &PathBuf) -> io::Result<String> {
 }
 
 fn focus_report_json(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     target_text: &str,
     since_override: Option<i64>,
     until_override: Option<i64>,
@@ -2049,7 +2449,7 @@ fn focus_report_json(
     let recent: Vec<_> = samples
         .into_iter()
         .filter(|s| {
-            s.timestamp >= since && until_override.map_or(true, |until| s.timestamp < until)
+            s.timestamp >= since && until_override.is_none_or(|until| s.timestamp < until)
         })
         .collect();
     let targets = target_list_from_text(target_text);
@@ -2073,8 +2473,7 @@ fn focus_report_json(
     let mut idle_seconds = 0;
     let mut distraction_counts: BTreeMap<(String, String), u64> = BTreeMap::new();
     let mut hourly: BTreeMap<i64, (u64, u64, u64)> = BTreeMap::new();
-    let mut hourly_details: BTreeMap<i64, BTreeMap<(String, String, String, String), u64>> =
-        BTreeMap::new();
+    let mut hourly_details: HourlyDetails = BTreeMap::new();
 
     for sample in &recent {
         let seconds = SAMPLE_SECONDS;
@@ -2110,14 +2509,10 @@ fn focus_report_json(
             } else {
                 *target_seconds.entry(target.clone()).or_default() += seconds;
             }
-        } else {
-            if sample.category == "idle" {
-                idle_seconds += 0;
-            } else {
-                outside_seconds += seconds;
-                let (app, source) = report_activity_key(sample);
-                *distraction_counts.entry((app, source)).or_default() += seconds;
-            }
+        } else if sample.category != "idle" {
+            outside_seconds += seconds;
+            let (app, source) = report_activity_key(sample);
+            *distraction_counts.entry((app, source)).or_default() += seconds;
         }
     }
 
@@ -2147,7 +2542,7 @@ fn focus_report_json(
         .join(",");
 
     let mut distractions = distraction_counts.into_iter().collect::<Vec<_>>();
-    distractions.sort_by(|a, b| b.1.cmp(&a.1));
+    distractions.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     let distraction_json = distractions
         .into_iter()
         .take(5)
@@ -2171,7 +2566,7 @@ fn focus_report_json(
                 .unwrap_or_default()
                 .into_iter()
                 .collect::<Vec<_>>();
-            details.sort_by(|a, b| b.1.cmp(&a.1));
+            details.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             let details_json = details
                 .into_iter()
                 .take(12)
@@ -2197,11 +2592,10 @@ fn focus_report_json(
 
     let focused_seconds = target_rows.iter().map(|(_, seconds)| *seconds).sum::<u64>();
     let total_seconds = focused_seconds + outside_seconds + idle_seconds;
-    let focus_percent = if total_seconds == 0 {
-        0
-    } else {
-        (focused_seconds * 100 / total_seconds).min(100)
-    };
+    let focus_percent = (focused_seconds * 100)
+        .checked_div(total_seconds)
+        .unwrap_or(0)
+        .min(100);
     let score = if total_seconds == 0 {
         0
     } else {
@@ -2231,6 +2625,9 @@ fn focus_report_json(
         hourly_json
     ))
 }
+
+/// Per-hour activity rollup keyed by (app, title, source, category) -> seconds.
+type HourlyDetails = BTreeMap<i64, BTreeMap<(String, String, String, String), u64>>;
 
 fn target_list_from_text(target_text: &str) -> Vec<String> {
     target_text
@@ -2302,7 +2699,7 @@ fn website_report_key(source: &str) -> Option<(String, String)> {
     Some((domain, format!("{scheme}://{display_host}/")))
 }
 
-fn reset_report(data_dir: &PathBuf) -> io::Result<()> {
+fn reset_report(data_dir: &Path) -> io::Result<()> {
     let archived_at = now();
     let report = report_json(data_dir)?;
     let mut file = OpenOptions::new()
@@ -2317,7 +2714,7 @@ fn reset_report(data_dir: &PathBuf) -> io::Result<()> {
     fs::write(data_dir.join("report_start.txt"), archived_at.to_string())
 }
 
-fn report_history_json(data_dir: &PathBuf) -> io::Result<String> {
+fn report_history_json(data_dir: &Path) -> io::Result<String> {
     let path = data_dir.join("report_history.jsonl");
     if !path.exists() {
         return Ok("[]".into());
@@ -2334,7 +2731,7 @@ fn report_history_json(data_dir: &PathBuf) -> io::Result<String> {
     Ok(format!("[{}]", lines.join(",")))
 }
 
-fn device_notifications_json(data_dir: &PathBuf, since: i64, device: &str) -> io::Result<String> {
+fn device_notifications_json(data_dir: &Path, since: i64, device: &str) -> io::Result<String> {
     let path = data_dir.join("device_notifications.jsonl");
     if !path.exists() {
         return Ok("[]".into());
@@ -2357,8 +2754,400 @@ fn device_notifications_json(data_dir: &PathBuf, since: i64, device: &str) -> io
     Ok(format!("[{}]", rows.join(",")))
 }
 
+fn load_journal_settings(data_dir: &Path) -> io::Result<JournalSettings> {
+    let path = data_dir.join("journal_settings.json");
+    if !path.exists() {
+        return Ok(JournalSettings::default());
+    }
+
+    let value = fs::read_to_string(path)?;
+    Ok(JournalSettings {
+        enabled: json_bool(&value, "enabled").unwrap_or(true),
+        reminder_mode: json_string(&value, "reminderMode")
+            .map(|value| normalize_journal_reminder_mode(&value))
+            .unwrap_or_else(|| "evening".into()),
+    })
+}
+
+fn save_journal_settings(data_dir: &Path, settings: &JournalSettings) -> io::Result<()> {
+    fs::write(
+        data_dir.join("journal_settings.json"),
+        format!(
+            "{{\"enabled\":{},\"reminderMode\":\"{}\",\"updatedAt\":{}}}",
+            settings.enabled,
+            json_escape(&normalize_journal_reminder_mode(&settings.reminder_mode)),
+            now()
+        ),
+    )
+}
+
+fn normalize_journal_reminder_mode(value: &str) -> String {
+    match value.trim().to_lowercase().as_str() {
+        "next_morning" | "morning" => "next_morning".into(),
+        _ => "evening".into(),
+    }
+}
+
+fn journal_settings_json(settings: &JournalSettings) -> String {
+    format!(
+        "{{\"enabled\":{},\"reminderMode\":\"{}\"}}",
+        settings.enabled,
+        json_escape(&normalize_journal_reminder_mode(&settings.reminder_mode))
+    )
+}
+
+fn journal_entry_json(data_dir: &Path, date: &str) -> io::Result<String> {
+    let date = clean_journal_date(date).unwrap_or_else(|| local_today().unwrap_or_default());
+    let (text, updated_at) = journal_entry_for_date(data_dir, &date)?.unwrap_or_default();
+    Ok(format!(
+        "{{\"date\":\"{}\",\"text\":\"{}\",\"updatedAt\":{}}}",
+        json_escape(&date),
+        json_escape(&text),
+        updated_at
+    ))
+}
+
+fn save_journal_entry(data_dir: &Path, date: &str, text: &str) -> io::Result<()> {
+    let date = clean_journal_date(date)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid journal date"))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("journal_entries.jsonl"))?;
+    writeln!(
+        file,
+        "{{\"date\":\"{}\",\"updatedAt\":{},\"text\":\"{}\"}}",
+        json_escape(&date),
+        now(),
+        json_escape(text)
+    )
+}
+
+fn journal_entry_for_date(data_dir: &Path, date: &str) -> io::Result<Option<(String, i64)>> {
+    let path = data_dir.join("journal_entries.jsonl");
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let mut latest = None;
+    for line in BufReader::new(File::open(path)?)
+        .lines()
+        .map_while(Result::ok)
+    {
+        if json_string(&line, "date").as_deref() != Some(date) {
+            continue;
+        }
+        let updated_at = json_number(&line, "updatedAt").unwrap_or(0);
+        let text = json_string(&line, "text").unwrap_or_default();
+        if latest
+            .as_ref()
+            .is_none_or(|(_, previous_at)| updated_at >= *previous_at)
+        {
+            latest = Some((text, updated_at));
+        }
+    }
+    Ok(latest)
+}
+
+fn journal_entry_exists(data_dir: &Path, date: &str) -> bool {
+    journal_entry_for_date(data_dir, date)
+        .ok()
+        .flatten()
+        .is_some_and(|(text, _)| !text.trim().is_empty())
+}
+
+fn clean_journal_date(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.len() != 10 {
+        return None;
+    }
+    for (index, c) in value.chars().enumerate() {
+        if index == 4 || index == 7 {
+            if c != '-' {
+                return None;
+            }
+        } else if !c.is_ascii_digit() {
+            return None;
+        }
+    }
+    Some(value.to_string())
+}
+
+fn load_journal_task_reminders(data_dir: &Path) -> io::Result<Vec<JournalTaskReminder>> {
+    let path = data_dir.join("journal_task_reminders.jsonl");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut reminders = Vec::new();
+    for line in BufReader::new(File::open(path)?)
+        .lines()
+        .map_while(Result::ok)
+    {
+        let Some(id) = json_string(&line, "id").filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        let Some(time) = json_string(&line, "time").and_then(|value| clean_reminder_time(&value))
+        else {
+            continue;
+        };
+        let Some(task) = json_string(&line, "task").filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        reminders.push(JournalTaskReminder { id, task, time });
+    }
+    reminders.sort_by(|left, right| left.time.cmp(&right.time).then(left.task.cmp(&right.task)));
+    Ok(reminders)
+}
+
+fn save_journal_task_reminders(
+    data_dir: &Path,
+    reminders: &[JournalTaskReminder],
+) -> io::Result<()> {
+    let mut content = String::new();
+    for reminder in reminders {
+        content.push_str(&format!(
+            "{{\"id\":\"{}\",\"time\":\"{}\",\"task\":\"{}\"}}\n",
+            json_escape(&reminder.id),
+            json_escape(&reminder.time),
+            json_escape(&reminder.task)
+        ));
+    }
+    fs::write(data_dir.join("journal_task_reminders.jsonl"), content)
+}
+
+fn journal_task_reminders_json(data_dir: &Path) -> io::Result<String> {
+    let rows = load_journal_task_reminders(data_dir)?
+        .into_iter()
+        .map(|reminder| {
+            format!(
+                "{{\"id\":\"{}\",\"time\":\"{}\",\"task\":\"{}\"}}",
+                json_escape(&reminder.id),
+                json_escape(&reminder.time),
+                json_escape(&reminder.task)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!("[{}]", rows))
+}
+
+fn add_journal_task_reminder(
+    data_dir: &Path,
+    task: &str,
+    time: &str,
+) -> io::Result<Option<JournalTaskReminder>> {
+    let task = clean_journal_reminder_task(task);
+    let Some(time) = clean_reminder_time(time) else {
+        return Ok(None);
+    };
+    if task.is_empty() {
+        return Ok(None);
+    }
+
+    let mut reminders = load_journal_task_reminders(data_dir)?;
+    if reminders
+        .iter()
+        .any(|reminder| reminder.time == time && reminder.task.eq_ignore_ascii_case(&task))
+    {
+        return Ok(reminders
+            .into_iter()
+            .find(|reminder| reminder.time == time && reminder.task.eq_ignore_ascii_case(&task)));
+    }
+
+    let reminder = JournalTaskReminder {
+        id: format!("{}-{}", now(), reminders.len() + 1),
+        task,
+        time,
+    };
+    reminders.push(reminder.clone());
+    save_journal_task_reminders(data_dir, &reminders)?;
+    Ok(Some(reminder))
+}
+
+fn remove_journal_task_reminder(data_dir: &Path, id: &str) -> io::Result<bool> {
+    let mut reminders = load_journal_task_reminders(data_dir)?;
+    let before = reminders.len();
+    reminders.retain(|reminder| reminder.id != id);
+    if reminders.len() != before {
+        save_journal_task_reminders(data_dir, &reminders)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn clean_journal_reminder_task(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .take(160)
+        .collect::<String>()
+        .replace(['\n', '\r', '\t'], " ")
+}
+
+fn clean_reminder_time(value: &str) -> Option<String> {
+    let value = value.trim();
+    let (hour, minute) = value.split_once(':')?;
+    if hour.len() != 2 || minute.len() != 2 {
+        return None;
+    }
+    let hour = hour.parse::<u32>().ok()?;
+    let minute = minute.parse::<u32>().ok()?;
+    if hour < 24 && minute < 60 {
+        Some(format!("{hour:02}:{minute:02}"))
+    } else {
+        None
+    }
+}
+
+fn maybe_send_journal_task_reminders(data_dir: &Path) -> io::Result<()> {
+    let Some(clock) = local_clock() else {
+        return Ok(());
+    };
+    let current_time = format!("{:02}:{:02}", clock.hour, clock.minute);
+    let reminders = load_journal_task_reminders(data_dir)?;
+    if reminders.is_empty() {
+        return Ok(());
+    }
+
+    let marker_path = data_dir.join("journal_task_reminder_marker.txt");
+    let sent = fs::read_to_string(&marker_path).unwrap_or_default();
+    let mut new_markers = Vec::new();
+    for reminder in reminders
+        .into_iter()
+        .filter(|reminder| reminder.time == current_time)
+    {
+        let marker = format!("{}|{}|{}", clock.today, reminder.id, reminder.time);
+        if sent.lines().any(|line| line.trim() == marker) {
+            continue;
+        }
+        let message = format!("{} - {}", reminder.time, reminder.task);
+        notify("Journal task reminder", &message);
+        append_event(data_dir, "journal_task_reminder", &message)?;
+        new_markers.push(marker);
+    }
+
+    if !new_markers.is_empty() {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(marker_path)?;
+        for marker in new_markers {
+            writeln!(file, "{marker}")?;
+        }
+    }
+    Ok(())
+}
+
+fn maybe_send_journal_reminder(data_dir: &Path) -> io::Result<()> {
+    let settings = load_journal_settings(data_dir).unwrap_or_default();
+    let Some(due) = journal_reminder_due(data_dir, &settings) else {
+        return Ok(());
+    };
+    let marker_path = data_dir.join("journal_reminder_marker.txt");
+    let last_marker = fs::read_to_string(&marker_path).unwrap_or_default();
+    if last_marker.trim() == due.marker_key {
+        return Ok(());
+    }
+
+    notify("Journal reminder", &due.message);
+    append_event(data_dir, "journal_reminder", &due.message)?;
+    fs::write(marker_path, due.marker_key)
+}
+
+fn journal_reminder_due(
+    data_dir: &Path,
+    settings: &JournalSettings,
+) -> Option<JournalReminderDue> {
+    if !settings.enabled {
+        return None;
+    }
+    let clock = local_clock()?;
+    let mode = normalize_journal_reminder_mode(&settings.reminder_mode);
+    let (date, label, message) = if mode == "next_morning" {
+        if !(7..11).contains(&clock.hour) {
+            return None;
+        }
+        (
+            clock.yesterday.clone(),
+            "Yesterday".to_string(),
+            "Take a few minutes to journal about yesterday.".to_string(),
+        )
+    } else {
+        if !(20..22).contains(&clock.hour) {
+            return None;
+        }
+        (
+            clock.today.clone(),
+            "Today".to_string(),
+            "Take a few minutes to journal about today.".to_string(),
+        )
+    };
+    if journal_entry_exists(data_dir, &date) {
+        return None;
+    }
+    Some(JournalReminderDue {
+        marker_key: format!("{mode}:{date}"),
+        date,
+        label,
+        message,
+    })
+}
+
+fn local_today() -> Option<String> {
+    local_clock().map(|clock| clock.today)
+}
+
+fn local_clock() -> Option<LocalClock> {
+    #[cfg(target_os = "macos")]
+    {
+        let today = command_text("date", &["+%Y-%m-%d"])?;
+        let yesterday = command_text("date", &["-v-1d", "+%Y-%m-%d"])?;
+        let hour = command_text("date", &["+%H"])?.parse().ok()?;
+        let minute = command_text("date", &["+%M"])?.parse().ok()?;
+        Some(LocalClock {
+            today,
+            yesterday,
+            hour,
+            minute,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let today = command_text("date", &["+%Y-%m-%d"])?;
+        let yesterday = command_text("date", &["-d", "yesterday", "+%Y-%m-%d"])?;
+        let hour = command_text("date", &["+%H"])?.parse().ok()?;
+        let minute = command_text("date", &["+%M"])?.parse().ok()?;
+        return Some(LocalClock {
+            today,
+            yesterday,
+            hour,
+            minute,
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = "$now=Get-Date; $y=$now.AddDays(-1); \"$($now.ToString('yyyy-MM-dd'))|$($y.ToString('yyyy-MM-dd'))|$($now.ToString('HH'))|$($now.ToString('mm'))\"";
+        let value = command_text("powershell", &["-NoProfile", "-Command", script])?;
+        let mut parts = value.split('|');
+        return Some(LocalClock {
+            today: parts.next()?.to_string(),
+            yesterday: parts.next()?.to_string(),
+            hour: parts.next()?.parse().ok()?,
+            minute: parts.next()?.parse().ok()?,
+        });
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        None
+    }
+}
+
 fn maybe_log_previous_day_report(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     state: &Arc<Mutex<AppState>>,
 ) -> io::Result<()> {
     let Some((previous_day, previous_start, today_start)) = local_day_window() else {
@@ -2427,7 +3216,7 @@ fn local_day_window() -> Option<(String, i64, i64)> {
         )?
         .parse()
         .ok()?;
-        return Some((yesterday, yesterday_start, today_start));
+        Some((yesterday, yesterday_start, today_start))
     }
 
     #[cfg(target_os = "linux")]
@@ -2454,6 +3243,12 @@ fn local_day_window() -> Option<(String, i64, i64)> {
         let end = parts.next()?.parse().ok()?;
         return Some((day, start, end));
     }
+
+    // Other platforms (e.g. Android) compute the day window in the native layer.
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        None
+    }
 }
 
 fn command_text(program: &str, args: &[&str]) -> Option<String> {
@@ -2464,7 +3259,7 @@ fn command_text(program: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn report_window_start(data_dir: &PathBuf) -> io::Result<i64> {
+fn report_window_start(data_dir: &Path) -> io::Result<i64> {
     let path = data_dir.join("report_start.txt");
     if !path.exists() {
         return Ok(0);
@@ -2474,17 +3269,38 @@ fn report_window_start(data_dir: &PathBuf) -> io::Result<i64> {
     Ok(value.trim().parse().unwrap_or(0))
 }
 
-fn state_json(focus: Option<FocusSession>, devices: &[String], blocks: &[String]) -> String {
+fn state_json(
+    data_dir: &Path,
+    focus: Option<FocusSession>,
+    devices: &[String],
+    blocks: &[String],
+    stopped: bool,
+) -> String {
     let lan_url = local_network_url().unwrap_or_else(|| "http://127.0.0.1:4799".into());
     let device_connect_url = format!("{lan_url}/device");
     let device_install_url = format!("{lan_url}/connect");
     let android_app_url = format!("{lan_url}/download/local-focus-mobile.apk");
     let mac_app_url = format!("{lan_url}/download/local-focus-macos.dmg");
+    let journal_settings = load_journal_settings(data_dir).unwrap_or_default();
+    let journal_due = journal_reminder_due(data_dir, &journal_settings);
+    let journal_json = match journal_due {
+        Some(due) => format!(
+            "{{\"settings\":{},\"due\":true,\"dueDate\":\"{}\",\"dueLabel\":\"{}\",\"dueMessage\":\"{}\"}}",
+            journal_settings_json(&journal_settings),
+            json_escape(&due.date),
+            json_escape(&due.label),
+            json_escape(&due.message)
+        ),
+        None => format!(
+            "{{\"settings\":{},\"due\":false,\"dueDate\":\"\",\"dueLabel\":\"\",\"dueMessage\":\"\"}}",
+            journal_settings_json(&journal_settings)
+        ),
+    };
     let devices_json = devices
         .iter()
         .map(|device| {
-            let device = parse_network_device_record(device);
-            device
+            
+            parse_network_device_record(device)
         })
         .filter(is_qr_connected_device)
         .map(|device| {
@@ -2516,7 +3332,8 @@ fn state_json(focus: Option<FocusSession>, devices: &[String], blocks: &[String]
             let elapsed = focus_elapsed_seconds(&focus, now());
             let remaining = ((focus.duration_minutes * 60) as i64 - elapsed).max(0);
             format!(
-                "{{\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"paused\":{},\"remainingSeconds\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
+                "{{\"stopped\":{},\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"paused\":{},\"remainingSeconds\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"journal\":{},\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
+                stopped,
                 json_escape(&focus.task),
                 json_escape(&focus.target),
                 focus.started_at,
@@ -2530,6 +3347,7 @@ fn state_json(focus: Option<FocusSession>, devices: &[String], blocks: &[String]
                 remaining,
                 devices_json,
                 blocks_json,
+                journal_json,
                 json_escape(&device_connect_url),
                 json_escape(&device_install_url),
                 json_escape(&android_app_url),
@@ -2537,9 +3355,11 @@ fn state_json(focus: Option<FocusSession>, devices: &[String], blocks: &[String]
             )
         }
         None => format!(
-            "{{\"focus\":null,\"devices\":[{}],\"blockedRules\":[{}],\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
+            "{{\"stopped\":{},\"focus\":null,\"devices\":[{}],\"blockedRules\":[{}],\"journal\":{},\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
+            stopped,
             devices_json,
             blocks_json,
+            journal_json,
             json_escape(&device_connect_url),
             json_escape(&device_install_url),
             json_escape(&android_app_url),
@@ -2678,6 +3498,26 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .high-focus-check input:disabled { opacity:.55; }
 .high-focus-explain { display:none; color:var(--muted); font-size:12px; }
 .high-focus-explain.open { display:block; }
+.journal-card { gap:16px; }
+.journal-head { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-start; justify-content:space-between; }
+.journal-toggle { display:flex; align-items:center; gap:8px; font-weight:850; }
+.journal-toggle input { width:18px; height:18px; accent-color:var(--good); }
+.journal-settings { display:grid; grid-template-columns:minmax(180px, 260px) minmax(0, 1fr); gap:12px; align-items:end; }
+.journal-reminder { border:1px solid var(--line); border-radius:8px; padding:10px; background:var(--panel-soft); min-height:42px; }
+.journal-reminder.due { border-color:color-mix(in srgb, var(--warn) 55%, var(--line)); background:color-mix(in srgb, var(--warn) 10%, var(--panel)); }
+.journal-reminder button { margin-top:8px; padding:7px 10px; }
+.journal-editor { display:grid; gap:10px; }
+.journal-row { display:grid; grid-template-columns:minmax(160px, 220px) auto 1fr; gap:10px; align-items:end; }
+.journal-row button { min-height:42px; }
+#journalText { min-height:150px; }
+.journal-task-reminders { border:1px solid var(--line); border-radius:10px; padding:12px; background:var(--panel-soft); display:grid; gap:12px; }
+.journal-task-form { display:grid; grid-template-columns:minmax(0, 1fr) 120px auto; gap:10px; align-items:end; }
+.journal-task-form button { min-height:42px; }
+.journal-reminder-list { display:flex; flex-wrap:wrap; gap:8px; }
+.journal-reminder-chip { display:inline-flex; align-items:center; gap:8px; border:1px solid color-mix(in srgb, var(--good) 38%, var(--line)); border-radius:999px; padding:6px 10px; background:var(--panel); max-width:100%; }
+.journal-reminder-chip strong { white-space:nowrap; }
+.journal-reminder-chip span { overflow-wrap:anywhere; }
+.journal-reminder-chip button { border:0; background:transparent; color:var(--bad); padding:0 2px; min-height:0; }
 .status-chip { border:1px solid var(--line); border-radius:999px; padding:6px 10px; background:color-mix(in srgb, var(--line) 25%, transparent); color:var(--muted); font-weight:700; }
 .status-chip.running { color:var(--good); border-color:color-mix(in srgb, var(--good) 45%, var(--line)); background:color-mix(in srgb, var(--good) 10%, transparent); }
 .status-chip.paused { color:var(--warn); border-color:color-mix(in srgb, var(--warn) 45%, var(--line)); background:color-mix(in srgb, var(--warn) 12%, transparent); }
@@ -2788,7 +3628,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .two { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
 @media (max-width:980px) { .focus-layout, .control-shell { grid-template-columns:1fr; } .focus-actions { justify-content:flex-start; } }
 @media (max-width:900px) { .focus-shell-head { align-items:start; display:grid; } .top-actions { justify-content:flex-start; } }
-@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid, .block-fields, .activity-row, .calendar-actions, .device-qr-body { grid-template-columns:1fr; display:grid; } header { align-items:start; } .header-actions { justify-items:start; } .hour-bars, .period-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } .calendar-grid { grid-template-columns:48px repeat(7, minmax(28px, 1fr)); gap:4px; } .block-type-options, .qr-type-grid { grid-template-columns:1fr; } .block-password-field { grid-column:auto; } .device-qr-code { width:100%; max-width:432px; justify-self:center; } }
+@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid, .block-fields, .activity-row, .calendar-actions, .device-qr-body, .journal-settings, .journal-row, .journal-task-form { grid-template-columns:1fr; display:grid; } header { align-items:start; } .header-actions { justify-items:start; } .hour-bars, .period-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } .calendar-grid { grid-template-columns:48px repeat(7, minmax(28px, 1fr)); gap:4px; } .block-type-options, .qr-type-grid { grid-template-columns:1fr; } .block-password-field { grid-column:auto; } .device-qr-code { width:100%; max-width:432px; justify-self:center; } }
 </style>
 </head>
 <body>
@@ -2800,6 +3640,10 @@ button:disabled { cursor:not-allowed; opacity:.55; }
   </div>
 </header>
 <main>
+  <div id="stopBanner" style="display:none; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap; border:1px solid var(--bad); background:color-mix(in srgb, var(--bad) 12%, var(--panel)); color:var(--ink); border-radius:12px; padding:14px 18px;">
+    <strong>Local Focus is stopped — tracking, blocking, alerts, and reminders are paused until you resume.</strong>
+    <button onclick="resumeApp()" style="background:var(--good); border-color:var(--good); color:#fff; white-space:nowrap;">Resume Local Focus</button>
+  </div>
   <section class="focus-shell">
     <div class="focus-shell-head">
       <div class="focus-title">
@@ -2865,6 +3709,52 @@ button:disabled { cursor:not-allowed; opacity:.55; }
       <button onclick="resetReport()">Refresh</button>
     </div>
   </aside>
+  <section id="journalCard" class="control-shell journal-card" aria-label="Daily journal">
+    <div class="journal-head">
+      <div>
+        <h2>Daily journal</h2>
+        <div class="muted">Optional private notes for each day. Entries stay on this device.</div>
+      </div>
+      <label class="journal-toggle" for="journalEnabled">
+        <input id="journalEnabled" type="checkbox" checked onchange="saveJournalSettings()">
+        Journal each day
+      </label>
+    </div>
+    <div class="journal-settings">
+      <div class="field">
+        <label for="journalReminderMode">Reminder</label>
+        <select id="journalReminderMode" onchange="saveJournalSettings()">
+          <option value="evening">Evening, 8-10 PM</option>
+          <option value="next_morning">Next morning, about yesterday</option>
+        </select>
+      </div>
+      <div id="journalReminderState" class="journal-reminder muted">Journaling is on by default. Save an entry to clear that day's reminder.</div>
+    </div>
+    <div class="journal-editor">
+      <div class="journal-row">
+        <div class="field"><label for="journalDate">Journal date</label><input id="journalDate" type="date" onchange="loadJournalEntry()"></div>
+        <button type="button" onclick="openJournalDate(todayYmd())">Today</button>
+        <div id="journalStatus" class="muted">Ready.</div>
+      </div>
+      <textarea id="journalText" placeholder="What mattered today? What pulled focus? What should tomorrow remember?" aria-label="Daily journal entry" oninput="markJournalUnsaved()"></textarea>
+      <div class="focus-actions">
+        <button type="button" onclick="saveJournalEntry()">Save journal</button>
+      </div>
+      <div class="journal-task-reminders">
+        <div>
+          <strong>Reminders</strong>
+          <div class="muted">Add a task and a 24-hour time. Local Focus will alert you at that time.</div>
+        </div>
+        <div class="journal-task-form">
+          <div class="field"><label for="journalReminderTask">Task</label><input id="journalReminderTask" placeholder="Reflect on writing progress" aria-label="Reminder task"></div>
+          <div class="field"><label for="journalReminderTime">Time (24 hr)</label><input id="journalReminderTime" inputmode="numeric" pattern="[0-2][0-9]:[0-5][0-9]" placeholder="18:30" aria-label="Reminder time in 24 hour HH:MM format"></div>
+          <button type="button" onclick="addJournalTaskReminder()">Add reminder</button>
+        </div>
+        <div id="journalReminderTaskStatus" class="muted">No reminder added yet.</div>
+        <div id="journalReminderList" class="journal-reminder-list" aria-live="polite"></div>
+      </div>
+    </div>
+  </section>
   <section id="reportsCard" class="control-shell" aria-label="Reports">
     <div>
       <h2>Reports</h2>
@@ -2915,16 +3805,16 @@ button:disabled { cursor:not-allowed; opacity:.55; }
   <section id="devicesCard" class="control-shell" aria-label="Connect to device">
     <div>
       <h2>Connect to device</h2>
-      <div class="muted">All device setup starts from a QR code. Scan it from the phone, tablet, laptop, or receiver browser you want to connect.</div>
+      <div class="muted">All device setup starts from a QR code or copied link. Local Focus does not scan the network for devices.</div>
     </div>
-    <div class="device-pill"><strong>Connect link</strong><br><span id="deviceConnectUrl" class="muted">Loading...</span></div>
+    <div class="device-pill"><strong>QR link</strong><br><span id="deviceConnectUrl" class="muted">Loading...</span></div>
     <div class="device-connect-actions">
       <button type="button" onclick="openDeviceQrPanel('install')">Show QR code</button>
     </div>
     <div id="deviceQrPanel" class="device-qr-panel hidden" aria-live="polite">
       <div>
         <strong>Download or connect with QR</strong>
-        <div class="muted">Choose the device type, then scan the QR code from that device. iPhone cannot install an unsigned local app from QR; it can connect as a receiver.</div>
+        <div class="muted">Choose the device type, then scan the QR code from that device. Only devices that open this QR link can connect.</div>
       </div>
       <div class="qr-type-grid" role="group" aria-label="QR destination">
         <button id="qrInstallButton" type="button" onclick="renderDeviceQr('install')">Any device</button>
@@ -2939,7 +3829,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
           <strong id="deviceQrTitle">Local Focus</strong>
           <p id="deviceQrHint" class="muted"></p>
           <div class="device-qr-url">
-            <span class="muted">If iPhone Camera does not show the QR URL, type this on the iPhone:</span>
+            <span class="muted">If iPhone Camera does not show the QR URL, copy or type this exact link:</span>
             <code id="deviceQrPlainUrl"></code>
             <button type="button" onclick="copyDeviceQrUrl()">Copy URL</button>
           </div>
@@ -2990,6 +3880,9 @@ let editingBlockTarget = '';
 let deviceQrUrls = {};
 let activeDeviceQrKind = 'install';
 let activeFocusSession = null;
+let journalEntryDirty = false;
+let activeJournalDate = '';
+let journalTaskReminders = [];
 const MAX_FOCUS_TARGETS = 15;
 const DEFAULT_ALERT_MESSAGE_TEMPLATE = `You have been outside your focus apps/sites for over {delay}. Allowed: '{targets}'. Current activity: {app}`;
 const fmtTime = seconds => new Date(seconds * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
@@ -3007,6 +3900,7 @@ async function startFocus() {
   refresh();
 }
 async function stopFocus() { await fetch('/api/focus/stop'); refresh(); }
+async function resumeApp() { await fetch('/api/app/resume'); refresh(); }
 async function pauseFocus() { await fetch('/api/focus/pause'); refresh(); }
 async function toggleHighFocusMode() {
   const checkbox = document.querySelector('#highFocusMode');
@@ -3025,6 +3919,156 @@ async function resetReport() {
   await fetch('/api/report/reset');
   closeFocusReport();
   refresh();
+}
+function todayYmd(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+function openJournalDate(date) {
+  const input = document.querySelector('#journalDate');
+  input.value = date || todayYmd();
+  loadJournalEntry();
+}
+async function loadJournalEntry() {
+  const input = document.querySelector('#journalDate');
+  const status = document.querySelector('#journalStatus');
+  const date = input.value || todayYmd();
+  input.value = date;
+  status.textContent = 'Loading journal...';
+  try {
+    const entry = await fetch(`/api/journal/entry?date=${encodeURIComponent(date)}`).then(r => r.json());
+    activeJournalDate = entry.date || date;
+    input.value = activeJournalDate;
+    document.querySelector('#journalText').value = entry.text || '';
+    journalEntryDirty = false;
+    status.textContent = entry.updatedAt ? `Saved for ${activeJournalDate}.` : `No journal saved for ${activeJournalDate}.`;
+  } catch {
+    status.textContent = 'Could not load journal.';
+  }
+}
+async function saveJournalEntry() {
+  const date = document.querySelector('#journalDate').value || todayYmd();
+  const text = document.querySelector('#journalText').value || '';
+  const status = document.querySelector('#journalStatus');
+  status.textContent = 'Saving journal...';
+  try {
+    const entry = await fetch('/api/journal/save', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({date, text})
+    }).then(r => r.json());
+    activeJournalDate = entry.date || date;
+    document.querySelector('#journalDate').value = activeJournalDate;
+    journalEntryDirty = false;
+    status.textContent = `Saved for ${activeJournalDate}.`;
+    refresh();
+  } catch {
+    status.textContent = 'Could not save journal.';
+  }
+}
+async function saveJournalSettings() {
+  const enabled = document.querySelector('#journalEnabled').checked;
+  const reminderMode = document.querySelector('#journalReminderMode').value || 'evening';
+  await fetch(`/api/journal/settings?enabled=${enabled ? '1' : '0'}&reminderMode=${encodeURIComponent(reminderMode)}`);
+  updateJournalControlState({settings: {enabled, reminderMode}, due: false});
+  refresh();
+}
+function markJournalUnsaved() {
+  journalEntryDirty = true;
+  const date = document.querySelector('#journalDate').value || todayYmd();
+  document.querySelector('#journalStatus').textContent = `Unsaved changes for ${date}.`;
+}
+function updateJournalControlState(journal) {
+  const settings = journal?.settings || {enabled: true, reminderMode: 'evening'};
+  const enabled = settings.enabled !== false;
+  const enabledInput = document.querySelector('#journalEnabled');
+  const reminderInput = document.querySelector('#journalReminderMode');
+  const reminderState = document.querySelector('#journalReminderState');
+  enabledInput.checked = enabled;
+  reminderInput.value = settings.reminderMode || 'evening';
+  reminderInput.disabled = !enabled;
+  if (!enabled) {
+    reminderState.className = 'journal-reminder muted';
+    reminderState.textContent = 'Journaling reminders are off. You can still write manually.';
+    return;
+  }
+  if (journal?.due && journal.dueDate) {
+    reminderState.className = 'journal-reminder due';
+    reminderState.innerHTML = `<strong>${escapeHtml(journal.dueLabel || 'Journal')}</strong><br>${escapeHtml(journal.dueMessage || 'Take a few minutes to journal.')}<br><button type="button" onclick="openJournalDate('${escapeTextAttr(journal.dueDate)}')">Open ${escapeHtml(journal.dueLabel || 'journal')}</button>`;
+    return;
+  }
+  reminderState.className = 'journal-reminder muted';
+  reminderState.textContent = settings.reminderMode === 'next_morning'
+    ? 'Reminder is set for the beginning of the next day, about the previous day.'
+    : 'Reminder is set for the evening, between 8 PM and 10 PM.';
+}
+function normalizeReminderTime(value) {
+  const match = String(value || '').trim().match(/^([0-2][0-9]):([0-5][0-9])$/);
+  if (!match) return '';
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour > 23 || minute > 59) return '';
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+async function loadJournalTaskReminders() {
+  try {
+    journalTaskReminders = await fetch('/api/journal/reminders').then(r => r.json());
+  } catch {
+    journalTaskReminders = [];
+  }
+  renderJournalTaskReminders();
+}
+async function addJournalTaskReminder() {
+  const taskInput = document.querySelector('#journalReminderTask');
+  const timeInput = document.querySelector('#journalReminderTime');
+  const status = document.querySelector('#journalReminderTaskStatus');
+  const task = taskInput.value.trim();
+  const time = normalizeReminderTime(timeInput.value);
+  if (!task) {
+    status.textContent = 'Enter a reminder task.';
+    taskInput.focus();
+    return;
+  }
+  if (!time) {
+    status.textContent = 'Enter time as HH:MM in 24-hour format.';
+    timeInput.focus();
+    return;
+  }
+  journalTaskReminders = await fetch('/api/journal/reminders/add', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({task, time})
+  }).then(r => r.json());
+  taskInput.value = '';
+  timeInput.value = '';
+  status.textContent = `Reminder added for ${time}.`;
+  renderJournalTaskReminders();
+}
+async function removeJournalTaskReminder(id) {
+  journalTaskReminders = await fetch(`/api/journal/reminders/remove?id=${encodeURIComponent(id)}`).then(r => r.json());
+  document.querySelector('#journalReminderTaskStatus').textContent = 'Reminder removed.';
+  renderJournalTaskReminders();
+}
+function removeJournalTaskReminderFromButton(button) {
+  removeJournalTaskReminder(button.dataset.id || '');
+}
+function renderJournalTaskReminders() {
+  const list = document.querySelector('#journalReminderList');
+  const status = document.querySelector('#journalReminderTaskStatus');
+  if (!list) return;
+  list.innerHTML = (journalTaskReminders || []).map(reminder => `
+    <span class="journal-reminder-chip">
+      <strong>${escapeHtml(reminder.time || '')}</strong>
+      <span>${escapeHtml(reminder.task || '')}</span>
+      <button type="button" data-id="${escapeTextAttr(reminder.id || '')}" onclick="removeJournalTaskReminderFromButton(this)" aria-label="Remove reminder ${escapeTextAttr(reminder.task || '')}">x</button>
+    </span>
+  `).join('');
+  if (!journalTaskReminders.length) {
+    list.innerHTML = '<div class="muted">No task reminders yet.</div>';
+    if (status) status.textContent = 'No reminder added yet.';
+  }
 }
 async function addBlock() {
   const input = document.querySelector('#blockKeyword');
@@ -3700,6 +4744,8 @@ async function refresh() {
     fetch('/api/report/history').then(r => r.json())
   ]);
   activeFocusSession = state.focus || null;
+  const stopBanner = document.querySelector('#stopBanner');
+  if (stopBanner) stopBanner.style.display = state.stopped ? 'flex' : 'none';
   const totalSeconds = reportTotalSeconds(report);
   document.querySelector('#metrics').innerHTML = `
     <div class="metric"><span class="muted">Total time</span><strong>${formatDuration(totalSeconds)}</strong></div>
@@ -3744,9 +4790,15 @@ async function refresh() {
       <div class="muted">${(r.topApps || []).slice(0, 2).map(app => escapeHtml(`${app.app}${app.source ? ' - ' + app.source : ''}`)).join(', ')}</div>
     </div>`;
   }).join('') || '<div class="muted">No previous reports yet.</div>';
-  updateFocusButtons(state.focus);
+  updateFocusButtons(state.focus, state.stopped);
   seedFocusInputsFromActiveSession(state.focus);
   updateFocusSummary(state.focus);
+  if (state.stopped) {
+    const chip = document.querySelector('#focusState');
+    chip.textContent = 'Stopped';
+    chip.className = 'status-chip paused';
+  }
+  updateJournalControlState(state.journal);
 }
 function updateFocusSummary(focus) {
   const chip = document.querySelector('#focusState');
@@ -3825,19 +4877,22 @@ function seedFocusInputsFromActiveSession(focus) {
   redirectInput.value = focus.redirectApp || '';
   saveFocusDraft();
 }
-function updateFocusButtons(focus) {
+function updateFocusButtons(focus, stopped) {
   const startButton = document.querySelector('#startFocus');
   const pauseButton = document.querySelector('#pauseFocus');
   const stopButton = document.querySelector('#stopFocus');
   const running = Boolean(focus && !focus.paused);
   const paused = Boolean(focus && focus.paused);
   startButton.className = `focus-btn ${running ? 'focus-running' : 'focus-idle'}`;
-  startButton.textContent = paused ? 'Restart focus' : running ? 'Focus' : 'Start focus';
-  pauseButton.disabled = !focus;
+  startButton.textContent = stopped ? 'Start' : paused ? 'Restart focus' : running ? 'Focus' : 'Start focus';
+  pauseButton.disabled = !focus || Boolean(stopped);
   pauseButton.className = `focus-btn ${paused ? 'focus-paused' : running ? 'focus-running' : ''}`;
   pauseButton.textContent = paused ? 'Resume' : 'Pause';
-  stopButton.disabled = !focus;
-  stopButton.className = `focus-btn ${focus ? 'focus-stop-active' : ''}`;
+  // Stop is the master off switch: available whenever the app is running,
+  // even without an active focus session, and disabled once already stopped.
+  stopButton.disabled = Boolean(stopped);
+  stopButton.className = `focus-btn ${stopped ? '' : 'focus-stop-active'}`;
+  stopButton.title = 'Stop all tracking, blocking, alerts, and reminders until you resume';
 }
 function sourceMarkup(source, index) {
   const shortSource = shortenSource(source);
@@ -3890,6 +4945,8 @@ function escapeTextAttr(value) {
 }
 restoreFocusDraft();
 syncBlockMode();
+openJournalDate(todayYmd());
+loadJournalTaskReminders();
 activeReportWeek = isoWeekNumber(selectedReportDate);
 renderReportCalendar();
 setFocusTaskWindow('day', calendarPeriodWindow('day', selectedReportDate));
@@ -3934,7 +4991,7 @@ code {{ overflow-wrap:anywhere; }}
 <main>
   <section>
     <h1>Connect Local Focus</h1>
-    <p class="muted">Choose this device type from the QR page. Android and Mac can download installers; iPhone/iPad connects as a receiver unless the app is installed through Xcode, TestFlight, or the App Store.</p>
+    <p class="muted">This QR page connects only the device that opens this exact link. Local Focus does not scan for nearby devices.</p>
     <p><code>{lan_url}</code></p>
   </section>
   <section>
@@ -3989,7 +5046,7 @@ button { background:var(--good); color:white; font-weight:800; cursor:pointer; }
 <main>
   <section>
     <h1>Local Focus Device</h1>
-    <p class="muted">Connect this phone, TV, tablet, or laptop to receive Local Focus alerts. Browser devices use a service worker for OS-style notifications; laptops/desktops running Local Focus use native OS notifications.</p>
+    <p class="muted">Connect this phone, TV, tablet, or laptop from the QR link to receive Local Focus alerts. Local Focus does not scan for nearby devices.</p>
   </section>
   <section>
     <h2>Connect device</h2>
@@ -4146,7 +5203,7 @@ fn data_dir() -> io::Result<PathBuf> {
     }
 }
 
-fn ensure_config(data_dir: &PathBuf) -> io::Result<()> {
+fn ensure_config(data_dir: &Path) -> io::Result<()> {
     let path = data_dir.join("config.txt");
     if path.exists() {
         return Ok(());
@@ -4160,7 +5217,7 @@ devices=\n",
     )
 }
 
-fn load_config(data_dir: &PathBuf) -> io::Result<Config> {
+fn load_config(data_dir: &Path) -> io::Result<Config> {
     let mut config = Config::default();
     let path = data_dir.join("config.txt");
     let content = fs::read_to_string(path)?;
@@ -4233,7 +5290,7 @@ fn parse_block_rule_record(record: &str) -> BlockRule {
     }
 }
 
-fn save_config(data_dir: &PathBuf, config: &Config) -> io::Result<()> {
+fn save_config(data_dir: &Path, config: &Config) -> io::Result<()> {
     fs::write(
         data_dir.join("config.txt"),
         format!(
@@ -4246,7 +5303,7 @@ fn save_config(data_dir: &PathBuf, config: &Config) -> io::Result<()> {
     )
 }
 
-fn save_focus(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<()> {
+fn save_focus(data_dir: &Path, focus: &FocusSession) -> io::Result<()> {
     let paused_at = focus
         .paused_at
         .map(|value| value.to_string())
@@ -4276,7 +5333,7 @@ fn save_focus(data_dir: &PathBuf, focus: &FocusSession) -> io::Result<()> {
     )
 }
 
-fn load_focus(data_dir: &PathBuf) -> Option<FocusSession> {
+fn load_focus(data_dir: &Path) -> Option<FocusSession> {
     let value = fs::read_to_string(data_dir.join("focus.json")).ok()?;
     Some(FocusSession {
         task: json_string(&value, "task")?,
@@ -4299,7 +5356,7 @@ fn load_focus(data_dir: &PathBuf) -> Option<FocusSession> {
     })
 }
 
-fn clear_focus(data_dir: &PathBuf) -> io::Result<()> {
+fn clear_focus(data_dir: &Path) -> io::Result<()> {
     let path = data_dir.join("focus.json");
     if path.exists() {
         fs::remove_file(path)?;
@@ -4464,7 +5521,7 @@ fn normalize_device_kind(kind: &str) -> String {
 fn format_device_record_selected(name: &str, kind: &str, endpoint: &str, selected: bool) -> String {
     format!(
         "{}|{}|{}|{}",
-        name.trim().replace('|', " "),
+        name.trim().replace(['|', ','], " "),
         normalize_device_kind(kind),
         normalize_device_endpoint(endpoint),
         if selected { "selected" } else { "off" }
@@ -4710,7 +5767,7 @@ fn prompt_for_block_password(rule: &BlockRule, message: &str) -> bool {
                 .to_string();
             return answer == rule.password;
         }
-        return false;
+        false
     }
 
     #[cfg(target_os = "windows")]
@@ -4740,6 +5797,12 @@ fn prompt_for_block_password(rule: &BlockRule, message: &str) -> bool {
             .output()
             .ok()
             .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == rule.password);
+    }
+
+    // Other platforms (e.g. Android) enforce password blocks in the native layer.
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        false
     }
 }
 
@@ -5025,6 +6088,13 @@ fn os_alert_blocking(title: &str, message: &str) -> bool {
             .status()
             .is_ok_and(|status| status.success());
     }
+
+    // Other platforms (e.g. Android) raise alerts through the native layer.
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        let _ = (title, message);
+        false
+    }
 }
 
 fn activate_app(app_name: &str) -> io::Result<()> {
@@ -5091,8 +6161,7 @@ fn activate_app(app_name: &str) -> io::Result<()> {
         }
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::Other,
+    Err(io::Error::other(
         "could not activate app",
     ))
 }
@@ -5117,22 +6186,31 @@ fn request_value(params: &HashMap<String, String>, body: &str, key: &str) -> Opt
 }
 
 fn percent_decode(value: &str) -> String {
-    let mut result = String::new();
+    // Decode at the byte level and interpret the result as UTF-8, so multi-byte
+    // characters (accents, emoji, CJK) survive instead of being mangled by a
+    // byte-to-char cast.
+    let mut bytes = Vec::with_capacity(value.len());
     let mut chars = value.as_bytes().iter().copied();
     while let Some(byte) = chars.next() {
         match byte {
-            b'+' => result.push(' '),
+            b'+' => bytes.push(b' '),
             b'%' => {
                 let hi = chars.next().unwrap_or(b'0');
                 let lo = chars.next().unwrap_or(b'0');
-                if let Ok(hex) = u8::from_str_radix(&format!("{}{}", hi as char, lo as char), 16) {
-                    result.push(hex as char);
+                if let Ok(decoded) =
+                    u8::from_str_radix(&format!("{}{}", hi as char, lo as char), 16)
+                {
+                    bytes.push(decoded);
+                } else {
+                    bytes.push(byte);
+                    bytes.push(hi);
+                    bytes.push(lo);
                 }
             }
-            _ => result.push(byte as char),
+            other => bytes.push(other),
         }
     }
-    result
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn url_encode(value: &str) -> String {
@@ -5149,17 +6227,20 @@ fn url_encode(value: &str) -> String {
 }
 
 fn json_escape(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|c| match c {
-            '\\' => "\\\\".chars().collect::<Vec<_>>(),
-            '"' => "\\\"".chars().collect(),
-            '\n' => "\\n".chars().collect(),
-            '\r' => "\\r".chars().collect(),
-            '\t' => "\\t".chars().collect(),
-            _ => vec![c],
-        })
-        .collect()
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            // Remaining control characters must be \u-escaped to stay valid JSON.
+            c if (c as u32) < 0x20 => escaped.push_str(&format!("\\u{:04x}", c as u32)),
+            c => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 fn html_attr_escape(value: &str) -> String {
@@ -5176,12 +6257,36 @@ fn html_attr_escape(value: &str) -> String {
         .collect()
 }
 
+/// Find the byte offset just past `"key":` for a key that sits at a value
+/// boundary (preceded by `{`, `,`, or whitespace), so a key name appearing as a
+/// substring of another key does not produce a false match.
+fn json_value_start(value: &str, key: &str) -> Option<usize> {
+    let marker = format!("\"{key}\":");
+    let mut search_from = 0;
+    while let Some(rel) = value[search_from..].find(&marker) {
+        let pos = search_from + rel;
+        let preceded_ok = pos == 0
+            || matches!(
+                value.as_bytes()[pos - 1],
+                b'{' | b',' | b' ' | b'\t' | b'\n' | b'\r'
+            );
+        if preceded_ok {
+            return Some(pos + marker.len());
+        }
+        search_from = pos + marker.len();
+    }
+    None
+}
+
 fn json_string(value: &str, key: &str) -> Option<String> {
-    let marker = format!("\"{key}\":\"");
-    let start = value.find(&marker)? + marker.len();
+    let start = json_value_start(value, key)?;
+    let mut chars = value[start..].trim_start().chars();
+    if chars.next()? != '"' {
+        return None;
+    }
     let mut result = String::new();
     let mut escaped = false;
-    for c in value[start..].chars() {
+    for c in chars {
         if escaped {
             result.push(match c {
                 'n' => '\n',
@@ -5202,9 +6307,9 @@ fn json_string(value: &str, key: &str) -> Option<String> {
 }
 
 fn json_number(value: &str, key: &str) -> Option<i64> {
-    let marker = format!("\"{key}\":");
-    let start = value.find(&marker)? + marker.len();
+    let start = json_value_start(value, key)?;
     let number = value[start..]
+        .trim_start()
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '-')
         .collect::<String>();
@@ -5212,8 +6317,7 @@ fn json_number(value: &str, key: &str) -> Option<i64> {
 }
 
 fn json_bool(value: &str, key: &str) -> Option<bool> {
-    let marker = format!("\"{key}\":");
-    let start = value.find(&marker)? + marker.len();
+    let start = json_value_start(value, key)?;
     let tail = value[start..].trim_start();
     if tail.starts_with("true") {
         Some(true)
@@ -5400,6 +6504,143 @@ mod tests {
         assert_eq!(values.len(), MAX_FOCUS_TARGETS);
         assert_eq!(values.first().map(String::as_str), Some("App1"));
         assert_eq!(values.last().map(String::as_str), Some("App15"));
+    }
+
+    #[test]
+    fn journal_settings_default_to_enabled_evening() {
+        let dir = temp_test_dir("journal-settings");
+
+        let settings = load_journal_settings(&dir).expect("journal settings");
+
+        assert!(settings.enabled);
+        assert_eq!(settings.reminder_mode, "evening");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn journal_entry_keeps_latest_saved_text() {
+        let dir = temp_test_dir("journal-entry");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        save_journal_entry(&dir, "2026-06-05", "First").expect("save first");
+        save_journal_entry(&dir, "2026-06-05", "Second\nwith detail").expect("save second");
+        let entry = journal_entry_for_date(&dir, "2026-06-05")
+            .expect("load entry")
+            .expect("entry exists");
+
+        assert_eq!(entry.0, "Second\nwith detail");
+        assert!(journal_entry_exists(&dir, "2026-06-05"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn journal_date_accepts_iso_day_only() {
+        assert_eq!(
+            clean_journal_date("2026-06-05").as_deref(),
+            Some("2026-06-05")
+        );
+        assert!(clean_journal_date("2026/06/05").is_none());
+        assert!(clean_journal_date("June 5").is_none());
+    }
+
+    #[test]
+    fn journal_reminder_time_accepts_24_hour_hhmm_only() {
+        assert_eq!(clean_reminder_time("00:00").as_deref(), Some("00:00"));
+        assert_eq!(clean_reminder_time("23:59").as_deref(), Some("23:59"));
+        assert!(clean_reminder_time("24:00").is_none());
+        assert!(clean_reminder_time("7:30").is_none());
+        assert!(clean_reminder_time("07:60").is_none());
+    }
+
+    #[test]
+    fn journal_task_reminders_can_be_added_and_removed() {
+        let dir = temp_test_dir("journal-task-reminder");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let reminder = add_journal_task_reminder(&dir, "Plan tomorrow", "18:30")
+            .expect("add reminder")
+            .expect("valid reminder");
+        let reminders = load_journal_task_reminders(&dir).expect("load reminders");
+
+        assert_eq!(reminders.len(), 1);
+        assert_eq!(reminders[0].time, "18:30");
+        assert_eq!(reminders[0].task, "Plan tomorrow");
+        assert!(remove_journal_task_reminder(&dir, &reminder.id).expect("remove reminder"));
+        assert!(load_journal_task_reminders(&dir)
+            .expect("reload reminders")
+            .is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn percent_decode_preserves_utf8() {
+        // "café 🚀" percent-encoded.
+        assert_eq!(percent_decode("caf%C3%A9+%F0%9F%9A%80"), "café 🚀");
+        assert_eq!(percent_decode("plain"), "plain");
+    }
+
+    #[test]
+    fn json_escape_escapes_control_characters() {
+        assert_eq!(json_escape("a\u{0007}b"), "a\\u0007b");
+        assert_eq!(json_escape("tab\tnewline\n"), "tab\\tnewline\\n");
+        assert_eq!(json_escape("quote\"slash\\"), "quote\\\"slash\\\\");
+    }
+
+    #[test]
+    fn json_value_lookup_ignores_key_substrings_and_boundaries() {
+        let line = "{\"task\":\"write\",\"startedAt\":42,\"highFocusMode\":true}";
+        assert_eq!(json_string(line, "task").as_deref(), Some("write"));
+        assert_eq!(json_number(line, "startedAt"), Some(42));
+        assert_eq!(json_bool(line, "highFocusMode"), Some(true));
+        // A key that only appears as a substring of another key must not match.
+        let tricky = "{\"xtask\":\"nope\"}";
+        assert_eq!(json_string(tricky, "task"), None);
+    }
+
+    #[test]
+    fn remote_requests_are_limited_to_device_endpoints() {
+        assert!(remote_path_allowed("/device"));
+        assert!(remote_path_allowed("/device-sw.js"));
+        assert!(remote_path_allowed("/connect"));
+        assert!(remote_path_allowed("/api/mobile/activity"));
+        assert!(remote_path_allowed("/download/local-focus-mobile.apk"));
+        assert!(!remote_path_allowed("/"));
+        assert!(!remote_path_allowed("/api/timeline"));
+        assert!(!remote_path_allowed("/api/journal/entry"));
+        assert!(!remote_path_allowed("/api/state"));
+    }
+
+    #[test]
+    fn mutation_paths_are_flagged_for_csrf_checks() {
+        assert!(is_mutation_path("/api/focus/start"));
+        assert!(is_mutation_path("/api/block/add"));
+        assert!(is_mutation_path("/api/journal/save"));
+        assert!(!is_mutation_path("/api/focus-sessions"));
+        assert!(!is_mutation_path("/api/timeline"));
+        assert!(!is_mutation_path("/api/state"));
+    }
+
+    #[test]
+    fn cross_site_detection_uses_fetch_metadata_and_origin() {
+        let same_origin = "GET /api/focus/stop HTTP/1.1\r\nHost: 127.0.0.1:4799\r\nSec-Fetch-Site: same-origin\r\n\r\n";
+        let cross_site = "GET /api/focus/stop HTTP/1.1\r\nHost: 127.0.0.1:4799\r\nSec-Fetch-Site: cross-site\r\n\r\n";
+        let native = "POST /api/mobile/activity HTTP/1.1\r\nHost: 127.0.0.1:4799\r\n\r\n";
+        let cross_origin =
+            "GET /x HTTP/1.1\r\nHost: 127.0.0.1:4799\r\nOrigin: http://evil.test\r\n\r\n";
+        assert!(!request_is_cross_site(same_origin));
+        assert!(request_is_cross_site(cross_site));
+        assert!(!request_is_cross_site(native));
+        assert!(request_is_cross_site(cross_origin));
+    }
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "local-focus-{name}-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
     }
 }
 
