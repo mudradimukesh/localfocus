@@ -10,6 +10,7 @@ import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
@@ -26,6 +27,21 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName).setMethodCallHandler { call, result ->
             when (call.method) {
                 "deviceName" -> result.success(Build.MODEL ?: "Android phone")
+                "serverUrl" -> result.success(EmbeddedServer.BASE_URL)
+                "startServer" -> {
+                    EmbeddedServer.start(applicationContext)
+                    result.success(true)
+                }
+                "serverReady" -> result.success(EmbeddedServer.ready())
+                "accessibilityEnabled" -> result.success(accessibilityEnabled())
+                "openAccessibilitySettings" -> {
+                    startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                    result.success(null)
+                }
+                "requestBatteryExemption" -> {
+                    requestBatteryExemption()
+                    result.success(null)
+                }
                 "usageAccessGranted" -> result.success(usageAccessGranted())
                 "requestUsageAccess" -> {
                     startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
@@ -59,6 +75,33 @@ class MainActivity : FlutterActivity() {
                 }
                 else -> result.notImplemented()
             }
+        }
+    }
+
+    private fun accessibilityEnabled(): Boolean {
+        val enabled = Settings.Secure.getString(
+            contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ) ?: return false
+        return enabled.split(':').any { entry ->
+            entry.contains("$packageName/", ignoreCase = true) &&
+                entry.endsWith("LocalFocusAccessibilityService", ignoreCase = true)
+        }
+    }
+
+    private fun requestBatteryExemption() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (powerManager.isIgnoringBatteryOptimizations(packageName)) return
+        try {
+            startActivity(
+                Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        } catch (_: Exception) {
+            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
         }
     }
 

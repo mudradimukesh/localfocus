@@ -138,7 +138,7 @@ class PhoneTrackingService : Service() {
         }
             .setSmallIcon(android.R.drawable.ic_menu_recent_history)
             .setContentTitle("Local Focus is tracking this phone")
-            .setContentText("Phone activity is staying on your local Wi-Fi.")
+            .setContentText("Phone activity is sent only to the QR-connected Local Focus laptop.")
             .setOngoing(true)
             .build()
     }

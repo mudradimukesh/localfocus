@@ -1,8 +1,8 @@
 # Local Focus Mobile Companion
 
-Local Focus can run the same focus logic with phones and tablets by using the desktop app as the private local hub. The phone app tracks its own activity with native OS permissions, posts samples to the laptop, and polls for focus alerts from the laptop over the same Wi-Fi network.
+Local Focus can run the same focus logic with phones and tablets by using the desktop app as the private local hub. The phone app tracks its own activity with native OS permissions, posts samples to the laptop, and polls for focus alerts through the QR-provided Local Focus link.
 
-No cloud service is required for same-Wi-Fi operation.
+No cloud service or network device discovery is required. Devices connect only after opening the QR link or entering that exact Local Focus URL.
 
 The installable Flutter phone app lives in:
 
@@ -73,7 +73,7 @@ Practical options:
 
 - Use Apple Screen Time APIs, such as Family Controls and Device Activity, for app and category monitoring.
 - Use local notifications for receiver alerts.
-- Use Local Network privacy permission so the phone can talk to the laptop at `http://<laptop-ip>:4799`.
+- Use Local Network privacy permission so the phone can open the QR-provided laptop link at `http://<laptop-ip>:4799`. The app does not scan for nearby devices.
 - For precise Safari URL tracking, iOS is intentionally restrictive; this usually needs a Safari extension, managed-device policy, or a local DNS/VPN-style approach.
 
 ## Receiver-Only Mode

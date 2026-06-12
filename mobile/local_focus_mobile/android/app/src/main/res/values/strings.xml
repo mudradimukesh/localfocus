@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_description">Local Focus uses this to block distracting apps you have added to your block list. It checks which app is in the foreground and returns you to the home screen when a blocked app opens. No data leaves your phone.</string>
+</resources>

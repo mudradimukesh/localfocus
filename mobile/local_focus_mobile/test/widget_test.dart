@@ -1,16 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:local_focus_mobile/main.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
-  TestWidgetsFlutterBinding.ensureInitialized();
-
-  testWidgets('Local Focus mobile shell renders', (WidgetTester tester) async {
-    SharedPreferences.setMockInitialValues({});
-
-    await tester.pumpWidget(const LocalFocusMobileApp());
+  testWidgets('Local Focus shell shows the boot screen first', (WidgetTester tester) async {
+    await tester.pumpWidget(const LocalFocusApp());
     expect(find.byType(MaterialApp), findsOneWidget);
+    // Before the embedded server is ready the boot screen shows a spinner.
     expect(find.byType(CircularProgressIndicator), findsOneWidget);
   });
 }
