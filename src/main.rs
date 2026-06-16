@@ -2199,12 +2199,14 @@ fn write_forbidden(stream: &mut TcpStream, message: &str) -> io::Result<()> {
     )
 }
 
-/// Endpoints reachable from other machines on the LAN: only the device-companion
-/// surface (receiver pages, QR images, downloads, and the mobile/native APIs).
-/// Everything else — dashboard, timeline, reports, journal, focus/block control —
-/// stays restricted to loopback.
+/// Endpoints reachable from other machines on the LAN: the device-companion
+/// surface (receiver pages, QR images, downloads, mobile/native APIs) plus the
+/// endpoints the phone companion needs — view state/reports and drive focus
+/// sessions. The most sensitive surface stays loopback-only: the full dashboard,
+/// the raw activity timeline, the journal, block management, report
+/// history/reset, and the master stop/resume.
 fn remote_path_allowed(route: &str) -> bool {
-    const ALLOWED_PREFIXES: [&str; 8] = [
+    let prefixes = [
         "/api/mobile/register",
         "/api/mobile/activity",
         "/api/device/register",
@@ -2213,9 +2215,16 @@ fn remote_path_allowed(route: &str) -> bool {
         "/api/qr.svg",
         "/connect",
         "/download/",
+        // Phone companion: control focus sessions and read focus reports.
+        "/api/focus/",
+        "/api/focus-report",
+        "/api/focus-sessions",
     ];
     // `/device`, `/device-sw.js`, and `/device-manifest.json` all share this prefix.
-    route.starts_with("/device") || ALLOWED_PREFIXES.iter().any(|prefix| route.starts_with(prefix))
+    route.starts_with("/device")
+        || route == "/api/state"
+        || route == "/api/report"
+        || prefixes.iter().any(|prefix| route.starts_with(prefix))
 }
 
 /// State-changing endpoints that must reject cross-site browser requests.
@@ -6598,16 +6607,28 @@ mod tests {
     }
 
     #[test]
-    fn remote_requests_are_limited_to_device_endpoints() {
+    fn remote_requests_are_limited_to_device_and_companion_endpoints() {
+        // Device-companion surface.
         assert!(remote_path_allowed("/device"));
         assert!(remote_path_allowed("/device-sw.js"));
         assert!(remote_path_allowed("/connect"));
         assert!(remote_path_allowed("/api/mobile/activity"));
         assert!(remote_path_allowed("/download/local-focus-mobile.apk"));
+        // Phone companion: state, reports, and focus control.
+        assert!(remote_path_allowed("/api/state"));
+        assert!(remote_path_allowed("/api/report"));
+        assert!(remote_path_allowed("/api/focus/start"));
+        assert!(remote_path_allowed("/api/focus/stop"));
+        assert!(remote_path_allowed("/api/focus-report"));
+        assert!(remote_path_allowed("/api/focus-sessions"));
+        // Sensitive surface stays loopback-only.
         assert!(!remote_path_allowed("/"));
         assert!(!remote_path_allowed("/api/timeline"));
         assert!(!remote_path_allowed("/api/journal/entry"));
-        assert!(!remote_path_allowed("/api/state"));
+        assert!(!remote_path_allowed("/api/report/history"));
+        assert!(!remote_path_allowed("/api/report/reset"));
+        assert!(!remote_path_allowed("/api/block/add"));
+        assert!(!remote_path_allowed("/api/app/resume"));
     }
 
     #[test]
