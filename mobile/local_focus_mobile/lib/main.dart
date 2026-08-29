@@ -15,7 +15,6 @@ import 'package:webview_flutter/webview_flutter.dart';
 import 'companion_app.dart';
 
 const MethodChannel _native = MethodChannel('local_focus/native');
-const Color _accent = Color(0xFF355C7D);
 
 Future<T?> _invoke<T>(String method, [Map<String, dynamic>? args]) async {
   try {
@@ -25,8 +24,9 @@ Future<T?> _invoke<T>(String method, [Map<String, dynamic>? args]) async {
   }
 }
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await loadFocusTemplate();
   // Android runs the full standalone experience (embedded server + on-device
   // dashboard + tracking + blocking). iOS cannot run the embedded server or
   // monitor other apps, so it falls back to the Mac companion.
@@ -42,16 +42,18 @@ class LocalFocusApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Local Focus',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(colorSchemeSeed: _accent, useMaterial3: true),
-      darkTheme: ThemeData(
-        colorSchemeSeed: _accent,
-        brightness: Brightness.dark,
-        useMaterial3: true,
-      ),
-      home: const HomePage(),
+    return ValueListenableBuilder<FocusTemplate>(
+      valueListenable: focusTemplate,
+      builder: (context, template, _) {
+        return MaterialApp(
+          title: 'Local Focus',
+          debugShowCheckedModeBanner: false,
+          themeMode: focusThemeMode(template),
+          theme: buildLocalFocusTheme(template, Brightness.light),
+          darkTheme: buildLocalFocusTheme(template, Brightness.dark),
+          home: const HomePage(),
+        );
+      },
     );
   }
 }

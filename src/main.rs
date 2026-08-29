@@ -1,5 +1,3 @@
-use qrcode::render::svg;
-use qrcode::QrCode;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -17,6 +15,8 @@ const DISTRACTION_SECONDS: i64 = 90;
 const BLOCK_COOLDOWN_SECONDS: i64 = 10;
 const DEVICE_NOTIFY_COOLDOWN_SECONDS: i64 = 60;
 const DEFAULT_ALERT_DELAY_SECONDS: u64 = 60;
+// The "move to app" action has its own, usually longer, timer than the alert.
+const DEFAULT_ACTION_DELAY_SECONDS: u64 = 120;
 const DEFAULT_ALERT_MESSAGE_TEMPLATE: &str = "You have been outside your focus apps/sites for over {delay}. Allowed: '{targets}'. Current activity: {app}";
 const IDLE_SECONDS: u64 = 60;
 const MAX_FOCUS_TARGETS: usize = 15;
@@ -53,6 +53,7 @@ struct FocusSession {
     paused_total_seconds: i64,
     pomodoro_alerted_at: Option<i64>,
     alert_delay_seconds: u64,
+    action_delay_seconds: u64,
     alert_action: String,
     alert_message: String,
     redirect_app: String,
@@ -66,6 +67,9 @@ struct AppState {
     last_distraction_at: i64,
     last_focus_mismatch_at: i64,
     focus_mismatch_started_at: Option<i64>,
+    // When the "move to app" action last fired, so it repeats on its own
+    // interval (like the alert) rather than only once per streak.
+    last_focus_action_at: i64,
     last_blocked_at: i64,
     last_blocked_key: String,
     last_device_notify_at: i64,
@@ -73,6 +77,11 @@ struct AppState {
     // Master switch. When true, the whole app is stopped: no tracking, blocking,
     // alerts, device notifications, or journal reminders until it is resumed.
     stopped: bool,
+    // Last time each "browser:" receiver device was seen (registered or
+    // polled `/api/device/events`). Not persisted — a fresh browser tab
+    // always re-registers with a new endpoint, so entries that stop being
+    // seen are dead and get pruned; see `prune_stale_browser_devices`.
+    browser_last_seen: HashMap<String, i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,11 +234,13 @@ fn run_app(data_dir: PathBuf) -> io::Result<()> {
         last_distraction_at: 0,
         last_focus_mismatch_at: 0,
         focus_mismatch_started_at: None,
+        last_focus_action_at: 0,
         last_blocked_at: 0,
         last_blocked_key: String::new(),
         last_device_notify_at: 0,
         last_device_notify_key: String::new(),
         stopped: false,
+        browser_last_seen: HashMap::new(),
     }));
 
     {
@@ -275,7 +286,7 @@ fn run_app(data_dir: PathBuf) -> io::Result<()> {
     let listener = TcpListener::bind("0.0.0.0:4799")?;
     println!("Local Focus is running at http://127.0.0.1:4799");
     if let Some(url) = local_network_url() {
-        println!("Device QR receiver URL: {url}/device");
+        println!("Device receiver URL: {url}/device");
     }
     println!("Data stays on this machine: {}", data_dir.display());
 
@@ -304,17 +315,21 @@ fn run_tracker(data_dir: PathBuf) -> io::Result<()> {
         last_distraction_at: 0,
         last_focus_mismatch_at: 0,
         focus_mismatch_started_at: None,
+        last_focus_action_at: 0,
         last_blocked_at: 0,
         last_blocked_key: String::new(),
         last_device_notify_at: 0,
         last_device_notify_key: String::new(),
         stopped: false,
+        browser_last_seen: HashMap::new(),
     }));
     tracking_loop(data_dir, state)
 }
 
 fn tracking_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<()> {
     loop {
+        prune_disconnected_browser_devices(&data_dir, &state)?;
+
         // Master switch: when stopped, do nothing — no sampling, no blocking,
         // no alerts — until the app is resumed.
         let (config, focus) = {
@@ -454,6 +469,7 @@ fn start_focus(
         paused_total_seconds: 0,
         pomodoro_alerted_at: None,
         alert_delay_seconds: DEFAULT_ALERT_DELAY_SECONDS,
+        action_delay_seconds: DEFAULT_ACTION_DELAY_SECONDS,
         alert_action: "alert".into(),
         alert_message: DEFAULT_ALERT_MESSAGE_TEMPLATE.into(),
         redirect_app: String::new(),
@@ -477,6 +493,26 @@ fn start_focus(
     Ok(())
 }
 
+/// Whether a focus warning should move the user to the redirect app (the
+/// "Move to app" warning action) rather than just showing an alert. Both the
+/// focus-mismatch and distraction paths use this so the action behaves the same.
+fn focus_alert_switches_app(alert_action: &str, redirect_app: &str) -> bool {
+    alert_action == "switch" && !redirect_app.trim().is_empty()
+}
+
+/// Whether the "move to app" action should fire now. The action has its own
+/// timer (separate from the alert) and repeats on its own interval: it must be
+/// enabled, the user must have been off-focus at least as long as the action
+/// delay, and at least one action interval must have passed since the last move.
+fn should_move_to_app(
+    off_focus_seconds: i64,
+    action_delay: i64,
+    since_last_action: i64,
+    switch_enabled: bool,
+) -> bool {
+    switch_enabled && off_focus_seconds >= action_delay && since_last_action >= action_delay
+}
+
 fn detect_distraction(
     data_dir: &Path,
     state: &Arc<Mutex<AppState>>,
@@ -493,6 +529,10 @@ fn detect_distraction(
         return Ok(());
     }
 
+    // Activity reported by a phone/companion should alert that device, not pop a
+    // dialog on this Mac. Local foreground activity still alerts here.
+    let sample_is_remote = sample.source.starts_with("mobile:");
+
     let distracting = sample.category == "distracting";
     let enough_time = sample.timestamp - guard.last_distraction_at >= DISTRACTION_SECONDS;
     let focus_mismatch = guard
@@ -502,11 +542,19 @@ fn detect_distraction(
         .is_some_and(|focus| !matches_focus_target(focus, sample));
 
     if focused && focus_mismatch {
-        let alert_delay = guard
+        let (alert_delay, action_delay) = guard
             .focus
             .as_ref()
-            .map(|focus| focus.alert_delay_seconds.max(1) as i64)
-            .unwrap_or(DEFAULT_ALERT_DELAY_SECONDS as i64);
+            .map(|focus| {
+                (
+                    focus.alert_delay_seconds.max(1) as i64,
+                    focus.action_delay_seconds.max(1) as i64,
+                )
+            })
+            .unwrap_or((
+                DEFAULT_ALERT_DELAY_SECONDS as i64,
+                DEFAULT_ACTION_DELAY_SECONDS as i64,
+            ));
         let mismatch_started_at = match guard.focus_mismatch_started_at {
             Some(started_at) => started_at,
             None => {
@@ -514,21 +562,58 @@ fn detect_distraction(
                 sample.timestamp
             }
         };
-        let mismatch_duration = sample.timestamp - mismatch_started_at;
+        let off_focus_seconds = sample.timestamp - mismatch_started_at;
         let alert_cooldown_passed = sample.timestamp - guard.last_focus_mismatch_at >= alert_delay;
 
-        if mismatch_duration >= alert_delay && alert_cooldown_passed {
+        // 1) Alert: a warning message after the warn time, repeating every warn
+        //    time while the user stays off-focus. Independent of the action.
+        if off_focus_seconds >= alert_delay && alert_cooldown_passed {
             let focus = guard.focus.as_ref().expect("focus checked above");
             let message = focus_alert_message(focus, sample);
-            if focus.alert_action == "switch" && !focus.redirect_app.trim().is_empty() {
-                os_alert_then_activate("Focus warning", &message, &focus.redirect_app);
-            } else {
+            let devices = selected_network_devices(&guard.config.network_devices);
+            if !devices.is_empty() {
+                send_device_notifications(&devices, "focus_target_mismatch", &message, sample);
+                append_device_notification(
+                    data_dir,
+                    "focus_target_mismatch",
+                    &message,
+                    sample,
+                    &devices,
+                )?;
+            }
+            if !sample_is_remote {
                 os_alert("Focus warning", &message);
             }
             guard.last_focus_mismatch_at = sample.timestamp;
             append_event(data_dir, "focus_target_mismatch", &message)?;
         }
+
+        // 2) Action: its own timer. Move the user to the redirect app once
+        //    off-focus past the action time, then repeat every action interval.
+        let action_cooldown = sample.timestamp - guard.last_focus_action_at;
+        let (switch_enabled, redirect_app) = guard
+            .focus
+            .as_ref()
+            .map(|focus| {
+                (
+                    focus_alert_switches_app(&focus.alert_action, &focus.redirect_app),
+                    focus.redirect_app.clone(),
+                )
+            })
+            .unwrap_or((false, String::new()));
+        if !sample_is_remote
+            && should_move_to_app(off_focus_seconds, action_delay, action_cooldown, switch_enabled)
+        {
+            os_alert_then_activate(
+                "Time to refocus",
+                &format!("Moving you to {redirect_app} to get back on task."),
+                &redirect_app,
+            );
+            guard.last_focus_action_at = sample.timestamp;
+            append_event(data_dir, "focus_action_moved", &redirect_app)?;
+        }
     } else {
+        // Back on a focus target: reset the off-focus streak.
         guard.focus_mismatch_started_at = None;
     }
 
@@ -542,7 +627,9 @@ fn detect_distraction(
             "You are in focus mode for {task}. Current activity: {}",
             sample.app
         );
-        os_alert("Distraction warning", &message);
+        if !sample_is_remote {
+            os_alert("Distraction warning", &message);
+        }
         guard.last_distraction_at = sample.timestamp;
         append_event(data_dir, "distraction_alert", &message)?;
     }
@@ -851,7 +938,12 @@ fn notify_devices_for_attention_event(
                 normalize_match_text(&sample.source)
             ),
             format!(
-                "Distracted activity detected on this machine: {} - {}",
+                "Distracted activity detected {}: {} - {}",
+                if sample.source.starts_with("mobile:") {
+                    "on your phone"
+                } else {
+                    "on this machine"
+                },
                 sample.app,
                 blocked_activity_label(sample)
             ),
@@ -1572,6 +1664,11 @@ fn handle_http(
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(DEFAULT_ALERT_DELAY_SECONDS)
             .clamp(10, 60 * 60);
+        let action_delay_seconds = params
+            .get("actionSeconds")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_ACTION_DELAY_SECONDS)
+            .clamp(10, 60 * 60);
         let alert_action = params
             .get("alertAction")
             .filter(|action| action.as_str() == "switch")
@@ -1595,6 +1692,7 @@ fn handle_http(
             paused_total_seconds: 0,
             pomodoro_alerted_at: None,
             alert_delay_seconds,
+            action_delay_seconds,
             alert_action,
             alert_message,
             redirect_app,
@@ -1618,6 +1716,62 @@ fn handle_http(
             &format!("{} minutes: {}{}", minutes, session.task, target_note),
         );
         write_response(&mut stream, "application/json", "{\"ok\":true}")?;
+    } else if path.starts_with("/api/focus/update") {
+        // Edit an active session in place, preserving its running timer and
+        // pause state (unlike /start, which begins a fresh session).
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let updated = {
+            let mut guard = lock_state(&state);
+            if let Some(mut focus) = guard.focus.clone() {
+                if let Some(task) = params.get("task").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    focus.task = task.to_string();
+                }
+                if let Some(target) = params.get("target") {
+                    focus.target = normalize_focus_target_text(target);
+                }
+                if let Some(minutes) = params.get("minutes").and_then(|v| v.parse().ok()) {
+                    focus.duration_minutes = minutes;
+                }
+                if let Some(seconds) = params.get("alertSeconds").and_then(|v| v.parse::<u64>().ok())
+                {
+                    focus.alert_delay_seconds = seconds.clamp(10, 60 * 60);
+                }
+                if let Some(seconds) = params.get("actionSeconds").and_then(|v| v.parse::<u64>().ok())
+                {
+                    focus.action_delay_seconds = seconds.clamp(10, 60 * 60);
+                }
+                if let Some(action) = params.get("alertAction") {
+                    focus.alert_action = if action == "switch" {
+                        "switch".into()
+                    } else {
+                        "alert".into()
+                    };
+                }
+                if let Some(message) = params.get("alertMessage") {
+                    focus.alert_message = clean_alert_message_template(message);
+                }
+                if let Some(redirect) = params.get("redirectApp") {
+                    focus.redirect_app = redirect.trim().to_string();
+                }
+                guard.focus = Some(focus.clone());
+                Some(focus)
+            } else {
+                None
+            }
+        };
+        if let Some(focus) = updated {
+            save_focus(&data_dir, &focus)?;
+            append_event(&data_dir, "focus_updated", &focus.task)?;
+            notify("Focus updated", &focus.task);
+            write_response(&mut stream, "application/json", "{\"ok\":true}")?;
+        } else {
+            write_response(
+                &mut stream,
+                "application/json",
+                "{\"ok\":false,\"noSession\":true}",
+            )?;
+        }
     } else if path.starts_with("/api/focus/pause") {
         let updated = {
             let mut guard = lock_state(&state);
@@ -1720,11 +1874,8 @@ fn handle_http(
     } else if path.starts_with("/api/block/add") {
         let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
         let params = parse_query(query);
-        let keyword = params
-            .get("keyword")
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_default();
+        // Comma/newline-separated input becomes one block rule per keyword.
+        let keywords = split_block_keywords(params.get("keyword").map(String::as_str).unwrap_or(""));
         let mode = params
             .get("mode")
             .map(|value| parse_block_mode(value))
@@ -1739,17 +1890,22 @@ fn handle_http(
             .filter(|s| !s.is_empty())
             .unwrap_or_default();
 
-        if !keyword.is_empty() {
-            let record = format_block_rule_record(&keyword, mode, &password);
+        if !keywords.is_empty() {
             let mut config = load_config(&data_dir).unwrap_or_default();
+            // Drop the rule being edited and any existing rule that one of the new
+            // keywords would duplicate, then add a record for each keyword.
             config.blocked_keywords.retain(|item| {
                 let target = parse_block_rule_record(item).target;
-                target != keyword && (original.is_empty() || target != original)
+                !keywords.contains(&target) && (original.is_empty() || target != original)
             });
-            config.blocked_keywords.push(record.clone());
+            for keyword in &keywords {
+                config
+                    .blocked_keywords
+                    .push(format_block_rule_record(keyword, mode, &password));
+            }
             save_config(&data_dir, &config)?;
             lock_state(&state).config = config;
-            append_event(&data_dir, "blocked_keyword_added", &keyword)?;
+            append_event(&data_dir, "blocked_keyword_added", &keywords.join(", "))?;
         }
 
         write_response(&mut stream, "application/json", "{\"ok\":true}")?;
@@ -1787,9 +1943,18 @@ fn handle_http(
         let endpoint = format!("browser:{}", now());
         let device = format_device_record_selected(&name, &kind, &endpoint, true);
         let mut config = load_config(&data_dir).unwrap_or_default();
+        config.network_devices = prune_stale_browser_devices(
+            &config.network_devices,
+            &lock_state(&state).browser_last_seen,
+            now(),
+        );
         config.network_devices.push(device.clone());
         save_config(&data_dir, &config)?;
-        lock_state(&state).config = config;
+        {
+            let mut guard = lock_state(&state);
+            guard.config = config;
+            guard.browser_last_seen.insert(endpoint.clone(), now());
+        }
         append_event(&data_dir, "browser_device_connected", &device)?;
         write_response(
             &mut stream,
@@ -1903,6 +2068,11 @@ fn handle_http(
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         let device = params.get("device").map(String::as_str).unwrap_or("");
+        if device.starts_with("browser:") {
+            lock_state(&state)
+                .browser_last_seen
+                .insert(device.to_string(), now());
+        }
         write_response(
             &mut stream,
             "application/json",
@@ -1927,22 +2097,6 @@ fn handle_http(
             .unwrap_or_else(|| "Local Focus".into());
         notify(&title, &message);
         write_response(&mut stream, "application/json", "{\"ok\":true}")?;
-    } else if path.starts_with("/api/qr.svg") {
-        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-        let params = parse_query(query);
-        let Some(value) = params.get("value").filter(|value| !value.trim().is_empty()) else {
-            write_not_found(&mut stream, "Missing QR value.")?;
-            return Ok(());
-        };
-        let label = params
-            .get("label")
-            .map(String::as_str)
-            .unwrap_or("Local Focus connection QR");
-        write_response(
-            &mut stream,
-            "image/svg+xml; charset=utf-8",
-            &qr_svg(value, label)?,
-        )?;
     } else if path.starts_with("/api/journal/settings") {
         let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
         let params = parse_query(query);
@@ -2160,7 +2314,7 @@ fn handle_http(
 fn write_response(stream: &mut TcpStream, content_type: &str, body: &str) -> io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     )
@@ -2174,7 +2328,7 @@ fn write_binary_response(
 ) -> io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         filename.replace('"', ""),
         body.len()
     )?;
@@ -2184,7 +2338,7 @@ fn write_binary_response(
 fn write_not_found(stream: &mut TcpStream, message: &str) -> io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
+        "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
         message.len(),
         message
     )
@@ -2193,18 +2347,18 @@ fn write_not_found(stream: &mut TcpStream, message: &str) -> io::Result<()> {
 fn write_forbidden(stream: &mut TcpStream, message: &str) -> io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
         message.len(),
         message
     )
 }
 
 /// Endpoints reachable from other machines on the LAN: the device-companion
-/// surface (receiver pages, QR images, downloads, mobile/native APIs) plus the
-/// endpoints the phone companion needs — view state/reports and drive focus
-/// sessions. The most sensitive surface stays loopback-only: the full dashboard,
-/// the raw activity timeline, the journal, block management, report
-/// history/reset, and the master stop/resume.
+/// surface (receiver pages, downloads, mobile/native APIs) plus the
+/// endpoints the phone companion needs — view state/reports, drive focus
+/// sessions, manage the journal and block list, and read report history.
+/// The most sensitive surface stays loopback-only: the full dashboard, the raw
+/// activity timeline, report reset, and the master stop/resume.
 fn remote_path_allowed(route: &str) -> bool {
     let prefixes = [
         "/api/mobile/register",
@@ -2212,18 +2366,22 @@ fn remote_path_allowed(route: &str) -> bool {
         "/api/device/register",
         "/api/device/events",
         "/api/native/notify",
-        "/api/qr.svg",
         "/connect",
         "/download/",
         // Phone companion: control focus sessions and read focus reports.
         "/api/focus/",
         "/api/focus-report",
         "/api/focus-sessions",
+        // Phone companion parity: daily journal and block-list management.
+        "/api/journal/",
+        "/api/block/",
     ];
     // `/device`, `/device-sw.js`, and `/device-manifest.json` all share this prefix.
     route.starts_with("/device")
         || route == "/api/state"
         || route == "/api/report"
+        // Past archived reports, but not report reset (loopback-only).
+        || route == "/api/report/history"
         || prefixes.iter().any(|prefix| route.starts_with(prefix))
 }
 
@@ -2303,26 +2461,6 @@ fn write_artifact_response(
             "Local Focus installer artifact has not been built yet.",
         )
     }
-}
-
-fn qr_svg(value: &str, label: &str) -> io::Result<String> {
-    let code = QrCode::new(value.as_bytes())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-    let mut image = code
-        .render::<svg::Color>()
-        .min_dimensions(410, 410)
-        .dark_color(svg::Color("#000000"))
-        .light_color(svg::Color("#ffffff"))
-        .build();
-    image = image.replacen(
-        "<svg",
-        &format!(
-            "<svg role=\"img\" aria-label=\"{}\"",
-            html_attr_escape(label)
-        ),
-        1,
-    );
-    Ok(image)
 }
 
 fn find_artifact_path(relative_paths: &[&str]) -> Option<PathBuf> {
@@ -3341,13 +3479,14 @@ fn state_json(
             let elapsed = focus_elapsed_seconds(&focus, now());
             let remaining = ((focus.duration_minutes * 60) as i64 - elapsed).max(0);
             format!(
-                "{{\"stopped\":{},\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"paused\":{},\"remainingSeconds\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"journal\":{},\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
+                "{{\"stopped\":{},\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"paused\":{},\"remainingSeconds\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"journal\":{},\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
                 stopped,
                 json_escape(&focus.task),
                 json_escape(&focus.target),
                 focus.started_at,
                 focus.duration_minutes,
                 focus.alert_delay_seconds,
+                focus.action_delay_seconds,
                 json_escape(&focus.alert_action),
                 json_escape(&clean_alert_message_template(&focus.alert_message)),
                 json_escape(&focus.redirect_app),
@@ -3408,39 +3547,53 @@ fn index_html() -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Local Focus</title>
 <style>
-:root { color-scheme: light dark; --bg:#f6f6f1; --ink:#202124; --muted:#686b63; --line:#d9dbd2; --good:#24734d; --warn:#9b6418; --bad:#a8323b; --panel:#ffffff; --panel-soft:#f0f1ea; --accent:#355c7d; --shadow:0 18px 45px rgba(32,33,36,.08); }
-@media (prefers-color-scheme: dark) { :root { --bg:#171816; --ink:#f1f1e9; --muted:#aeb0a8; --line:#34362f; --panel:#22231f; --panel-soft:#1c1d19; --shadow:0 18px 45px rgba(0,0,0,.22); } }
+:root { color-scheme: light dark; --bg:#f5f2ff; --ink:#1c1330; --muted:#6c6486; --line:#eae3fb; --good:#10b981; --warn:#f59e0b; --bad:#f43f5e; --panel:#ffffff; --panel-soft:#f1ebff; --accent:#7c3aed; --accent-2:#ec4899; --accent-3:#22d3ee; --accent-grad:linear-gradient(135deg, #7c3aed 0%, #ec4899 100%); --shadow:0 18px 44px rgba(124,58,237,.18); }
+@media (prefers-color-scheme: dark) { :root { --bg:#120e22; --ink:#f4f1ff; --muted:#aaa2cc; --line:#2c2746; --panel:#1d1838; --panel-soft:#171331; --accent:#a78bfa; --accent-2:#f472b6; --accent-3:#67e8f9; --accent-grad:linear-gradient(135deg, #a78bfa 0%, #f472b6 100%); --shadow:0 18px 44px rgba(0,0,0,.45); } }
+/* Switchable templates (set via the header picker, persisted in localStorage). */
+html[data-theme="cyber"] { color-scheme:dark; --bg:#07060f; --ink:#ece9ff; --muted:#9a92c4; --line:#2a2348; --good:#34d399; --warn:#fbbf24; --bad:#fb7185; --panel:#130f24; --panel-soft:#1b1533; --accent:#b66bff; --accent-2:#22d3ee; --accent-3:#f472b6; --accent-grad:linear-gradient(135deg, #b66bff 0%, #22d3ee 100%); --shadow:0 0 0 1px rgba(182,107,255,.20), 0 18px 50px rgba(124,58,237,.40); }
+html[data-theme="clay"] { color-scheme:light; --bg:#ede9f6; --ink:#322b4a; --muted:#7a7397; --line:#e3ddf3; --good:#10b981; --warn:#f59e0b; --bad:#fb7185; --panel:#fbf9ff; --panel-soft:#f1ecfb; --accent:#8b7cf6; --accent-2:#f59ebc; --accent-3:#a78bfa; --accent-grad:linear-gradient(135deg, #8b7cf6 0%, #f59ebc 100%); --shadow:0 14px 34px rgba(139,124,246,.24); }
+html[data-theme="minimal"] { color-scheme:light; --bg:#ffffff; --ink:#0a0a0a; --muted:#71717a; --line:#e4e4e7; --good:#16a34a; --warn:#b45309; --bad:#dc2626; --panel:#ffffff; --panel-soft:#f4f4f5; --accent:#111111; --accent-2:#111111; --accent-3:#111111; --accent-grad:linear-gradient(135deg, #111111, #111111); --shadow:0 1px 2px rgba(0,0,0,.06), 0 10px 28px rgba(0,0,0,.05); }
+html[data-theme="minimal"] button { border-radius:10px; box-shadow:none; }
+html[data-theme="minimal"] .control-shell, html[data-theme="minimal"] .focus-shell { border-radius:14px; }
+html[data-theme="professional"] { color-scheme:light; --bg:#f8fafc; --ink:#0f172a; --muted:#64748b; --line:#e2e8f0; --good:#15803d; --warn:#b45309; --bad:#b91c1c; --panel:#ffffff; --panel-soft:#f1f5f9; --accent:#1e40af; --accent-2:#2563eb; --accent-3:#1d4ed8; --accent-grad:linear-gradient(135deg, #1e40af 0%, #2563eb 100%); --shadow:0 12px 32px rgba(15,23,42,.10); }
+html[data-theme="professional"] .control-shell, html[data-theme="professional"] .focus-shell { border-radius:16px; }
 * { box-sizing: border-box; }
 body { margin:0; font:14px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--ink); }
-header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 24px; border-bottom:1px solid var(--line); background:color-mix(in srgb, var(--panel) 82%, transparent); backdrop-filter:blur(12px); position:sticky; top:0; z-index:20; }
-.header-actions { display:grid; gap:8px; justify-items:end; }
+header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 24px; border-bottom:1px solid var(--line); background:color-mix(in srgb, var(--panel) 82%, transparent); backdrop-filter:blur(12px); position:sticky; top:0; z-index:20; transition:padding .18s ease, box-shadow .18s ease; }
+header.compact { padding:8px 24px; box-shadow:var(--shadow); }
+header.compact h1 { font-size:17px; }
+header.compact .header-sub { display:none; }
+.header-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; justify-content:flex-end; }
 .header-actions button { padding:7px 11px; }
-h1 { margin:0; font-size:20px; }
+h1 { margin:0; font-size:23px; font-weight:850; letter-spacing:-.02em; background:var(--accent-grad); -webkit-background-clip:text; background-clip:text; color:transparent; transition:font-size .18s ease; }
 main { max-width:1180px; margin:0 auto; padding:24px; display:grid; gap:18px; }
 .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
-input, select, textarea, button { border:1px solid var(--line); border-radius:8px; padding:10px 12px; background:var(--panel); color:var(--ink); }
+input, select, textarea, button { border:1px solid var(--line); border-radius:12px; padding:10px 13px; background:var(--panel); color:var(--ink); }
+input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
 textarea { min-height:88px; resize:vertical; font:inherit; }
-button { cursor:pointer; font-weight:700; }
-button:disabled { cursor:not-allowed; opacity:.55; }
-.focus-shell { background:linear-gradient(180deg, color-mix(in srgb, var(--panel) 92%, var(--panel-soft)), var(--panel)); border:1px solid var(--line); border-radius:12px; padding:18px; display:grid; gap:16px; box-shadow:var(--shadow); }
+button { cursor:pointer; font-weight:800; color:#fff; background:var(--accent-grad); border:1px solid transparent; border-radius:14px; box-shadow:0 8px 18px color-mix(in srgb, var(--accent) 32%, transparent); transition:filter .15s ease, transform .08s ease; }
+button:hover:not(:disabled) { filter:brightness(1.06); }
+button:active:not(:disabled) { transform:translateY(1px); }
+button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
+.focus-shell { background:linear-gradient(180deg, color-mix(in srgb, var(--panel) 92%, var(--panel-soft)), var(--panel)); border:1px solid var(--line); border-radius:22px; padding:20px; display:grid; gap:16px; box-shadow:var(--shadow); }
 .focus-shell-head { display:flex; align-items:center; justify-content:space-between; gap:14px; }
 .focus-title { display:flex; align-items:center; gap:12px; }
-.focus-mark { width:42px; height:42px; border-radius:10px; background:linear-gradient(135deg, var(--accent), var(--good)); color:white; display:grid; place-items:center; font-weight:850; letter-spacing:.04em; }
+.focus-mark { width:44px; height:44px; border-radius:14px; background:var(--accent-grad); color:white; display:grid; place-items:center; font-weight:850; letter-spacing:.04em; box-shadow:0 8px 20px color-mix(in srgb, var(--accent) 35%, transparent); }
 .focus-shell h2 { margin:0; font-size:18px; }
-.control-shell { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; display:grid; gap:14px; }
+.control-shell { background:var(--panel); border:1px solid var(--line); border-radius:22px; padding:18px; display:grid; gap:14px; box-shadow:var(--shadow); }
 .control-shell h2 { margin:0; font-size:16px; }
 .report-calendar { display:grid; gap:12px; }
 .calendar-head { display:grid; grid-template-columns:auto 1fr auto; gap:10px; align-items:center; }
 .calendar-title { text-align:center; font-weight:800; }
 .calendar-actions { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
-.calendar-actions button, .week-button, .day-button { min-height:40px; }
-.calendar-actions button.active-report, .week-button.active-report { background:var(--good); border-color:var(--good); color:white; }
-.calendar-actions button.active-year { background:var(--accent); border-color:var(--accent); color:white; }
+/* Grid/selector buttons stay neutral so only the active one pops. */
+.calendar-actions button, .week-button, .day-button { min-height:40px; background:var(--panel); color:var(--ink); border:1px solid var(--line); box-shadow:none; font-weight:700; }
+.calendar-actions button.active-report, .week-button.active-report, .calendar-actions button.active-year { background:var(--accent-grad); border-color:transparent; color:white; box-shadow:0 6px 16px color-mix(in srgb, var(--accent) 28%, transparent); }
 .calendar-grid { display:grid; grid-template-columns:64px repeat(7, minmax(0, 1fr)); gap:6px; align-items:stretch; }
 .calendar-label { color:var(--muted); font-size:12px; font-weight:750; text-align:center; padding:4px; }
 .week-button, .day-button { width:100%; padding:8px 6px; }
 .day-button.outside { color:var(--muted); opacity:.65; }
-.day-button.selected { background:var(--good); border-color:var(--good); color:white; }
+.day-button.selected { background:var(--accent-grad); border-color:transparent; color:white; box-shadow:0 6px 16px color-mix(in srgb, var(--accent) 28%, transparent); }
 .focus-task-window { border:1px solid var(--line); border-radius:10px; padding:12px; background:var(--panel-soft); display:grid; gap:8px; }
 .focus-task-window.disabled { opacity:.55; }
 .focus-session-list { display:grid; gap:8px; }
@@ -3461,24 +3614,20 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .device-row input { width:18px; height:18px; min-width:18px; margin-top:2px; accent-color:var(--accent); }
 .device-connect-actions { display:flex; flex-wrap:wrap; gap:10px; }
 .device-connect-actions button:first-child { background:var(--good); border-color:var(--good); color:white; }
-.device-qr-panel { border:1px solid var(--line); border-radius:10px; padding:14px; background:var(--panel-soft); display:grid; gap:12px; }
-.device-qr-panel.hidden { display:none; }
-.qr-type-grid { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:8px; }
-.qr-type-grid button { min-height:42px; padding:8px; }
-.qr-type-grid button.active { background:var(--accent); border-color:var(--accent); color:white; }
-.device-qr-body { display:grid; grid-template-columns:auto minmax(0, 1fr); gap:14px; align-items:center; }
-.device-qr-code { width:432px; min-height:432px; border:1px solid var(--line); border-radius:10px; padding:10px; background:#fff; display:grid; place-items:center; max-width:100%; }
-.device-qr-code svg, .device-qr-code img { width:410px; max-width:100%; height:auto; display:block; shape-rendering:crispEdges; image-rendering:pixelated; }
-.device-qr-meta { display:grid; gap:8px; min-width:0; }
-.device-qr-meta a { overflow-wrap:anywhere; color:var(--accent); font-weight:800; }
-.device-qr-url { border:1px solid var(--line); border-radius:8px; background:var(--panel); padding:10px; display:grid; gap:6px; }
-.device-qr-url code { display:block; font-size:16px; font-weight:850; color:var(--ink); overflow-wrap:anywhere; user-select:all; }
-.device-qr-url button { justify-self:start; padding:7px 10px; }
+.connect-code-panel { border:1px solid var(--line); border-radius:10px; padding:16px; background:var(--panel-soft); display:grid; gap:10px; justify-items:start; }
+.connect-code-label { font-size:13px; text-transform:uppercase; letter-spacing:.08em; }
+.connect-code-value { font-size:34px; font-weight:850; letter-spacing:.12em; color:var(--ink); user-select:all; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; }
+.connect-code-actions { display:flex; gap:8px; flex-wrap:wrap; }
+.connect-advanced { border:1px solid var(--line); border-radius:10px; padding:8px 12px; background:var(--panel); }
+.connect-advanced summary { cursor:pointer; font-weight:700; }
+.connect-advanced > *:not(summary) { margin-top:10px; }
+.connect-downloads { display:grid; gap:6px; }
+.connect-downloads a { color:var(--accent); font-weight:800; overflow-wrap:anywhere; }
 .blocked-list { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
 .blocked-chip { display:inline-flex; align-items:center; gap:8px; border:1px solid color-mix(in srgb, var(--bad) 38%, var(--line)); border-radius:999px; padding:6px 10px; background:color-mix(in srgb, var(--bad) 7%, transparent); color:var(--ink); font-weight:700; max-width:100%; overflow-wrap:anywhere; }
 .blocked-chip.editing { border-color:color-mix(in srgb, var(--accent) 65%, var(--line)); background:color-mix(in srgb, var(--accent) 12%, transparent); }
 .blocked-chip small { color:var(--muted); font-weight:800; }
-.blocked-chip button { width:auto; min-width:0; border:0; background:transparent; color:var(--bad); padding:0 2px; font-weight:900; }
+.blocked-chip button { width:auto; min-width:0; border:0; background:transparent; color:var(--bad); padding:0 2px; font-weight:900; box-shadow:none; }
 .blocked-chip .edit-chip { color:var(--accent); }
 .focus-layout { display:grid; gap:16px; align-items:start; }
 .focus-layout.editor-collapsed { grid-template-columns:minmax(0, 520px); }
@@ -3526,7 +3675,7 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .journal-reminder-chip { display:inline-flex; align-items:center; gap:8px; border:1px solid color-mix(in srgb, var(--good) 38%, var(--line)); border-radius:999px; padding:6px 10px; background:var(--panel); max-width:100%; }
 .journal-reminder-chip strong { white-space:nowrap; }
 .journal-reminder-chip span { overflow-wrap:anywhere; }
-.journal-reminder-chip button { border:0; background:transparent; color:var(--bad); padding:0 2px; min-height:0; }
+.journal-reminder-chip button { border:0; background:transparent; color:var(--bad); padding:0 2px; min-height:0; box-shadow:none; }
 .status-chip { border:1px solid var(--line); border-radius:999px; padding:6px 10px; background:color-mix(in srgb, var(--line) 25%, transparent); color:var(--muted); font-weight:700; }
 .status-chip.running { color:var(--good); border-color:color-mix(in srgb, var(--good) 45%, var(--line)); background:color-mix(in srgb, var(--good) 10%, transparent); }
 .status-chip.paused { color:var(--warn); border-color:color-mix(in srgb, var(--warn) 45%, var(--line)); background:color-mix(in srgb, var(--warn) 12%, transparent); }
@@ -3545,13 +3694,15 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .field label { color:var(--muted); font-size:12px; font-weight:650; }
 .field input, .field select, .field textarea { width:100%; min-width:150px; }
 .field-wide input { min-width:280px; }
-.source-toggle { display:inline; max-width:100%; padding:0; border:0; background:transparent; color:var(--ink); font:inherit; font-weight:500; text-align:left; overflow-wrap:anywhere; }
+.source-toggle { display:inline; max-width:100%; padding:0; border:0; background:transparent; color:var(--ink); font:inherit; font-weight:500; text-align:left; overflow-wrap:anywhere; box-shadow:none; }
 .source-toggle:hover { text-decoration:underline; }
-.focus-btn { transition: background .15s ease, border-color .15s ease, color .15s ease; }
-.focus-idle { border-color:var(--good); color:var(--good); }
-.focus-running { background:var(--good); border-color:var(--good); color:white; }
-.focus-paused { background:var(--warn); border-color:var(--warn); color:white; }
-.focus-stop-active { border-color:var(--bad); color:var(--bad); }
+/* Focus controls keep their own semantic colors instead of the default accent fill. */
+.focus-btn { background:var(--panel); border:1px solid var(--line); color:var(--ink); box-shadow:none; transition: background .15s ease, border-color .15s ease, color .15s ease, filter .15s ease; }
+.focus-idle { background:var(--accent-grad); border-color:transparent; color:#fff; box-shadow:0 8px 20px color-mix(in srgb, var(--accent) 30%, transparent); }
+.focus-running { background:var(--good); border-color:transparent; color:white; box-shadow:0 8px 20px color-mix(in srgb, var(--good) 30%, transparent); }
+.focus-paused { background:var(--warn); border-color:transparent; color:white; box-shadow:0 8px 20px color-mix(in srgb, var(--warn) 30%, transparent); }
+.focus-stop-active { background:var(--panel); border-color:var(--bad); color:var(--bad); box-shadow:none; }
+.focus-btn:hover:not(:disabled) { filter:brightness(1.05); }
 .grid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; }
 .focus-summary-grid { gap:8px; }
 .metric, .timeline, .apps, .explain, .history, .report { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
@@ -3637,13 +3788,20 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .two { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
 @media (max-width:980px) { .focus-layout, .control-shell { grid-template-columns:1fr; } .focus-actions { justify-content:flex-start; } }
 @media (max-width:900px) { .focus-shell-head { align-items:start; display:grid; } .top-actions { justify-content:flex-start; } }
-@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid, .block-fields, .activity-row, .calendar-actions, .device-qr-body, .journal-settings, .journal-row, .journal-task-form { grid-template-columns:1fr; display:grid; } header { align-items:start; } .header-actions { justify-items:start; } .hour-bars, .period-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } .calendar-grid { grid-template-columns:48px repeat(7, minmax(28px, 1fr)); gap:4px; } .block-type-options, .qr-type-grid { grid-template-columns:1fr; } .block-password-field { grid-column:auto; } .device-qr-code { width:100%; max-width:432px; justify-self:center; } }
+@media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid, .block-fields, .activity-row, .calendar-actions, .journal-settings, .journal-row, .journal-task-form { grid-template-columns:1fr; display:grid; } header { align-items:start; padding:12px 16px; gap:8px; } .header-sub { display:none; } #themeSelect { padding:6px 9px; } .header-actions { justify-content:flex-start; } .hour-bars, .period-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } .calendar-grid { grid-template-columns:48px repeat(7, minmax(28px, 1fr)); gap:4px; } .block-type-options { grid-template-columns:1fr; } .block-password-field { grid-column:auto; } }
 </style>
 </head>
 <body>
 <header>
-  <div><h1>Local Focus</h1><div class="muted">Private activity timeline, focus sessions, and reports. All data stays on this device.</div></div>
+  <div><h1>Local Focus</h1><div class="muted header-sub">Private activity timeline, focus sessions, and reports. All data stays on this device.</div></div>
   <div class="header-actions">
+    <select id="themeSelect" aria-label="Theme" title="Theme" onchange="setTheme(this.value)">
+      <option value="vibrant">✨ Vibrant</option>
+      <option value="cyber">🌌 Cyber</option>
+      <option value="clay">🫧 Clay</option>
+      <option value="minimal">◾ Minimal</option>
+      <option value="professional">💼 Professional</option>
+    </select>
     <div id="focusState" class="status-chip"></div>
     <button id="explainToggle" onclick="toggleExplain()" aria-expanded="false">Explain</button>
   </div>
@@ -3678,16 +3836,20 @@ button:disabled { cursor:not-allowed; opacity:.55; }
           <input id="target" type="hidden" aria-label="Focus targets">
         </div>
         <div class="field"><label for="minutes">Focus timer</label><input id="minutes" type="number" min="1" max="180" value="25" aria-label="Minutes"></div>
-        <div class="field"><label for="alertMinutes">Warn after</label><input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Alert after minutes" title="Alert after minutes outside focus"></div>
-        <div class="field"><label for="alertAction">Warning action</label><select id="alertAction" aria-label="After delay action" title="After delay action">
-          <option value="alert">Show alert</option>
+        <div class="field"><label for="alertMinutes">Alert: warn after (min)</label><input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Alert after minutes" title="Show the warning alert this many minutes after leaving focus, repeating every interval"></div>
+        <div class="field"><label for="alertAction">Action when off focus</label><select id="alertAction" aria-label="Off-focus action" title="What happens once the action timer elapses">
+          <option value="alert">None (alert only)</option>
           <option value="switch">Move to app</option>
         </select></div>
+        <div class="field"><label for="actionMinutes">Action: move every (min)</label><input id="actionMinutes" type="number" min="1" max="60" value="2" aria-label="Move every minutes" title="Move to the app this many minutes after leaving focus, repeating on its own timer"></div>
         <div class="field"><label for="redirectApp">App to move to</label><input id="redirectApp" placeholder="Pages" aria-label="Move focus to app"></div>
         <div class="field field-wide alert-message-field">
           <label for="alertMessage">Alert message</label>
           <textarea id="alertMessage" aria-label="Alert message">You have been outside your focus apps/sites for over {delay}. Allowed: '{targets}'. Current activity: {app}</textarea>
           <div class="muted">Use {delay}, {targets}, {app}, {title}, or {url}.</div>
+        </div>
+        <div class="field field-wide">
+          <button id="saveFocusEdits" type="button" onclick="saveFocusEdits()" style="display:none;">Save changes</button>
         </div>
       </div>
     </div>
@@ -3715,9 +3877,31 @@ button:disabled { cursor:not-allowed; opacity:.55; }
       <button id="startFocus" class="focus-btn focus-idle" onclick="startFocus()">Start focus</button>
       <button id="pauseFocus" class="focus-btn" onclick="pauseFocus()" disabled>Pause</button>
       <button id="stopFocus" class="focus-btn" onclick="stopFocus()" disabled>Stop</button>
-      <button onclick="resetReport()">Refresh</button>
     </div>
   </aside>
+  <section id="distractionCard" class="control-shell distraction-card" aria-label="Distraction rules">
+    <div>
+      <h2>Add distraction rule</h2>
+      <div class="muted">Block matching apps or sites. Websites close their active tab; apps are quit.</div>
+    </div>
+    <div>
+      <strong>Blocked apps and websites</strong>
+      <div id="blockedList" class="blocked-list"></div>
+    </div>
+    <div class="block-fields">
+      <div class="field"><label for="blockKeyword">Block keyword, app, or site</label><input id="blockKeyword" placeholder="youtube, reddit, games" aria-label="Block keyword" oninput="syncBlockEditState()"></div>
+      <div class="field check-field">
+        <label>Block type</label>
+        <div class="block-type-options" role="group" aria-label="Block type">
+          <label id="fullBlockOption" class="inline-check selected" for="fullBlock"><input id="fullBlock" type="checkbox" checked onchange="setBlockMode('full')" aria-label="Use full block"> Full block</label>
+          <label id="passwordBlockOption" class="inline-check" for="passwordBlock"><input id="passwordBlock" type="checkbox" onchange="setBlockMode('password')" aria-label="Use password block"> Password block</label>
+        </div>
+        <div id="blockModeHint" class="muted">Full block is active.</div>
+      </div>
+      <div id="blockPasswordField" class="field block-password-field password-hidden"><label for="blockPassword">Password</label><input id="blockPassword" type="password" placeholder="Enter password to continue when blocked" aria-label="Block password"></div>
+      <button id="blockSubmit" class="block-submit" onclick="addBlock()">Add block</button>
+    </div>
+  </section>
   <section id="journalCard" class="control-shell journal-card" aria-label="Daily journal">
     <div class="journal-head">
       <div>
@@ -3788,66 +3972,29 @@ button:disabled { cursor:not-allowed; opacity:.55; }
     </div>
     <section class="report report-inline" id="focusReportPanel" aria-live="polite"></section>
   </section>
-  <section id="distractionCard" class="control-shell distraction-card" aria-label="Distraction rules">
-    <div>
-      <h2>Add distraction rule</h2>
-      <div class="muted">Block matching apps or sites. Websites close their active tab; apps are quit.</div>
-    </div>
-    <div>
-      <strong>Blocked apps and websites</strong>
-      <div id="blockedList" class="blocked-list"></div>
-    </div>
-    <div class="block-fields">
-      <div class="field"><label for="blockKeyword">Block keyword, app, or site</label><input id="blockKeyword" placeholder="youtube, reddit, games" aria-label="Block keyword" oninput="syncBlockEditState()"></div>
-      <div class="field check-field">
-        <label>Block type</label>
-        <div class="block-type-options" role="group" aria-label="Block type">
-          <label id="fullBlockOption" class="inline-check selected" for="fullBlock"><input id="fullBlock" type="checkbox" checked onchange="setBlockMode('full')" aria-label="Use full block"> Full block</label>
-          <label id="passwordBlockOption" class="inline-check" for="passwordBlock"><input id="passwordBlock" type="checkbox" onchange="setBlockMode('password')" aria-label="Use password block"> Password block</label>
-        </div>
-        <div id="blockModeHint" class="muted">Full block is active.</div>
-      </div>
-      <div id="blockPasswordField" class="field block-password-field password-hidden"><label for="blockPassword">Password</label><input id="blockPassword" type="password" placeholder="Enter password to continue when blocked" aria-label="Block password"></div>
-      <button id="blockSubmit" class="block-submit" onclick="addBlock()">Add block</button>
-    </div>
-  </section>
   <section id="devicesCard" class="control-shell" aria-label="Connect to device">
     <div>
       <h2>Connect to device</h2>
-      <div class="muted">All device setup starts from a QR code or copied link. Local Focus does not scan the network for devices.</div>
+      <div class="muted">Open the Local Focus companion app on your phone, tablet, or another computer, then enter the connection code below. Local Focus does not scan the network for devices.</div>
     </div>
-    <div class="device-pill"><strong>QR link</strong><br><span id="deviceConnectUrl" class="muted">Loading...</span></div>
-    <div class="device-connect-actions">
-      <button type="button" onclick="openDeviceQrPanel('install')">Show QR code</button>
+    <div class="connect-code-panel">
+      <div class="connect-code-label muted">Connection code</div>
+      <code id="connectCode" class="connect-code-value" title="Connection code">--------</code>
+      <div class="connect-code-actions">
+        <button type="button" onclick="copyConnectCode()">Copy code</button>
+      </div>
+      <div id="connectCodeHint" class="muted">Type this code into the companion app's <strong>Connection code</strong> field to connect. It changes if Local Focus restarts on a different network address.</div>
     </div>
-    <div id="deviceQrPanel" class="device-qr-panel hidden" aria-live="polite">
-      <div>
-        <strong>Download or connect with QR</strong>
-        <div class="muted">Choose the device type, then scan the QR code from that device. Only devices that open this QR link can connect.</div>
+    <details class="connect-advanced">
+      <summary>Manual link &amp; app downloads</summary>
+      <div class="device-pill"><strong>Direct link</strong><br><span id="deviceConnectUrl" class="muted">Loading...</span></div>
+      <div class="connect-downloads">
+        <a id="androidDownloadLink" href="/download/local-focus-mobile.apk" target="_blank" rel="noreferrer">Download Android app (APK)</a>
+        <a id="macDownloadLink" href="/download/local-focus-macos.dmg" target="_blank" rel="noreferrer">Download Mac app (DMG)</a>
       </div>
-      <div class="qr-type-grid" role="group" aria-label="QR destination">
-        <button id="qrInstallButton" type="button" onclick="renderDeviceQr('install')">Any device</button>
-        <button id="qrAndroidButton" type="button" onclick="renderDeviceQr('android')">Android app</button>
-        <button id="qrIphoneButton" type="button" onclick="renderDeviceQr('iphone')">iPhone/iPad</button>
-        <button id="qrLaptopButton" type="button" onclick="renderDeviceQr('laptop')">Mac laptop app</button>
-        <button id="qrReceiverButton" type="button" onclick="renderDeviceQr('receiver')">Receiver link</button>
-      </div>
-      <div class="device-qr-body">
-        <div id="deviceQrCode" class="device-qr-code"></div>
-        <div class="device-qr-meta">
-          <strong id="deviceQrTitle">Local Focus</strong>
-          <p id="deviceQrHint" class="muted"></p>
-          <div class="device-qr-url">
-            <span class="muted">If iPhone Camera does not show the QR URL, copy or type this exact link:</span>
-            <code id="deviceQrPlainUrl"></code>
-            <button type="button" onclick="copyDeviceQrUrl()">Copy URL</button>
-          </div>
-          <a id="deviceQrLink" href="" target="_blank" rel="noreferrer"></a>
-        </div>
-      </div>
-    </div>
+    </details>
     <div>
-      <strong>QR-connected devices</strong>
+      <strong>Connected devices</strong>
       <div id="deviceList" class="device-list"></div>
     </div>
   </section>
@@ -3874,8 +4021,33 @@ button:disabled { cursor:not-allowed; opacity:.55; }
   </section>
 </main>
 <script>
+// Look-and-feel templates: swap the CSS variable palette via a data-theme
+// attribute and remember the choice on this device.
+function setTheme(value) {
+  const theme = ['vibrant', 'cyber', 'clay', 'minimal', 'professional'].includes(value) ? value : 'vibrant';
+  document.documentElement.dataset.theme = theme;
+  try { localStorage.setItem('lfTheme', theme); } catch (e) {}
+  const select = document.querySelector('#themeSelect');
+  if (select) select.value = theme;
+}
+(function initTheme() {
+  let saved = 'vibrant';
+  try { saved = localStorage.getItem('lfTheme') || 'vibrant'; } catch (e) {}
+  setTheme(saved);
+})();
+// Shrink the sticky header once the page scrolls past the focus setup.
+(function initHeaderShrink() {
+  const header = document.querySelector('header');
+  if (!header) return;
+  const onScroll = () => header.classList.toggle('compact', window.scrollY > 56);
+  window.addEventListener('scroll', onScroll, { passive: true });
+  onScroll();
+})();
 const focusDraftKey = 'local-focus-draft';
 let focusEditorManuallyOpened = false;
+// Tracks which session's values we've already loaded into the editor, so the
+// 10s refresh doesn't overwrite edits the user is making to the active session.
+let lastSeededFocusStart = null;
 let focusTargets = [];
 let currentFocusReport = null;
 let calendarDate = new Date();
@@ -3886,8 +4058,6 @@ let activeReportMonth = selectedReportDate.getMonth();
 let activeReportWeek = 0;
 let blockedRules = [];
 let editingBlockTarget = '';
-let deviceQrUrls = {};
-let activeDeviceQrKind = 'install';
 let activeFocusSession = null;
 let journalEntryDirty = false;
 let activeJournalDate = '';
@@ -3902,10 +4072,27 @@ async function startFocus() {
   const target = encodeURIComponent(document.querySelector('#target').value || '');
   const mins = encodeURIComponent(document.querySelector('#minutes').value || '25');
   const alertSeconds = encodeURIComponent(Math.max(1, Number(document.querySelector('#alertMinutes').value || '1')) * 60);
+  const actionSeconds = encodeURIComponent(Math.max(1, Number(document.querySelector('#actionMinutes').value || '2')) * 60);
   const alertAction = encodeURIComponent(document.querySelector('#alertAction').value || 'alert');
   const alertMessage = encodeURIComponent(document.querySelector('#alertMessage').value || DEFAULT_ALERT_MESSAGE_TEMPLATE);
   const redirectApp = encodeURIComponent(document.querySelector('#redirectApp').value || '');
-  await fetch(`/api/focus/start?task=${task}&target=${target}&minutes=${mins}&alertSeconds=${alertSeconds}&alertAction=${alertAction}&alertMessage=${alertMessage}&redirectApp=${redirectApp}`);
+  await fetch(`/api/focus/start?task=${task}&target=${target}&minutes=${mins}&alertSeconds=${alertSeconds}&actionSeconds=${actionSeconds}&alertAction=${alertAction}&alertMessage=${alertMessage}&redirectApp=${redirectApp}`);
+  refresh();
+}
+async function saveFocusEdits() {
+  saveFocusDraft();
+  const task = encodeURIComponent(document.querySelector('#task').value || 'Deep work');
+  const target = encodeURIComponent(document.querySelector('#target').value || '');
+  const mins = encodeURIComponent(document.querySelector('#minutes').value || '25');
+  const alertSeconds = encodeURIComponent(Math.max(1, Number(document.querySelector('#alertMinutes').value || '1')) * 60);
+  const actionSeconds = encodeURIComponent(Math.max(1, Number(document.querySelector('#actionMinutes').value || '2')) * 60);
+  const alertAction = encodeURIComponent(document.querySelector('#alertAction').value || 'alert');
+  const alertMessage = encodeURIComponent(document.querySelector('#alertMessage').value || DEFAULT_ALERT_MESSAGE_TEMPLATE);
+  const redirectApp = encodeURIComponent(document.querySelector('#redirectApp').value || '');
+  const button = document.querySelector('#saveFocusEdits');
+  if (button) { button.disabled = true; button.textContent = 'Saving...'; }
+  await fetch(`/api/focus/update?task=${task}&target=${target}&minutes=${mins}&alertSeconds=${alertSeconds}&actionSeconds=${actionSeconds}&alertAction=${alertAction}&alertMessage=${alertMessage}&redirectApp=${redirectApp}`);
+  if (button) { button.disabled = false; button.textContent = 'Save changes'; }
   refresh();
 }
 async function stopFocus() { await fetch('/api/focus/stop'); refresh(); }
@@ -3923,11 +4110,6 @@ function toggleHighFocusExplanation() {
   const open = panel.classList.toggle('open');
   button.setAttribute('aria-expanded', String(open));
   button.textContent = open ? 'Hide explanation' : 'Explain';
-}
-async function resetReport() {
-  await fetch('/api/report/reset');
-  closeFocusReport();
-  refresh();
 }
 function todayYmd(date = new Date()) {
   const year = date.getFullYear();
@@ -4184,11 +4366,11 @@ async function removeBlock(target) {
 function removeBlockFromButton(button) {
   removeBlock(button.dataset.target || '');
 }
-function qrDeviceRowMarkup(device) {
+function connectedDeviceRowMarkup(device) {
   const endpoint = device.endpoint || '';
   const note = endpoint.startsWith('browser:')
-    ? 'Receiver browser connected from QR.'
-    : 'Mobile app connected from QR.';
+    ? 'Receiver browser connected.'
+    : 'Companion app connected.';
   const kind = device.kind || 'device';
   return `<div class="device-pill"><strong>${escapeHtml(device.name || 'Device')}</strong><br><span class="muted">${escapeHtml(deviceKindLabel(kind))}<br>${escapeHtml(note)}</span></div>`;
 }
@@ -4196,74 +4378,38 @@ function deviceKindLabel(kind) {
   const labels = {phone:'Phone', tv:'TV', tablet:'Tablet', laptop:'Laptop', desktop:'Desktop', router:'Router', device:'Device'};
   return labels[kind] || 'Device';
 }
-function openDeviceQrPanel(kind = 'install') {
-  document.querySelector('#deviceQrPanel').classList.remove('hidden');
-  renderDeviceQr(kind);
+const CONNECT_CODE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+// Encodes an IPv4 host (the port is always 4799) into an 8-character connection
+// code: four address octets plus a checksum byte, rendered as Crockford base32.
+// The companion app reverses this to rebuild http://<ip>:4799 and connect.
+function encodeConnectCode(host) {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(host || '').trim());
+  if (!match) return '';
+  const octets = [Number(match[1]), Number(match[2]), Number(match[3]), Number(match[4])];
+  if (octets.some(value => value > 255)) return '';
+  const checksum = (octets[0] + octets[1] + octets[2] + octets[3]) & 0xff;
+  const bits = [...octets, checksum].map(byte => byte.toString(2).padStart(8, '0')).join('');
+  let code = '';
+  for (let i = 0; i < 40; i += 5) code += CONNECT_CODE_ALPHABET[parseInt(bits.slice(i, i + 5), 2)];
+  return `${code.slice(0, 4)}-${code.slice(4)}`;
 }
-function renderDeviceQr(kind = 'install') {
-  activeDeviceQrKind = kind;
-  const option = deviceQrOption(kind);
-  ['install', 'android', 'iphone', 'laptop', 'receiver'].forEach(name => {
-    const button = document.querySelector(`#qr${name[0].toUpperCase()}${name.slice(1)}Button`);
-    if (button) button.classList.toggle('active', name === kind);
-  });
-  document.querySelector('#deviceQrTitle').textContent = option.title;
-  document.querySelector('#deviceQrHint').textContent = option.hint;
-  const link = document.querySelector('#deviceQrLink');
-  link.href = option.url;
-  link.textContent = `Open ${option.url}`;
-  const plainUrl = document.querySelector('#deviceQrPlainUrl');
-  if (plainUrl) plainUrl.textContent = option.url;
-  const qrSrc = `/api/qr.svg?value=${encodeURIComponent(option.url)}&label=${encodeURIComponent(option.title)}`;
-  document.querySelector('#deviceQrCode').innerHTML = `<img src="${qrSrc}" alt="${escapeTextAttr(option.title)} QR code" width="410" height="410">`;
+function hostFromUrl(value) {
+  try { return new URL(value).hostname; } catch { return ''; }
 }
-async function copyDeviceQrUrl() {
-  const value = document.querySelector('#deviceQrPlainUrl')?.textContent || '';
-  if (!value) return;
+async function copyConnectCode() {
+  const code = (document.querySelector('#connectCode')?.textContent || '').trim();
+  const hint = document.querySelector('#connectCodeHint');
+  if (!/^[0-9A-Z]{4}-[0-9A-Z]{4}$/.test(code)) return;
   try {
-    await navigator.clipboard.writeText(value);
-    document.querySelector('#deviceQrHint').textContent = `Copied. Open this URL on the device: ${value}`;
+    await navigator.clipboard.writeText(code);
+    if (hint) hint.textContent = `Copied ${code}. Enter it in the companion app's Connection code field to connect.`;
   } catch {
     const range = document.createRange();
-    range.selectNodeContents(document.querySelector('#deviceQrPlainUrl'));
+    range.selectNodeContents(document.querySelector('#connectCode'));
     const selection = window.getSelection();
     selection.removeAllRanges();
     selection.addRange(range);
   }
-}
-function deviceQrOption(kind) {
-  const installUrl = deviceQrUrls.install || `${location.origin}/connect`;
-  const receiverUrl = deviceQrUrls.receiver || document.querySelector('#deviceConnectUrl')?.textContent || `${location.origin}/device`;
-  const androidUrl = deviceQrUrls.android || `${location.origin}/download/local-focus-mobile.apk`;
-  const macUrl = deviceQrUrls.mac || `${location.origin}/download/local-focus-macos.dmg`;
-  const options = {
-    install: {
-      title: 'Choose install or receiver option',
-      hint: 'Scan from any device. Android can download the APK, Mac can download the DMG, and iPhone/iPad can connect as a receiver. Native iPhone install requires Xcode, TestFlight, or App Store signing.',
-      url: installUrl
-    },
-    android: {
-      title: 'Android phone or tablet app',
-      hint: 'Scan from an Android phone or tablet to download the Local Focus APK. After installing, open Tracking and allow Usage Access.',
-      url: androidUrl
-    },
-    iphone: {
-      title: 'iPhone or iPad receiver',
-      hint: 'Scan from iPhone or iPad to connect as a receiver. This does not install a native iPhone app; native install requires Xcode, TestFlight, or App Store signing.',
-      url: receiverUrl
-    },
-    laptop: {
-      title: 'Mac laptop app',
-      hint: 'Scan from a Mac to download the Local Focus DMG. Other laptops can use the receiver link.',
-      url: macUrl
-    },
-    receiver: {
-      title: 'Receiver connection',
-      hint: 'Scan from any phone, tablet, TV, or laptop browser to receive Local Focus alerts from this machine.',
-      url: receiverUrl
-    }
-  };
-  return options[kind] || options.install;
 }
 function saveFocusDraft() {
   localStorage.setItem(focusDraftKey, JSON.stringify({
@@ -4271,6 +4417,7 @@ function saveFocusDraft() {
     task: document.querySelector('#task').value,
     minutes: document.querySelector('#minutes').value,
     alertMinutes: document.querySelector('#alertMinutes').value,
+    actionMinutes: document.querySelector('#actionMinutes').value,
     alertAction: document.querySelector('#alertAction').value,
     alertMessage: document.querySelector('#alertMessage').value,
     redirectApp: document.querySelector('#redirectApp').value
@@ -4283,11 +4430,12 @@ function restoreFocusDraft() {
     if (draft.task) document.querySelector('#task').value = draft.task;
     if (draft.minutes) document.querySelector('#minutes').value = draft.minutes;
     if (draft.alertMinutes) document.querySelector('#alertMinutes').value = draft.alertMinutes;
+    if (draft.actionMinutes) document.querySelector('#actionMinutes').value = draft.actionMinutes;
     if (draft.alertAction) document.querySelector('#alertAction').value = draft.alertAction;
     if (draft.alertMessage) document.querySelector('#alertMessage').value = draft.alertMessage;
     if (draft.redirectApp) document.querySelector('#redirectApp').value = draft.redirectApp;
   } catch {}
-  ['#task', '#minutes', '#alertMinutes', '#alertAction', '#alertMessage', '#redirectApp'].forEach(selector => {
+  ['#task', '#minutes', '#alertMinutes', '#actionMinutes', '#alertAction', '#alertMessage', '#redirectApp'].forEach(selector => {
     document.querySelector(selector).addEventListener('input', saveFocusDraft);
     document.querySelector(selector).addEventListener('change', saveFocusDraft);
   });
@@ -4776,16 +4924,18 @@ async function refresh() {
   blockedRules = (state.blockedRules || []).map(rule => ({...rule, target: normalizedBlockValue(rule.target || '')}));
   document.querySelector('#blockedList').innerHTML = blockedRules.map(rule => `<span class="blocked-chip${rule.target === editingBlockTarget ? ' editing' : ''}" data-target="${escapeTextAttr(rule.target || '')}">${escapeHtml(shortenSource(rule.target || ''))} <small>${rule.mode === 'password' ? 'password' : 'full'}</small><button class="edit-chip" type="button" data-target="${escapeTextAttr(rule.target || '')}" onclick="editBlockFromButton(this)" aria-label="Edit ${escapeTextAttr(rule.target || '')}">edit</button><button type="button" data-target="${escapeTextAttr(rule.target || '')}" onclick="removeBlockFromButton(this)" aria-label="Remove ${escapeTextAttr(rule.target || '')}">x</button></span>`).join('') || '<div class="muted">No blocked apps or sites yet.</div>';
   syncBlockEditState();
-  document.querySelector('#deviceConnectUrl').textContent = state.deviceConnectUrl || 'http://127.0.0.1:4799/device';
-  deviceQrUrls = {
-    install: state.deviceInstallUrl || `${location.origin}/connect`,
-    receiver: state.deviceConnectUrl || `${location.origin}/device`,
-    android: state.androidAppUrl || `${location.origin}/download/local-focus-mobile.apk`,
-    mac: state.macAppUrl || `${location.origin}/download/local-focus-macos.dmg`
-  };
-  if (!document.querySelector('#deviceQrPanel').classList.contains('hidden')) renderDeviceQr(activeDeviceQrKind);
-  const qrDevices = (state.devices || []).filter(device => String(device.endpoint || '').startsWith('browser:') || String(device.endpoint || '').startsWith('mobile:'));
-  document.querySelector('#deviceList').innerHTML = qrDevices.map(qrDeviceRowMarkup).join('') || '<div class="muted">No QR-connected devices yet.</div>';
+  const connectUrl = state.deviceConnectUrl || 'http://127.0.0.1:4799/device';
+  document.querySelector('#deviceConnectUrl').textContent = connectUrl;
+  const connectHost = hostFromUrl(connectUrl);
+  const connectCode = encodeConnectCode(connectHost);
+  const connectCodeEl = document.querySelector('#connectCode');
+  if (connectCodeEl) connectCodeEl.textContent = connectCode || 'Unavailable';
+  const androidLink = document.querySelector('#androidDownloadLink');
+  if (androidLink) androidLink.href = state.androidAppUrl || `${location.origin}/download/local-focus-mobile.apk`;
+  const macLink = document.querySelector('#macDownloadLink');
+  if (macLink) macLink.href = state.macAppUrl || `${location.origin}/download/local-focus-macos.dmg`;
+  const connectedDevices = (state.devices || []).filter(device => String(device.endpoint || '').startsWith('browser:') || String(device.endpoint || '').startsWith('mobile:'));
+  document.querySelector('#deviceList').innerHTML = connectedDevices.map(connectedDeviceRowMarkup).join('') || '<div class="muted">No devices connected yet.</div>';
   document.querySelector('#historyList').innerHTML = history.map(item => {
     const r = item.report;
     return `<div class="item">
@@ -4869,11 +5019,16 @@ function updateHighFocusControls(focus) {
         : 'Block every active app or website outside the focus list.';
 }
 function seedFocusInputsFromActiveSession(focus) {
-  if (!focus) return;
+  if (!focus) { lastSeededFocusStart = null; return; }
+  // Only load the session's values into the form once (when it starts), so the
+  // periodic refresh never reverts edits the user is making.
+  if (focus.startedAt === lastSeededFocusStart) return;
+  lastSeededFocusStart = focus.startedAt;
   const taskInput = document.querySelector('#task');
   const targetInput = document.querySelector('#target');
   const minutesInput = document.querySelector('#minutes');
   const alertInput = document.querySelector('#alertMinutes');
+  const actionTimeInput = document.querySelector('#actionMinutes');
   const actionInput = document.querySelector('#alertAction');
   const messageInput = document.querySelector('#alertMessage');
   const redirectInput = document.querySelector('#redirectApp');
@@ -4881,6 +5036,7 @@ function seedFocusInputsFromActiveSession(focus) {
   if (focus.target && targetInput.value !== focus.target) setFocusTargets(focus.target);
   if (focus.durationMinutes) minutesInput.value = focus.durationMinutes;
   if (focus.alertDelaySeconds) alertInput.value = Math.max(1, Math.round(focus.alertDelaySeconds / 60));
+  if (focus.actionDelaySeconds && actionTimeInput) actionTimeInput.value = Math.max(1, Math.round(focus.actionDelaySeconds / 60));
   if (focus.alertAction) actionInput.value = focus.alertAction;
   messageInput.value = focus.alertMessage || DEFAULT_ALERT_MESSAGE_TEMPLATE;
   redirectInput.value = focus.redirectApp || '';
@@ -4893,15 +5049,20 @@ function updateFocusButtons(focus, stopped) {
   const running = Boolean(focus && !focus.paused);
   const paused = Boolean(focus && focus.paused);
   startButton.className = `focus-btn ${running ? 'focus-running' : 'focus-idle'}`;
-  startButton.textContent = stopped ? 'Start' : paused ? 'Restart focus' : running ? 'Focus' : 'Start focus';
+  startButton.textContent = stopped ? 'Start' : paused ? 'Restart focus' : running ? 'Running Focus' : 'Start focus';
   pauseButton.disabled = !focus || Boolean(stopped);
-  pauseButton.className = `focus-btn ${paused ? 'focus-paused' : running ? 'focus-running' : ''}`;
+  // Pause uses the same treatment as Stop so it reads differently from the green
+  // "Running Focus" button.
+  pauseButton.className = `focus-btn ${paused ? 'focus-paused' : running ? 'focus-stop-active' : ''}`;
   pauseButton.textContent = paused ? 'Resume' : 'Pause';
   // Stop is the master off switch: available whenever the app is running,
   // even without an active focus session, and disabled once already stopped.
   stopButton.disabled = Boolean(stopped);
   stopButton.className = `focus-btn ${stopped ? '' : 'focus-stop-active'}`;
   stopButton.title = 'Stop all tracking, blocking, alerts, and reminders until you resume';
+  // Show the editor's Save button only while a session is active to edit.
+  const saveEditsButton = document.querySelector('#saveFocusEdits');
+  if (saveEditsButton) saveEditsButton.style.display = focus && !stopped ? '' : 'none';
 }
 function sourceMarkup(source, index) {
   const shortSource = shortenSource(source);
@@ -5000,7 +5161,7 @@ code {{ overflow-wrap:anywhere; }}
 <main>
   <section>
     <h1>Connect Local Focus</h1>
-    <p class="muted">This QR page connects only the device that opens this exact link. Local Focus does not scan for nearby devices.</p>
+    <p class="muted">This page connects only the device that opens this exact link. Local Focus does not scan for nearby devices.</p>
     <p><code>{lan_url}</code></p>
   </section>
   <section>
@@ -5010,7 +5171,7 @@ code {{ overflow-wrap:anywhere; }}
   </section>
   <section>
     <h2>iPhone or iPad receiver</h2>
-    <p class="muted">This QR cannot install a native iPhone app. Apple requires Xcode, TestFlight, App Store, or a signed enterprise/ad-hoc package for iOS app installation. Use this receiver link now to receive Local Focus alerts.</p>
+    <p class="muted">This page cannot install a native iPhone app. Apple requires Xcode, TestFlight, App Store, or a signed enterprise/ad-hoc package for iOS app installation. Use this receiver link now to receive Local Focus alerts.</p>
     <div class="actions"><a class="button secondary" href="{receiver_url}">Connect iPhone as receiver</a></div>
   </section>
   <section>
@@ -5055,7 +5216,7 @@ button { background:var(--good); color:white; font-weight:800; cursor:pointer; }
 <main>
   <section>
     <h1>Local Focus Device</h1>
-    <p class="muted">Connect this phone, TV, tablet, or laptop from the QR link to receive Local Focus alerts. Local Focus does not scan for nearby devices.</p>
+    <p class="muted">Connect this phone, TV, tablet, or laptop with the connection code or direct link to receive Local Focus alerts. Local Focus does not scan for nearby devices.</p>
   </section>
   <section>
     <h2>Connect device</h2>
@@ -5284,6 +5445,20 @@ fn format_block_rule_record(target: &str, mode: BlockMode, password: &str) -> St
     )
 }
 
+/// Split a block input into individual, trimmed, lowercased keywords. Commas and
+/// newlines separate entries, so "youtube, reddit, games" becomes three blocks.
+/// Duplicates and blanks are dropped.
+fn split_block_keywords(raw: &str) -> Vec<String> {
+    let mut keywords: Vec<String> = Vec::new();
+    for part in raw.split([',', '\n']) {
+        let keyword = part.trim().to_lowercase();
+        if !keyword.is_empty() && !keywords.contains(&keyword) {
+            keywords.push(keyword);
+        }
+    }
+    keywords
+}
+
 fn parse_block_rule_record(record: &str) -> BlockRule {
     let mut parts = record.splitn(3, '|');
     let target = parts.next().unwrap_or("").trim().to_lowercase();
@@ -5324,7 +5499,7 @@ fn save_focus(data_dir: &Path, focus: &FocusSession) -> io::Result<()> {
     fs::write(
         data_dir.join("focus.json"),
         format!(
-            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{},\"alertDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{}}}",
+            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{}}}",
             json_escape(&focus.task),
             json_escape(&focus.target),
             focus.started_at,
@@ -5334,6 +5509,7 @@ fn save_focus(data_dir: &Path, focus: &FocusSession) -> io::Result<()> {
             focus.paused_total_seconds,
             pomodoro_alerted_at,
             focus.alert_delay_seconds,
+            focus.action_delay_seconds,
             json_escape(&focus.alert_action),
             json_escape(&clean_alert_message_template(&focus.alert_message)),
             json_escape(&focus.redirect_app),
@@ -5356,6 +5532,9 @@ fn load_focus(data_dir: &Path) -> Option<FocusSession> {
         alert_delay_seconds: json_number(&value, "alertDelaySeconds")
             .map(|value| value.max(1) as u64)
             .unwrap_or(DEFAULT_ALERT_DELAY_SECONDS),
+        action_delay_seconds: json_number(&value, "actionDelaySeconds")
+            .map(|value| value.max(1) as u64)
+            .unwrap_or(DEFAULT_ACTION_DELAY_SECONDS),
         alert_action: json_string(&value, "alertAction").unwrap_or_else(|| "alert".into()),
         alert_message: json_string(&value, "alertMessage")
             .map(|message| clean_alert_message_template(&message))
@@ -5588,6 +5767,58 @@ fn idle_warning_devices(records: &[String]) -> Vec<NetworkDevice> {
 
 fn is_qr_connected_device(device: &NetworkDevice) -> bool {
     device.endpoint.starts_with("browser:") || device.endpoint.starts_with("mobile:")
+}
+
+// A browser tab always registers a brand-new `browser:<timestamp>` endpoint
+// (see `/api/device/register`) and never reconnects to an old one, so once an
+// entry stops being seen (registered or polled) it can never become live
+// again. Drop any such entry the connect page hasn't touched recently, so
+// closed tabs don't pile up in the persisted device list forever. Real
+// companion devices (`mobile:...`) are untouched — they reconnect to a
+// stable endpoint and are deduped by `/api/mobile/register` instead.
+const BROWSER_DEVICE_TTL_SECONDS: i64 = 60;
+
+fn prune_stale_browser_devices(
+    records: &[String],
+    last_seen: &HashMap<String, i64>,
+    now: i64,
+) -> Vec<String> {
+    records
+        .iter()
+        .filter(|record| {
+            let device = parse_network_device_record(record);
+            if !device.endpoint.starts_with("browser:") {
+                return true;
+            }
+            last_seen
+                .get(&device.endpoint)
+                .is_some_and(|seen| now - seen <= BROWSER_DEVICE_TTL_SECONDS)
+        })
+        .cloned()
+        .collect()
+}
+
+// Runs on every tracking tick so a closed connect-page tab drops out of the
+// persisted device list on its own, instead of sitting there forever.
+fn prune_disconnected_browser_devices(
+    data_dir: &Path,
+    state: &Arc<Mutex<AppState>>,
+) -> io::Result<()> {
+    let now_ts = now();
+    let config_snapshot = {
+        let mut guard = lock_state(state);
+        let pruned =
+            prune_stale_browser_devices(&guard.config.network_devices, &guard.browser_last_seen, now_ts);
+        if pruned.len() == guard.config.network_devices.len() {
+            return Ok(());
+        }
+        guard.config.network_devices = pruned;
+        guard
+            .browser_last_seen
+            .retain(|_, seen| now_ts - *seen <= BROWSER_DEVICE_TTL_SECONDS);
+        guard.config.clone()
+    };
+    save_config(data_dir, &config_snapshot)
 }
 
 fn push_unique_device(devices: &mut Vec<NetworkDevice>, device: NetworkDevice) {
@@ -6252,19 +6483,6 @@ fn json_escape(value: &str) -> String {
     escaped
 }
 
-fn html_attr_escape(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|c| match c {
-            '&' => "&amp;".chars().collect::<Vec<_>>(),
-            '<' => "&lt;".chars().collect(),
-            '>' => "&gt;".chars().collect(),
-            '"' => "&quot;".chars().collect(),
-            '\'' => "&#039;".chars().collect(),
-            _ => vec![c],
-        })
-        .collect()
-}
 
 /// Find the byte offset just past `"key":` for a key that sits at a value
 /// boundary (preceded by `{`, `,`, or whitespace), so a key name appearing as a
@@ -6378,6 +6596,7 @@ mod tests {
             paused_total_seconds: 0,
             pomodoro_alerted_at: None,
             alert_delay_seconds: DEFAULT_ALERT_DELAY_SECONDS,
+            action_delay_seconds: DEFAULT_ACTION_DELAY_SECONDS,
             alert_action: "alert".into(),
             alert_message: DEFAULT_ALERT_MESSAGE_TEMPLATE.into(),
             redirect_app: String::new(),
@@ -6403,6 +6622,48 @@ mod tests {
             focus_alert_message(&session, &active),
             "You have been outside your focus apps/sites for over 3 minutes. Allowed: 'Pages, https://claude.ai/'. Current activity: Safari"
         );
+    }
+
+    #[test]
+    fn block_keywords_split_on_commas_and_dedupe() {
+        assert_eq!(
+            split_block_keywords("youtube, reddit, games"),
+            vec!["youtube", "reddit", "games"]
+        );
+        // Trims, lowercases, and drops duplicates and blanks.
+        assert_eq!(
+            split_block_keywords("  YouTube , youtube ,, Reddit\nreddit "),
+            vec!["youtube", "reddit"]
+        );
+        assert_eq!(split_block_keywords("solo"), vec!["solo"]);
+        assert!(split_block_keywords("  ,  ,  ").is_empty());
+    }
+
+    #[test]
+    fn move_to_app_action_switches_only_with_a_redirect_app() {
+        // Regression guard for the "Move to app" warning action: it must switch
+        // to the redirect app when one is set...
+        assert!(focus_alert_switches_app("switch", "Pages"));
+        // ...but fall back to a plain alert when the action is "alert"...
+        assert!(!focus_alert_switches_app("alert", "Pages"));
+        // ...or when there is no redirect app to move to.
+        assert!(!focus_alert_switches_app("switch", ""));
+        assert!(!focus_alert_switches_app("switch", "   "));
+    }
+
+    #[test]
+    fn move_action_repeats_on_its_own_timer() {
+        // Action timer (300s) is independent of the alert timer.
+        // Below the action delay -> no move yet.
+        assert!(!should_move_to_app(120, 300, 9999, true));
+        // Reached the action delay and the repeat cooldown has passed -> move.
+        assert!(should_move_to_app(300, 300, 300, true));
+        // Off focus long enough, but it just moved (cooldown not elapsed) -> wait.
+        assert!(!should_move_to_app(600, 300, 100, true));
+        // Cooldown elapsed again -> repeat the move.
+        assert!(should_move_to_app(600, 300, 300, true));
+        // Action disabled (alert-only) -> never moves.
+        assert!(!should_move_to_app(600, 300, 9999, false));
     }
 
     #[test]
@@ -6621,13 +6882,16 @@ mod tests {
         assert!(remote_path_allowed("/api/focus/stop"));
         assert!(remote_path_allowed("/api/focus-report"));
         assert!(remote_path_allowed("/api/focus-sessions"));
+        // Companion parity: journal, block list, and report history are reachable
+        // so the phone can use them.
+        assert!(remote_path_allowed("/api/journal/entry"));
+        assert!(remote_path_allowed("/api/journal/save"));
+        assert!(remote_path_allowed("/api/block/add"));
+        assert!(remote_path_allowed("/api/report/history"));
         // Sensitive surface stays loopback-only.
         assert!(!remote_path_allowed("/"));
         assert!(!remote_path_allowed("/api/timeline"));
-        assert!(!remote_path_allowed("/api/journal/entry"));
-        assert!(!remote_path_allowed("/api/report/history"));
         assert!(!remote_path_allowed("/api/report/reset"));
-        assert!(!remote_path_allowed("/api/block/add"));
         assert!(!remote_path_allowed("/api/app/resume"));
     }
 
