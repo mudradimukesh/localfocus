@@ -6850,6 +6850,36 @@ mod tests {
     }
 
     #[test]
+    fn prune_stale_browser_devices_drops_unseen_browser_entries() {
+        let records = vec![
+            "Device|phone|browser:1000|selected".to_string(),
+            "Device|phone|browser:2000|selected".to_string(),
+            "Phone|phone|mobile:1782160452|selected".to_string(),
+        ];
+        let mut last_seen: HashMap<String, i64> = HashMap::new();
+        // browser:1000 hasn't been seen recently; browser:2000 was just seen.
+        last_seen.insert("browser:1000".to_string(), 0);
+        last_seen.insert("browser:2000".to_string(), 100);
+
+        let kept = prune_stale_browser_devices(&records, &last_seen, 100);
+
+        let endpoints: Vec<String> = kept
+            .iter()
+            .map(|record| parse_network_device_record(record).endpoint)
+            .collect();
+        assert_eq!(endpoints, vec!["browser:2000", "mobile:1782160452"]);
+    }
+
+    #[test]
+    fn prune_stale_browser_devices_drops_never_seen_entries() {
+        // A "browser:" device with no last_seen entry at all (e.g. left over
+        // from before a restart) is dead and must be pruned immediately.
+        let records = vec!["Device|phone|browser:1000|selected".to_string()];
+        let kept = prune_stale_browser_devices(&records, &HashMap::new(), 100);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
     fn json_escape_escapes_control_characters() {
         assert_eq!(json_escape("a\u{0007}b"), "a\\u0007b");
         assert_eq!(json_escape("tab\tnewline\n"), "tab\\tnewline\\n");

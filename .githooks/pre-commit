@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+# Runs the full test suite before every commit. Installed automatically into
+# .git/hooks/pre-commit for this clone; tracked here so it's easy to
+# reinstall (`cp .githooks/pre-commit .git/hooks/` + `chmod +x`) elsewhere.
+set -eu
+
+ROOT_DIR=$(git rev-parse --show-toplevel)
+sh "$ROOT_DIR/scripts/test.sh"
