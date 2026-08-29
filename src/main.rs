@@ -7003,6 +7003,86 @@ mod tests {
     }
 
     #[test]
+    fn switch_report_handles_no_samples_without_panicking() {
+        let dir = temp_test_dir("switch-report-empty");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let report = switch_report_json(&dir).expect("switch report");
+
+        assert_eq!(json_number(&report, "totalSwitches"), Some(0));
+        assert_eq!(json_number(&report, "distractingSwitches"), Some(0));
+        assert!(report.contains("\"topSwitchTargets\":[]"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn switch_report_excludes_switches_before_the_window_start() {
+        let dir = temp_test_dir("switch-report-window");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let base = now();
+        // Two switches well before the report window starts...
+        append_sample(
+            &dir,
+            &ActivitySample {
+                timestamp: base - 3600,
+                app: "Claude".into(),
+                title: "Claude".into(),
+                source: "local".into(),
+                category: "productive".into(),
+            },
+        )
+        .expect("append old sample");
+        append_sample(
+            &dir,
+            &ActivitySample {
+                timestamp: base - 3595,
+                app: "Google Chrome".into(),
+                title: "YouTube".into(),
+                source: "local".into(),
+                category: "distracting".into(),
+            },
+        )
+        .expect("append old sample");
+        // ...then one switch after the window starts.
+        fs::write(dir.join("report_start.txt"), (base - 10).to_string())
+            .expect("write report_start.txt");
+        append_sample(
+            &dir,
+            &ActivitySample {
+                timestamp: base,
+                app: "Claude".into(),
+                title: "Claude".into(),
+                source: "local".into(),
+                category: "productive".into(),
+            },
+        )
+        .expect("append new sample");
+        append_sample(
+            &dir,
+            &ActivitySample {
+                timestamp: base + 5,
+                app: "WhatsApp".into(),
+                title: "WhatsApp".into(),
+                source: "local".into(),
+                category: "distracting".into(),
+            },
+        )
+        .expect("append new sample");
+
+        let report = switch_report_json(&dir).expect("switch report");
+
+        // Only the switch after report_start.txt should count.
+        assert_eq!(json_number(&report, "totalSwitches"), Some(1));
+        assert_eq!(json_number(&report, "distractingSwitches"), Some(1));
+        assert!(report.contains("WhatsApp"));
+        assert!(!report.contains("YouTube"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn json_escape_escapes_control_characters() {
         assert_eq!(json_escape("a\u{0007}b"), "a\\u0007b");
         assert_eq!(json_escape("tab\tnewline\n"), "tab\\tnewline\\n");
