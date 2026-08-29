@@ -6957,6 +6957,190 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         dir
     }
+
+    // --- Integration tests: spin up the real HTTP server (`handle_http`, the
+    // same function `run_app` hands every accepted connection) on an ephemeral
+    // port against a throwaway data dir, then hit routes over a real TCP
+    // socket exactly like the dashboard's `fetch()` calls do. This exercises
+    // routing, query parsing, CSRF/mutation checks, and on-disk persistence
+    // together, unlike the unit tests above which call internal functions
+    // directly. The background tracking/focus/journal loops are intentionally
+    // not started, since they poll real OS activity and aren't needed to
+    // exercise the HTTP surface.
+
+    fn start_test_server(name: &str) -> (u16, PathBuf) {
+        let data_dir = temp_test_dir(name);
+        fs::create_dir_all(&data_dir).expect("create test data dir");
+        ensure_config(&data_dir).expect("ensure config");
+
+        let config = load_config(&data_dir).unwrap_or_default();
+        let state = Arc::new(Mutex::new(AppState {
+            config,
+            focus: load_focus(&data_dir),
+            ..Default::default()
+        }));
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        let returned_dir = data_dir.clone();
+
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                if let Ok(stream) = stream {
+                    let request_dir = data_dir.clone();
+                    let request_state = Arc::clone(&state);
+                    thread::spawn(move || {
+                        let _ = handle_http(stream, request_dir, request_state);
+                    });
+                }
+            }
+        });
+
+        (port, returned_dir)
+    }
+
+    /// GET `path` from the test server on `port` and return (status, body).
+    fn test_get(port: u16, path: &str) -> (u16, String) {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to test server");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .expect("read response");
+        let response = String::from_utf8_lossy(&response).into_owned();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap_or((&response, ""));
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(0);
+        (status, body.to_string())
+    }
+
+    #[test]
+    fn integration_focus_session_lifecycle_over_http() {
+        let (port, dir) = start_test_server("integration-focus");
+
+        let (status, body) = test_get(port, "/api/state");
+        assert_eq!(status, 200);
+        assert_eq!(json_bool(&body, "stopped"), Some(false));
+
+        let (status, _) = test_get(
+            port,
+            "/api/focus/start?task=Deep+work&minutes=25&target=Terminal",
+        );
+        assert_eq!(status, 200);
+
+        let (_, body) = test_get(port, "/api/state");
+        assert_eq!(json_string(&body, "task").as_deref(), Some("Deep work"));
+        assert_eq!(json_string(&body, "target").as_deref(), Some("Terminal"));
+        assert_eq!(json_bool(&body, "paused"), Some(false));
+
+        let (_, body) = test_get(port, "/api/focus/pause");
+        assert_eq!(json_bool(&body, "ok"), Some(true));
+        let (_, body) = test_get(port, "/api/state");
+        assert_eq!(json_bool(&body, "paused"), Some(true));
+
+        let (_, body) = test_get(port, "/api/focus/pause");
+        assert_eq!(json_bool(&body, "ok"), Some(true));
+        let (_, body) = test_get(port, "/api/state");
+        assert_eq!(json_bool(&body, "paused"), Some(false));
+
+        let (_, body) = test_get(port, "/api/focus/stop");
+        assert_eq!(json_bool(&body, "stopped"), Some(true));
+        let (_, body) = test_get(port, "/api/state");
+        assert_eq!(json_bool(&body, "stopped"), Some(true));
+
+        let (_, body) = test_get(port, "/api/app/resume");
+        assert_eq!(json_bool(&body, "stopped"), Some(false));
+        let (_, body) = test_get(port, "/api/state");
+        assert_eq!(json_bool(&body, "stopped"), Some(false));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn integration_block_rule_add_and_remove_over_http() {
+        let (port, dir) = start_test_server("integration-block");
+
+        let (_, before) = test_get(port, "/api/state");
+        assert!(!before.contains("qa-blocked.example"));
+
+        let (status, _) = test_get(
+            port,
+            "/api/block/add?keyword=qa-blocked.example&mode=full",
+        );
+        assert_eq!(status, 200);
+
+        let (_, after_add) = test_get(port, "/api/state");
+        assert!(after_add.contains("qa-blocked.example"));
+
+        let (status, _) = test_get(port, "/api/block/remove?keyword=qa-blocked.example");
+        assert_eq!(status, 200);
+
+        let (_, after_remove) = test_get(port, "/api/state");
+        assert!(!after_remove.contains("qa-blocked.example"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn integration_journal_save_and_load_over_http() {
+        let (port, dir) = start_test_server("integration-journal");
+
+        let (status, body) = test_get(
+            port,
+            "/api/journal/save?date=2026-01-15&text=Shipped+the+QA+suite",
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            json_string(&body, "text").as_deref(),
+            Some("Shipped the QA suite")
+        );
+
+        let (status, body) = test_get(port, "/api/journal/entry?date=2026-01-15");
+        assert_eq!(status, 200);
+        assert_eq!(json_string(&body, "date").as_deref(), Some("2026-01-15"));
+        assert_eq!(
+            json_string(&body, "text").as_deref(),
+            Some("Shipped the QA suite")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn integration_device_register_appears_then_expires_over_http() {
+        let (port, dir) = start_test_server("integration-device");
+
+        let (status, _) = test_get(port, "/api/device/register?name=QaBrowser&kind=phone");
+        assert_eq!(status, 200);
+
+        let (_, body) = test_get(port, "/api/state");
+        assert!(body.contains("QaBrowser"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn integration_unknown_route_falls_back_to_dashboard() {
+        // Any unmatched path serves the dashboard shell (no client-side
+        // router, no separate 404 page), matching `handle_http`'s final
+        // `else` branch.
+        let (port, dir) = start_test_server("integration-fallback");
+        let (status, body) = test_get(port, "/api/does-not-exist");
+        assert_eq!(status, 200);
+        assert!(body.contains("Local Focus"));
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(target_os = "macos")]
