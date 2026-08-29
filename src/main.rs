@@ -2255,6 +2255,12 @@ fn handle_http(
         )?;
     } else if route == "/api/report" {
         write_response(&mut stream, "application/json", &report_json(&data_dir)?)?;
+    } else if route == "/api/report/switches" {
+        write_response(
+            &mut stream,
+            "application/json",
+            &switch_report_json(&data_dir)?,
+        )?;
     } else if route == "/api/state" {
         let (focus, devices, blocks, stopped) = {
             let guard = lock_state(&state);
@@ -2380,6 +2386,7 @@ fn remote_path_allowed(route: &str) -> bool {
     route.starts_with("/device")
         || route == "/api/state"
         || route == "/api/report"
+        || route == "/api/report/switches"
         // Past archived reports, but not report reset (loopback-only).
         || route == "/api/report/history"
         || prefixes.iter().any(|prefix| route.starts_with(prefix))
@@ -2579,6 +2586,66 @@ fn report_json(data_dir: &Path) -> io::Result<String> {
         distracting as u64 * SAMPLE_SECONDS / 60,
         idle as u64 * SAMPLE_SECONDS / 60,
         app_json
+    ))
+}
+
+/// How often attention actually shifts, independent of `report_json`'s
+/// duration-based view. The research behind this: habitual interruption
+/// (how often you check something) degrades sustained attention on its own,
+/// separately from how many total minutes were spent distracted — a low
+/// distracted-minutes total can still hide a shredded, constantly-switching
+/// attention pattern. Counts a "switch" as any change in the foreground
+/// app or window title between consecutive samples, over the same rolling
+/// report window `report_json` uses.
+fn switch_report_json(data_dir: &Path) -> io::Result<String> {
+    let samples = load_samples(data_dir)?;
+    let since = report_window_start(data_dir)?.max(now() - 24 * 60 * 60);
+    let recent: Vec<_> = samples
+        .into_iter()
+        .filter(|s| s.timestamp >= since)
+        .collect();
+
+    let mut total_switches: u64 = 0;
+    let mut distracting_switches: u64 = 0;
+    let mut switch_targets: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut previous: Option<&ActivitySample> = None;
+    for sample in &recent {
+        if let Some(prev) = previous {
+            if prev.app != sample.app || prev.title != sample.title {
+                total_switches += 1;
+                if sample.category == "distracting" {
+                    distracting_switches += 1;
+                }
+                *switch_targets
+                    .entry((sample.app.clone(), sample.source.clone()))
+                    .or_default() += 1;
+            }
+        }
+        previous = Some(sample);
+    }
+
+    let window_minutes = (recent.len() as u64 * SAMPLE_SECONDS / 60).max(1);
+    let switches_per_hour = total_switches as f64 / (window_minutes as f64 / 60.0);
+
+    let mut top: Vec<_> = switch_targets.into_iter().collect();
+    top.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    let top_json = top
+        .into_iter()
+        .take(10)
+        .map(|((app, source), count)| {
+            format!(
+                "{{\"app\":\"{}\",\"source\":\"{}\",\"switches\":{}}}",
+                json_escape(&app),
+                json_escape(&source),
+                count
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    Ok(format!(
+        "{{\"totalSwitches\":{},\"distractingSwitches\":{},\"switchesPerHour\":{:.1},\"topSwitchTargets\":[{}]}}",
+        total_switches, distracting_switches, switches_per_hour, top_json
     ))
 }
 
@@ -3972,6 +4039,17 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
     </div>
     <section class="report report-inline" id="focusReportPanel" aria-live="polite"></section>
   </section>
+  <section id="switchReportCard" class="control-shell" aria-label="Interruption frequency">
+    <div>
+      <h2>Interruption frequency</h2>
+      <div class="muted">A second, independent report: how often your attention actually shifts, not how many minutes were distracted. Frequent switching fragments focus even on a day where the duration report above looks fine.</div>
+    </div>
+    <section class="grid focus-summary-grid" id="switchMetrics" aria-label="Interruption frequency summary"></section>
+    <div>
+      <strong>Most switched-to</strong>
+      <div id="switchTargets" class="muted">No switches recorded yet.</div>
+    </div>
+  </section>
   <section id="devicesCard" class="control-shell" aria-label="Connect to device">
     <div>
       <h2>Connect to device</h2>
@@ -4006,6 +4084,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
       <div><h3>Distracted</h3><p>Any activity that is not productive. During targeted focus, every app or site outside your focus list is tracked here.</p></div>
       <div><h3>Idle</h3><p>If there is no keyboard or mouse input for 60 seconds, time is tracked as idle even when the focused app or website matches your focus list.</p></div>
       <div><h3>Blocked</h3><p>Blocked apps or sites are actively closed when detected, and the blocked time is tracked as distracted.</p></div>
+      <div><h3>Switches</h3><p>Every time the foreground app or window title changes, in the same window as the report above. Independent of duration — a low distracted-minutes total can still hide constant switching.</p></div>
     </div>
   </section>
   <section class="bar">
@@ -4894,11 +4973,12 @@ function showHourDetails(hour, button) {
     <div class="activity-mix">${rows || '<p class="muted">No detailed activity found for this hour.</p>'}</div>`;
 }
 async function refresh() {
-  const [timeline, report, state, history] = await Promise.all([
+  const [timeline, report, state, history, switches] = await Promise.all([
     fetch('/api/timeline').then(r => r.json()),
     fetch('/api/report').then(r => r.json()),
     fetch('/api/state').then(r => r.json()),
-    fetch('/api/report/history').then(r => r.json())
+    fetch('/api/report/history').then(r => r.json()),
+    fetch('/api/report/switches').then(r => r.json())
   ]);
   activeFocusSession = state.focus || null;
   const stopBanner = document.querySelector('#stopBanner');
@@ -4909,6 +4989,11 @@ async function refresh() {
     <div class="metric"><span class="muted">Productive</span><strong>${formatDuration(report.productiveMinutes * 60)}</strong></div>
     <div class="metric"><span class="muted">Distracted</span><strong>${formatDuration(report.distractingMinutes * 60)}</strong></div>
     <div class="metric"><span class="muted">Idle</span><strong>${formatDuration((report.idleMinutes || 0) * 60)}</strong></div>`;
+  document.querySelector('#switchMetrics').innerHTML = `
+    <div class="metric"><span class="muted">Switches</span><strong>${switches.totalSwitches || 0}</strong></div>
+    <div class="metric"><span class="muted">Per hour</span><strong>${(switches.switchesPerHour || 0).toFixed(1)}</strong></div>
+    <div class="metric"><span class="muted">Into distractions</span><strong>${switches.distractingSwitches || 0}</strong></div>`;
+  document.querySelector('#switchTargets').innerHTML = (switches.topSwitchTargets || []).map(target => `<p><strong>${escapeHtml(target.app)}</strong><br><span class="muted">${target.switches} switch${target.switches === 1 ? '' : 'es'}</span></p>`).join('') || '<div class="muted">No switches recorded yet.</div>';
   document.querySelector('#timeline').innerHTML = timeline.slice(-80).reverse().map((item, index) => {
     const longAttention = item.durationSeconds > 15 * 60 && (item.category === 'idle' || item.category === 'distracting');
     const longClass = longAttention ? ` long-attention ${item.category === 'idle' ? 'long-idle' : 'long-distracting'}` : '';
@@ -6880,6 +6965,44 @@ mod tests {
     }
 
     #[test]
+    fn switch_report_counts_app_and_title_changes() {
+        let dir = temp_test_dir("switch-report");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let base = now();
+        let samples = [
+            ("Claude", "Claude", "local", "productive", base),
+            ("Claude", "Claude", "local", "productive", base + 5),
+            ("Google Chrome", "YouTube", "local", "distracting", base + 10),
+            ("Google Chrome", "YouTube", "local", "distracting", base + 15),
+            ("Claude", "Claude", "local", "productive", base + 20),
+        ];
+        for (app, title, source, category, timestamp) in samples {
+            append_sample(
+                &dir,
+                &ActivitySample {
+                    timestamp,
+                    app: app.into(),
+                    title: title.into(),
+                    source: source.into(),
+                    category: category.into(),
+                },
+            )
+            .expect("append sample");
+        }
+
+        let report = switch_report_json(&dir).expect("switch report");
+        // Claude -> Chrome -> Claude: two switches, one of them into a
+        // distracting app. No switch is counted between the two identical
+        // consecutive Claude/Chrome samples.
+        assert_eq!(json_number(&report, "totalSwitches"), Some(2));
+        assert_eq!(json_number(&report, "distractingSwitches"), Some(1));
+        assert!(report.contains("\"topSwitchTargets\""));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn json_escape_escapes_control_characters() {
         assert_eq!(json_escape("a\u{0007}b"), "a\\u0007b");
         assert_eq!(json_escape("tab\tnewline\n"), "tab\\tnewline\\n");
@@ -7127,6 +7250,17 @@ mod tests {
         let (_, body) = test_get(port, "/api/state");
         assert!(body.contains("QaBrowser"));
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn integration_report_switches_endpoint_returns_json() {
+        let (port, dir) = start_test_server("integration-switches");
+        let (status, body) = test_get(port, "/api/report/switches");
+        assert_eq!(status, 200);
+        assert!(body.contains("totalSwitches"));
+        assert!(body.contains("distractingSwitches"));
+        assert!(body.contains("topSwitchTargets"));
         let _ = fs::remove_dir_all(dir);
     }
 
