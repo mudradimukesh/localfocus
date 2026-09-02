@@ -383,7 +383,7 @@ fn focus_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<()> 
                 os_alert(
                     "Focus complete",
                     &format!(
-                        "{} Pomodoro is complete. Focus monitoring is still active until you Pause or Stop. Take a {} minute break when you are ready.",
+                        "{} — time is up. Tracking keeps running until you pause the session or turn Local Focus off. Take a {} minute break when you are ready.",
                         session.task, session.break_minutes
                     ),
                 );
@@ -1856,9 +1856,11 @@ fn handle_http(
             guard.focus = None;
             guard.stopped = true;
         }
+        // "off", not "paused": pausing is what a single session does, and
+        // reusing that word here is what made the two controls read alike.
         notify(
-            "Local Focus stopped",
-            "Tracking, blocking, alerts, and reminders are paused until you resume.",
+            "Local Focus turned off",
+            "Tracking, blocking, warnings, and reminders stay off until you turn it back on.",
         );
         write_response(&mut stream, "application/json", "{\"ok\":true,\"stopped\":true}")?;
     } else if path.starts_with("/api/app/resume") {
@@ -1867,8 +1869,8 @@ fn handle_http(
             guard.stopped = false;
         }
         notify(
-            "Local Focus resumed",
-            "Tracking, blocking, alerts, and reminders are active again.",
+            "Local Focus turned on",
+            "Tracking, blocking, warnings, and reminders are on again.",
         );
         write_response(&mut stream, "application/json", "{\"ok\":true,\"stopped\":false}")?;
     } else if path.starts_with("/api/block/add") {
@@ -3716,6 +3718,17 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
 .quick-metric { border:1px solid var(--line); border-radius:8px; padding:10px; background:var(--panel); }
 .quick-metric span { color:var(--muted); display:block; font-size:11px; font-weight:700; }
 .quick-metric strong { display:block; margin-top:2px; font-size:16px; }
+.focus-timer { display:flex; align-items:center; gap:14px; border:1px solid var(--line); border-radius:10px; padding:12px 14px; background:var(--panel); }
+.timer-ring { width:84px; height:84px; flex:none; transform:rotate(-90deg); }
+.timer-ring circle { fill:none; stroke-width:8; stroke-linecap:round; }
+.timer-ring-track { stroke:var(--line); }
+.timer-ring-progress { stroke:var(--accent); transition:stroke-dashoffset .5s linear; }
+.focus-timer.is-paused .timer-ring-progress { stroke:var(--warn); }
+.focus-timer.is-done .timer-ring-progress { stroke:var(--good); }
+.focus-timer.is-idle .timer-ring-progress { stroke:var(--line); }
+.timer-readout { display:grid; gap:2px; min-width:0; }
+.timer-readout strong { font-size:34px; line-height:1.05; letter-spacing:-.02em; font-variant-numeric:tabular-nums; }
+.timer-readout span { font-size:12px; }
 .high-focus-control { border:1px solid var(--line); border-radius:8px; padding:10px; background:var(--panel); display:grid; gap:8px; }
 .high-focus-row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; }
 .high-focus-check { display:flex; align-items:center; gap:8px; font-weight:800; }
@@ -3875,8 +3888,8 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
 </header>
 <main>
   <div id="stopBanner" style="display:none; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap; border:1px solid var(--bad); background:color-mix(in srgb, var(--bad) 12%, var(--panel)); color:var(--ink); border-radius:12px; padding:14px 18px;">
-    <strong>Local Focus is stopped — tracking, blocking, alerts, and reminders are paused until you resume.</strong>
-    <button onclick="resumeApp()" style="background:var(--good); border-color:var(--good); color:#fff; white-space:nowrap;">Resume Local Focus</button>
+    <strong>Local Focus is off — tracking, blocking, warnings, and reminders stay off until you turn it back on.</strong>
+    <button onclick="resumeApp()" style="background:var(--good); border-color:var(--good); color:#fff; white-space:nowrap;">Turn on Local Focus</button>
   </div>
   <section class="focus-shell">
     <div class="focus-shell-head">
@@ -3902,17 +3915,17 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
           <div id="targetListEditor" class="target-list-editor empty" aria-live="polite"></div>
           <input id="target" type="hidden" aria-label="Focus targets">
         </div>
-        <div class="field"><label for="minutes">Focus timer</label><input id="minutes" type="number" min="1" max="180" value="25" aria-label="Minutes"></div>
-        <div class="field"><label for="alertMinutes">Alert: warn after (min)</label><input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Alert after minutes" title="Show the warning alert this many minutes after leaving focus, repeating every interval"></div>
-        <div class="field"><label for="alertAction">Action when off focus</label><select id="alertAction" aria-label="Off-focus action" title="What happens once the action timer elapses">
-          <option value="alert">None (alert only)</option>
-          <option value="switch">Move to app</option>
+        <div class="field"><label for="minutes">Session length (minutes)</label><input id="minutes" type="number" min="1" max="180" value="25" aria-label="Session length in minutes"></div>
+        <div class="field"><label for="alertMinutes">Warn me after (minutes off task)</label><input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Warn me after this many minutes off task" title="Warn me once I have been off task this long, then repeat every interval"></div>
+        <div class="field"><label for="alertAction">If I stay off task</label><select id="alertAction" aria-label="What to do if I stay off task" title="What happens once the off-task timer runs out">
+          <option value="alert">Just warn me</option>
+          <option value="switch">Switch me to an app</option>
         </select></div>
-        <div class="field"><label for="actionMinutes">Action: move every (min)</label><input id="actionMinutes" type="number" min="1" max="60" value="2" aria-label="Move every minutes" title="Move to the app this many minutes after leaving focus, repeating on its own timer"></div>
-        <div class="field"><label for="redirectApp">App to move to</label><input id="redirectApp" placeholder="Pages" aria-label="Move focus to app"></div>
+        <div class="field"><label for="actionMinutes">Switch me back every (minutes)</label><input id="actionMinutes" type="number" min="1" max="60" value="2" aria-label="Switch me back every this many minutes" title="Switch me back once I have been off task this long, then repeat on its own timer"></div>
+        <div class="field"><label for="redirectApp">App to switch me to</label><input id="redirectApp" placeholder="Pages" aria-label="App to switch me to"></div>
         <div class="field field-wide alert-message-field">
-          <label for="alertMessage">Alert message</label>
-          <textarea id="alertMessage" aria-label="Alert message">You have been outside your focus apps/sites for over {delay}. Allowed: '{targets}'. Current activity: {app}</textarea>
+          <label for="alertMessage">Warning message</label>
+          <textarea id="alertMessage" aria-label="Warning message">You have been outside your focus apps/sites for over {delay}. Allowed: '{targets}'. Current activity: {app}</textarea>
           <div class="muted">Use {delay}, {targets}, {app}, {title}, or {url}.</div>
         </div>
         <div class="field field-wide">
@@ -3923,11 +3936,21 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
   </section>
   <aside class="focus-side">
     <h3>Current focus session</h3>
+    <div id="focusTimer" class="focus-timer is-idle">
+      <svg class="timer-ring" viewBox="0 0 120 120" aria-hidden="true">
+        <circle class="timer-ring-track" cx="60" cy="60" r="54"></circle>
+        <circle class="timer-ring-progress" id="timerRingProgress" cx="60" cy="60" r="54"></circle>
+      </svg>
+      <div class="timer-readout" role="timer" aria-live="off">
+        <strong id="timerValue">--:--</strong>
+        <span id="timerCaption" class="muted">No session running</span>
+      </div>
+    </div>
     <div class="quick-metrics">
       <div class="quick-metric"><span>Task</span><strong id="quickTask">None</strong></div>
-      <div class="quick-metric"><span>Status</span><strong id="quickStatus">Off</strong></div>
-      <div class="quick-metric"><span>Warn after</span><strong id="quickDelay">1m</strong></div>
-      <div class="quick-metric"><span>Action</span><strong id="quickAction">Alert</strong></div>
+      <div class="quick-metric"><span>Status</span><strong id="quickStatus">No session</strong></div>
+      <div class="quick-metric"><span>Warn me after</span><strong id="quickDelay">1m</strong></div>
+      <div class="quick-metric"><span>Off-task action</span><strong id="quickAction">Just warn me</strong></div>
     </div>
     <section class="grid focus-summary-grid" id="metrics" aria-label="Current focus summary"></section>
     <div class="high-focus-control">
@@ -3942,8 +3965,8 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
     </div>
     <div class="focus-actions">
       <button id="startFocus" class="focus-btn focus-idle" onclick="startFocus()">Start focus</button>
-      <button id="pauseFocus" class="focus-btn" onclick="pauseFocus()" disabled>Pause</button>
-      <button id="stopFocus" class="focus-btn" onclick="stopFocus()" disabled>Stop</button>
+      <button id="pauseFocus" class="focus-btn" onclick="pauseFocus()" disabled>Pause session</button>
+      <button id="stopFocus" class="focus-btn" onclick="stopFocus()" disabled>Turn off Local Focus</button>
     </div>
   </aside>
   <section id="distractionCard" class="control-shell distraction-card" aria-label="Distraction rules">
@@ -5035,15 +5058,65 @@ async function refresh() {
     </div>`;
   }).join('') || '<div class="muted">No previous reports yet.</div>';
   updateFocusButtons(state.focus, state.stopped);
+  updateFocusTimer(state.focus, state.stopped);
   seedFocusInputsFromActiveSession(state.focus);
   updateFocusSummary(state.focus);
   if (state.stopped) {
     const chip = document.querySelector('#focusState');
-    chip.textContent = 'Stopped';
+    chip.textContent = 'Local Focus off';
     chip.className = 'status-chip paused';
   }
   updateJournalControlState(state.journal);
 }
+// Live session countdown. The server already sends remainingSeconds on every
+// /api/state poll; it is authoritative, and the local 1s tick below just fills
+// the gap between polls so the number moves the way a timer should. Time
+// blindness is the whole reason this is the biggest element in the panel.
+const TIMER_RING_CIRCUMFERENCE = 2 * Math.PI * 54;
+let focusTimerState = { remaining: 0, duration: 1500, active: false, paused: false, stopped: false };
+function updateFocusTimer(focus, stopped) {
+  focusTimerState = {
+    remaining: Math.max(0, Number(focus && focus.remainingSeconds) || 0),
+    duration: Math.max(1, (Number(focus && focus.durationMinutes) || 25) * 60),
+    active: Boolean(focus) && !stopped,
+    paused: Boolean(focus && focus.paused),
+    stopped: Boolean(stopped)
+  };
+  renderFocusTimer();
+}
+function renderFocusTimer() {
+  const shell = document.querySelector('#focusTimer');
+  const value = document.querySelector('#timerValue');
+  const caption = document.querySelector('#timerCaption');
+  const ring = document.querySelector('#timerRingProgress');
+  if (!shell || !value || !caption || !ring) return;
+  const { remaining, duration, active, paused, stopped } = focusTimerState;
+  // The session keeps tracking after the timer runs out, so "done" is its own
+  // state rather than an end state.
+  const done = active && remaining <= 0;
+  shell.className = `focus-timer ${!active ? 'is-idle' : done ? 'is-done' : paused ? 'is-paused' : ''}`;
+  value.textContent = active ? formatClock(remaining) : '--:--';
+  caption.textContent = stopped ? 'Local Focus is off'
+    : !active ? 'No session running'
+    : paused ? 'Paused'
+    : done ? 'Time is up, still tracking'
+    : 'Left in this session';
+  const fraction = done ? 1 : active ? Math.min(1, remaining / duration) : 0;
+  ring.style.strokeDasharray = TIMER_RING_CIRCUMFERENCE;
+  ring.style.strokeDashoffset = TIMER_RING_CIRCUMFERENCE * (1 - fraction);
+}
+function formatClock(totalSeconds) {
+  const seconds = Math.max(0, Math.round(totalSeconds));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const pad = part => String(part).padStart(2, '0');
+  return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds % 60)}` : `${pad(minutes)}:${pad(seconds % 60)}`;
+}
+setInterval(() => {
+  if (!focusTimerState.active || focusTimerState.paused || focusTimerState.remaining <= 0) return;
+  focusTimerState.remaining -= 1;
+  renderFocusTimer();
+}, 1000);
 function updateFocusSummary(focus) {
   const chip = document.querySelector('#focusState');
   const details = document.querySelector('#focusDetails');
@@ -5053,25 +5126,25 @@ function updateFocusSummary(focus) {
   const quickAction = document.querySelector('#quickAction');
   updateHighFocusControls(focus);
   if (!focus) {
-    chip.textContent = 'Focus off';
+    chip.textContent = 'No session';
     chip.className = 'status-chip';
     details.innerHTML = `<div class="detail-grid">
       <div class="detail-card"><span>Focus apps/sites</span><strong>None active</strong></div>
-      <div class="detail-card"><span>Warning</span><strong>Off</strong></div>
-      <div class="detail-card"><span>Action</span><strong>Start focus to enable alerts</strong></div>
+      <div class="detail-card"><span>Warn me after</span><strong>Off</strong></div>
+      <div class="detail-card"><span>Off-task action</span><strong>Start a session to turn on warnings</strong></div>
     </div>`;
     quickTask.textContent = 'None';
-    quickStatus.textContent = 'Off';
+    quickStatus.textContent = 'No session';
     quickDelay.textContent = '1m';
-    quickAction.textContent = 'Alert';
+    quickAction.textContent = 'Just warn me';
     focusEditorManuallyOpened = false;
     setFocusEditorOpen(true);
     return;
   }
   const paused = Boolean(focus.paused);
-  chip.textContent = paused ? 'Focus paused' : 'Focus active';
+  chip.textContent = paused ? 'Paused' : 'Focusing';
   chip.className = `status-chip ${paused ? 'paused' : 'running'}`;
-  const action = focus.alertAction === 'switch' && focus.redirectApp ? `move to ${focus.redirectApp}` : 'show alert';
+  const action = focus.alertAction === 'switch' && focus.redirectApp ? `switch to ${focus.redirectApp}` : 'just warn me';
   const alertMessage = focus.alertMessage || DEFAULT_ALERT_MESSAGE_TEMPLATE;
   const targets = String(focus.target || '').split(/[,\n]/).map(value => value.trim()).filter(Boolean);
   const targetChips = targets.map(value => `<span class="target-chip">${escapeHtml(shortenSource(value))}</span>`).join('') || '<span class="target-chip">No target set</span>';
@@ -5079,14 +5152,14 @@ function updateFocusSummary(focus) {
     <div class="target-chips">${targetChips}</div>
     <div class="detail-grid">
       <div class="detail-card"><span>Full focus list</span><strong>${escapeHtml(focus.target || 'No target set')}</strong></div>
-      <div class="detail-card"><span>Warning delay</span><strong>${formatDuration(focus.alertDelaySeconds || 60)} outside focus</strong></div>
-      <div class="detail-card"><span>Notification action</span><strong>${escapeHtml(action)}</strong></div>
-      <div class="detail-card"><span>Alert message</span><strong>${escapeHtml(alertMessage)}</strong></div>
+      <div class="detail-card"><span>Warn me after</span><strong>${formatDuration(focus.alertDelaySeconds || 60)} off task</strong></div>
+      <div class="detail-card"><span>Off-task action</span><strong>${escapeHtml(action)}</strong></div>
+      <div class="detail-card"><span>Warning message</span><strong>${escapeHtml(alertMessage)}</strong></div>
     </div>`;
   quickTask.textContent = focus.task || 'Focus session';
-  quickStatus.textContent = paused ? 'Paused' : 'Active';
+  quickStatus.textContent = paused ? 'Paused' : 'Focusing';
   quickDelay.textContent = formatDuration(focus.alertDelaySeconds || 60);
-  quickAction.textContent = focus.alertAction === 'switch' && focus.redirectApp ? `Move` : 'Alert';
+  quickAction.textContent = focus.alertAction === 'switch' && focus.redirectApp ? 'Switch me' : 'Just warn me';
   if (!focusEditorManuallyOpened) setFocusEditorOpen(false);
 }
 function updateHighFocusControls(focus) {
@@ -5100,7 +5173,7 @@ function updateHighFocusControls(focus) {
     : targets.length === 0
       ? 'Add focus apps or websites before enabling High Focus mode.'
       : checkbox.disabled
-        ? 'Resume focus to change High Focus mode.'
+        ? 'Resume the session to change High Focus mode.'
         : 'Block every active app or website outside the focus list.';
 }
 function seedFocusInputsFromActiveSession(focus) {
@@ -5134,17 +5207,20 @@ function updateFocusButtons(focus, stopped) {
   const running = Boolean(focus && !focus.paused);
   const paused = Boolean(focus && focus.paused);
   startButton.className = `focus-btn ${running ? 'focus-running' : 'focus-idle'}`;
-  startButton.textContent = stopped ? 'Start' : paused ? 'Restart focus' : running ? 'Running Focus' : 'Start focus';
+  startButton.textContent = stopped ? 'Start focus' : paused ? 'Start new session' : running ? 'Focusing' : 'Start focus';
   pauseButton.disabled = !focus || Boolean(stopped);
-  // Pause uses the same treatment as Stop so it reads differently from the green
-  // "Running Focus" button.
+  // Pause uses the same treatment as the off switch so it reads differently
+  // from the green "Focusing" button.
   pauseButton.className = `focus-btn ${paused ? 'focus-paused' : running ? 'focus-stop-active' : ''}`;
-  pauseButton.textContent = paused ? 'Resume' : 'Pause';
-  // Stop is the master off switch: available whenever the app is running,
-  // even without an active focus session, and disabled once already stopped.
+  // "session" is explicit here so this never reads as the master switch below.
+  pauseButton.textContent = paused ? 'Resume session' : 'Pause session';
+  // This is the master off switch, not an end-this-session button: it is
+  // available whenever the app is running, even without an active focus
+  // session, and disabled once already off. It pairs with the banner's
+  // "Resume Local Focus".
   stopButton.disabled = Boolean(stopped);
   stopButton.className = `focus-btn ${stopped ? '' : 'focus-stop-active'}`;
-  stopButton.title = 'Stop all tracking, blocking, alerts, and reminders until you resume';
+  stopButton.title = 'Turn off all tracking, blocking, warnings, and reminders until you resume';
   // Show the editor's Save button only while a session is active to edit.
   const saveEditsButton = document.querySelector('#saveFocusEdits');
   if (saveEditsButton) saveEditsButton.style.display = focus && !stopped ? '' : 'none';
@@ -7341,6 +7417,35 @@ mod tests {
         assert!(body.contains("totalSwitches"));
         assert!(body.contains("distractingSwitches"));
         assert!(body.contains("topSwitchTargets"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn integration_dashboard_ships_the_session_countdown() {
+        // The server has always sent remainingSeconds; for a long time the
+        // dashboard never rendered it. Guard the countdown markup so the most
+        // important number in a focus app cannot silently disappear again.
+        let (port, dir) = start_test_server("integration-countdown");
+        let (status, body) = test_get(port, "/");
+        assert_eq!(status, 200);
+        assert!(body.contains("id=\"timerValue\""));
+        assert!(body.contains("id=\"timerRingProgress\""));
+        assert!(body.contains("remainingSeconds"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn integration_dashboard_never_labels_two_controls_the_same_stop() {
+        // "Stop" used to mean both "end this session" and "halt the whole app".
+        // The session control says "Pause session"; the master switch says
+        // "Turn off Local Focus" and pairs with "Turn on Local Focus".
+        let (port, dir) = start_test_server("integration-vocabulary");
+        let (status, body) = test_get(port, "/");
+        assert_eq!(status, 200);
+        assert!(body.contains("Pause session"));
+        assert!(body.contains("Turn off Local Focus"));
+        assert!(body.contains("Turn on Local Focus"));
+        assert!(!body.contains(">Stop</button>"));
         let _ = fs::remove_dir_all(dir);
     }
 
