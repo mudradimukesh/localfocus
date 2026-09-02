@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for Developer ID (notarized, distributed outside the App Store).
+
+  Deliberately NOT sandboxed: the app spawns its own local-focus-bin server,
+  reclaims port 4799 via lsof/kill, and drives other apps with AppleScript to
+  read the active tab and switch you back on task. The App Store build uses
+  LocalFocus.entitlements instead, which does turn the sandbox on.
+
+  Hardened runtime is required for notarization, so the Apple Events exception
+  below is what keeps the AppleScript automation working under it.
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.automation.apple-events</key>
+  <true/>
+</dict>
+</plist>

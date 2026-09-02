@@ -24,6 +24,7 @@ swiftc \
   "$ROOT_DIR/macos/LocalFocusHost.swift" \
   -framework Cocoa \
   -framework WebKit \
+  -framework UserNotifications \
   -o "$MACOS_DIR/local-focus"
 
 rm -rf "$ICONSET_DIR"

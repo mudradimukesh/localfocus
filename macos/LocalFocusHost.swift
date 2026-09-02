@@ -1,5 +1,49 @@
 import Cocoa
+import UserNotifications
 import WebKit
+
+/// Talks to the local server the app already runs. Everything the menu bar and
+/// the Focus menu do goes through the same HTTP surface the dashboard uses, so
+/// there is exactly one implementation of each action.
+enum LocalFocusAPI {
+    static let base = URL(string: "http://127.0.0.1:4799")!
+
+    static func call(_ path: String, completion: ((Data?) -> Void)? = nil) {
+        guard let url = URL(string: path, relativeTo: base) else { return }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
+        request.httpMethod = "GET"
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            completion?(data)
+        }.resume()
+    }
+}
+
+/// The current session, as far as the menu bar needs to know.
+struct FocusSnapshot {
+    var running = false
+    var paused = false
+    var stopped = false
+    var task = ""
+    var remainingSeconds = 0
+
+    var statusText: String {
+        if stopped { return "Off" }
+        if !running { return "Idle" }
+        if paused { return "Paused" }
+        return FocusSnapshot.clock(remainingSeconds)
+    }
+
+    static func clock(_ seconds: Int) -> String {
+        let total = max(0, seconds)
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let rest = total % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, rest)
+        }
+        return String(format: "%02d:%02d", minutes, rest)
+    }
+}
 
 @main
 struct LocalFocusHost {
@@ -19,9 +63,37 @@ enum AppMenu {
         let mainMenu = NSMenu()
         mainMenu.addItem(appMenuItem())
         mainMenu.addItem(editMenuItem())
+        mainMenu.addItem(focusMenuItem())
         mainMenu.addItem(viewMenuItem())
         mainMenu.addItem(windowMenuItem())
         return mainMenu
+    }
+
+    /// The app's actual verbs, with keyboard shortcuts. Before this the menu
+    /// bar only offered WebKit boilerplate and none of what the app does.
+    private static func focusMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "Focus", action: nil, keyEquivalent: "")
+        let menu = NSMenu(title: "Focus")
+
+        let start = NSMenuItem(title: "Start focus", action: #selector(AppDelegate.startFocus(_:)), keyEquivalent: "\r")
+        menu.addItem(start)
+
+        let pause = NSMenuItem(title: "Pause or resume session", action: #selector(AppDelegate.togglePause(_:)), keyEquivalent: "p")
+        pause.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(pause)
+
+        menu.addItem(.separator())
+
+        let turnOff = NSMenuItem(title: "Turn off Local Focus", action: #selector(AppDelegate.turnOff(_:)), keyEquivalent: "l")
+        turnOff.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(turnOff)
+
+        let turnOn = NSMenuItem(title: "Turn on Local Focus", action: #selector(AppDelegate.turnOn(_:)), keyEquivalent: "l")
+        turnOn.keyEquivalentModifierMask = [.command, .option]
+        menu.addItem(turnOn)
+
+        item.submenu = menu
+        return item
     }
 
     private static func appMenuItem() -> NSMenuItem {
@@ -130,10 +202,171 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var serverProcess: Process?
     private let dashboardURL = URL(string: "http://127.0.0.1:4799/")!
 
+    private var statusItem: NSStatusItem?
+    private var statusTimer: Timer?
+    private var snapshot = FocusSnapshot()
+    private var notificationsAuthorized = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         startLocalServer()
         openWindow()
         loadDashboardWhenReady()
+        setUpStatusItem()
+        requestNotificationAccess()
+        startStatusPolling()
+    }
+
+    // MARK: - Menu bar extra
+
+    /// Session status without raising the window — the whole point of a focus
+    /// timer is being able to glance at it.
+    private func setUpStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.title = "Local Focus"
+        item.button?.image = NSImage(systemSymbolName: "target", accessibilityDescription: "Local Focus")
+        item.button?.imagePosition = .imageLeading
+        item.menu = buildStatusMenu()
+        statusItem = item
+    }
+
+    private func buildStatusMenu() -> NSMenu {
+        let menu = NSMenu()
+
+        let status = NSMenuItem(title: "Idle", action: nil, keyEquivalent: "")
+        status.isEnabled = false
+        status.tag = 1
+        menu.addItem(status)
+        menu.addItem(.separator())
+
+        menu.addItem(NSMenuItem(title: "Start focus", action: #selector(startFocus(_:)), keyEquivalent: ""))
+        let pause = NSMenuItem(title: "Pause session", action: #selector(togglePause(_:)), keyEquivalent: "")
+        pause.tag = 2
+        menu.addItem(pause)
+        let power = NSMenuItem(title: "Turn off Local Focus", action: #selector(toggleStopped(_:)), keyEquivalent: "")
+        power.tag = 3
+        menu.addItem(power)
+
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Open dashboard", action: #selector(openDashboard(_:)), keyEquivalent: ""))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit Local Focus", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+
+        for item in menu.items where item.action != nil {
+            item.target = item.action == #selector(NSApplication.terminate(_:)) ? nil : self
+        }
+        return menu
+    }
+
+    private func startStatusPolling() {
+        let timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.pollState()
+            self?.drainNotifications()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        statusTimer = timer
+        pollState()
+    }
+
+    private func pollState() {
+        LocalFocusAPI.call("/api/state") { [weak self] data in
+            guard let data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            var next = FocusSnapshot()
+            next.stopped = json["stopped"] as? Bool ?? false
+            if let focus = json["focus"] as? [String: Any] {
+                next.running = true
+                next.paused = focus["paused"] as? Bool ?? false
+                next.task = focus["task"] as? String ?? ""
+                next.remainingSeconds = focus["remainingSeconds"] as? Int ?? 0
+            }
+            DispatchQueue.main.async { self?.apply(next) }
+        }
+    }
+
+    private func apply(_ next: FocusSnapshot) {
+        snapshot = next
+        statusItem?.button?.title = next.statusText
+        guard let menu = statusItem?.menu else { return }
+        menu.item(withTag: 1)?.title = next.stopped ? "Local Focus is off"
+            : !next.running ? "No session running"
+            : next.paused ? "Paused — \(next.task)"
+            : "\(FocusSnapshot.clock(next.remainingSeconds)) left — \(next.task)"
+        menu.item(withTag: 2)?.title = next.paused ? "Resume session" : "Pause session"
+        menu.item(withTag: 2)?.isEnabled = next.running && !next.stopped
+        menu.item(withTag: 3)?.title = next.stopped ? "Turn on Local Focus" : "Turn off Local Focus"
+    }
+
+    // MARK: - Notifications
+
+    /// Post banners as Local Focus rather than as osascript, so they carry the
+    /// app's name and icon and can be managed in System Settings. If access is
+    /// denied we simply never heartbeat, and the server keeps its own fallback.
+    private func requestNotificationAccess() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
+            DispatchQueue.main.async { self?.notificationsAuthorized = granted }
+        }
+    }
+
+    private func drainNotifications() {
+        // Only claim the heartbeat (?host=1) once macOS has actually granted
+        // permission. If it hasn't, the server must keep its own fallback
+        // rather than queue banners this process cannot post.
+        guard notificationsAuthorized else { return }
+        LocalFocusAPI.call("/api/mac/notifications?host=1") { data in
+            guard let data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let items = json["notifications"] as? [[String: Any]] else { return }
+            for item in items {
+                let content = UNMutableNotificationContent()
+                content.title = item["title"] as? String ?? "Local Focus"
+                content.body = item["message"] as? String ?? ""
+                content.sound = .default
+                let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+                UNUserNotificationCenter.current().add(request)
+            }
+        }
+    }
+
+    // MARK: - Actions
+
+    @objc func startFocus(_ sender: Any?) {
+        LocalFocusAPI.call("/api/focus/start") { [weak self] _ in
+            DispatchQueue.main.async { self?.pollState() }
+        }
+    }
+
+    @objc func togglePause(_ sender: Any?) {
+        LocalFocusAPI.call("/api/focus/pause") { [weak self] _ in
+            DispatchQueue.main.async { self?.pollState() }
+        }
+    }
+
+    @objc func turnOff(_ sender: Any?) {
+        LocalFocusAPI.call("/api/focus/stop") { [weak self] _ in
+            DispatchQueue.main.async { self?.pollState() }
+        }
+    }
+
+    @objc func turnOn(_ sender: Any?) {
+        LocalFocusAPI.call("/api/app/resume") { [weak self] _ in
+            DispatchQueue.main.async { self?.pollState() }
+        }
+    }
+
+    @objc func toggleStopped(_ sender: Any?) {
+        if snapshot.stopped {
+            turnOn(sender)
+        } else {
+            turnOff(sender)
+        }
+    }
+
+    @objc func openDashboard(_ sender: Any?) {
+        if window == nil || window?.isVisible == false {
+            openWindow()
+            loadDashboardWhenReady()
+        }
+        bringWindowForward()
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -232,29 +465,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             defer: false
         )
         window.title = "Local Focus"
-        window.center()
         window.contentView = webView
+        // Come back the size and place the user left it, rather than always
+        // recentering at a fixed size.
+        window.setFrameAutosaveName("LocalFocusMainWindow")
+        if window.frame.origin == .zero {
+            window.center()
+        }
 
         self.window = window
         self.webView = webView
         bringWindowForward()
-        bringWindowForwardAfterLaunch()
     }
 
+    /// Bring the window up once, politely. This used to re-activate on a timer
+    /// three times after launch, which fought the window server and stole focus
+    /// from whatever the user was doing.
     private func bringWindowForward() {
-        NSApp.setActivationPolicy(.regular)
         NSApp.unhide(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate(ignoringOtherApps: false)
         window?.makeKeyAndOrderFront(nil)
-        window?.orderFrontRegardless()
-    }
-
-    private func bringWindowForwardAfterLaunch() {
-        for delay in [0.2, 0.8, 1.6] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                self?.bringWindowForward()
-            }
-        }
     }
 
     private func loadDashboardWhenReady(attempt: Int = 0) {

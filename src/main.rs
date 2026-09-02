@@ -219,6 +219,14 @@ fn main() -> io::Result<()> {
             println!("{}", data_dir.display());
             Ok(())
         }
+        // The dashboard is one big raw string in this file, so a typo in its
+        // JS compiles fine and only breaks at runtime. This prints the page
+        // without binding a port so scripts/test.sh can syntax-check the
+        // script it contains.
+        Some("dump-dashboard") => {
+            println!("{}", index_html());
+            Ok(())
+        }
         _ => {
             print_help();
             Ok(())
@@ -1647,41 +1655,78 @@ fn handle_http(
     if path.starts_with("/api/focus/start") {
         let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
         let params = parse_query(query);
-        let task = params
-            .get("task")
-            .cloned()
-            .unwrap_or_else(|| "Focus session".into());
+        // A quick start with no parameters at all (the menu bar extra) reuses
+        // the last session's setup instead of silently dropping the user's
+        // focus list. The dashboard always sends its form, so it is unaffected.
+        let last = if params.contains_key("task") || params.contains_key("target") {
+            None
+        } else {
+            load_last_focus_settings(&data_dir)
+        };
+        let task = params.get("task").cloned().unwrap_or_else(|| {
+            last.as_ref()
+                .map(|settings| settings.task.clone())
+                .unwrap_or_else(|| "Focus session".into())
+        });
         let minutes = params
             .get("minutes")
             .and_then(|v| v.parse().ok())
-            .unwrap_or(25);
+            .unwrap_or_else(|| {
+                last.as_ref()
+                    .map(|settings| settings.duration_minutes)
+                    .unwrap_or(25)
+            });
         let target = params
             .get("target")
             .map(|s| normalize_focus_target_text(s))
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                last.as_ref()
+                    .map(|settings| settings.target.clone())
+                    .unwrap_or_default()
+            });
         let alert_delay_seconds = params
             .get("alertSeconds")
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_ALERT_DELAY_SECONDS)
+            .unwrap_or_else(|| {
+                last.as_ref()
+                    .map(|settings| settings.alert_delay_seconds)
+                    .unwrap_or(DEFAULT_ALERT_DELAY_SECONDS)
+            })
             .clamp(10, 60 * 60);
         let action_delay_seconds = params
             .get("actionSeconds")
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_ACTION_DELAY_SECONDS)
+            .unwrap_or_else(|| {
+                last.as_ref()
+                    .map(|settings| settings.action_delay_seconds)
+                    .unwrap_or(DEFAULT_ACTION_DELAY_SECONDS)
+            })
             .clamp(10, 60 * 60);
         let alert_action = params
             .get("alertAction")
             .filter(|action| action.as_str() == "switch")
             .cloned()
-            .unwrap_or_else(|| "alert".into());
+            .unwrap_or_else(|| {
+                last.as_ref()
+                    .map(|settings| settings.alert_action.clone())
+                    .unwrap_or_else(|| "alert".into())
+            });
         let alert_message = params
             .get("alertMessage")
             .map(|message| clean_alert_message_template(message))
-            .unwrap_or_else(|| DEFAULT_ALERT_MESSAGE_TEMPLATE.into());
+            .unwrap_or_else(|| {
+                last.as_ref()
+                    .map(|settings| settings.alert_message.clone())
+                    .unwrap_or_else(|| DEFAULT_ALERT_MESSAGE_TEMPLATE.into())
+            });
         let redirect_app = params
             .get("redirectApp")
             .map(|s| s.trim().to_string())
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                last.as_ref()
+                    .map(|settings| settings.redirect_app.clone())
+                    .unwrap_or_default()
+            });
         let session = FocusSession {
             task,
             target,
@@ -1699,6 +1744,7 @@ fn handle_http(
             high_focus_mode: false,
         };
         save_focus(&data_dir, &session)?;
+        save_last_focus_settings(&data_dir, &session)?;
         append_focus_session(&data_dir, &session)?;
         {
             let mut guard = lock_state(&state);
@@ -2257,6 +2303,51 @@ fn handle_http(
         )?;
     } else if route == "/api/report" {
         write_response(&mut stream, "application/json", &report_json(&data_dir)?)?;
+    } else if route == "/api/mac/notifications" {
+        // Loopback-only by omission from remote_path_allowed: this is the app's
+        // own window process talking to its own server, never the LAN.
+        //
+        // Only `?host=1` claims the heartbeat and drains the queue, and the
+        // native host sends it only once macOS has actually granted it
+        // notification permission. Anything else is a read-only peek. Without
+        // that split, any local reader would mark a host "live" and notify()
+        // would queue banners that nobody ever posts — silently swallowing
+        // them instead of falling back to osascript.
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let is_host = params
+            .get("host")
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"));
+        let pending = {
+            match mac_notifications().lock() {
+                Ok(mut queue) => {
+                    if is_host {
+                        queue.host_seen_at = now();
+                        std::mem::take(&mut queue.queued)
+                    } else {
+                        queue.queued.clone()
+                    }
+                }
+                Err(_) => Vec::new(),
+            }
+        };
+        let items = pending
+            .iter()
+            .map(|(timestamp, title, message)| {
+                format!(
+                    "{{\"timestamp\":{},\"title\":\"{}\",\"message\":\"{}\"}}",
+                    timestamp,
+                    json_escape(title),
+                    json_escape(message)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        write_response(
+            &mut stream,
+            "application/json",
+            &format!("{{\"ok\":true,\"notifications\":[{}]}}", items),
+        )?;
     } else if route == "/api/report/switches" {
         write_response(
             &mut stream,
@@ -3637,6 +3728,12 @@ header.compact .header-sub { display:none; }
 h1 { margin:0; font-size:23px; font-weight:850; letter-spacing:-.02em; background:var(--accent-grad); -webkit-background-clip:text; background-clip:text; color:transparent; transition:font-size .18s ease; }
 main { max-width:1180px; margin:0 auto; padding:24px; display:grid; gap:18px; }
 .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+.view-nav { display:flex; gap:6px; flex-wrap:wrap; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:6px; box-shadow:var(--shadow); }
+.view-tab { border:0; background:transparent; color:var(--muted); font-weight:800; font-size:13px; padding:9px 16px; border-radius:10px; cursor:pointer; }
+.view-tab:hover { color:var(--ink); background:var(--panel-soft); }
+.view-tab.is-active { background:var(--accent-grad); color:#fff; }
+.view { display:grid; gap:18px; }
+.view[hidden] { display:none; }
 input, select, textarea, button { border:1px solid var(--line); border-radius:12px; padding:10px 13px; background:var(--panel); color:var(--ink); }
 input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
 textarea { min-height:88px; resize:vertical; font:inherit; }
@@ -3891,6 +3988,14 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
     <strong>Local Focus is off — tracking, blocking, warnings, and reminders stay off until you turn it back on.</strong>
     <button onclick="resumeApp()" style="background:var(--good); border-color:var(--good); color:#fff; white-space:nowrap;">Turn on Local Focus</button>
   </div>
+  <nav class="view-nav" aria-label="Sections">
+    <button type="button" class="view-tab is-active" data-view="focus" onclick="showView('focus')">Focus</button>
+    <button type="button" class="view-tab" data-view="rules" onclick="showView('rules')">Blocking</button>
+    <button type="button" class="view-tab" data-view="journal" onclick="showView('journal')">Journal</button>
+    <button type="button" class="view-tab" data-view="reports" onclick="showView('reports')">Reports</button>
+    <button type="button" class="view-tab" data-view="devices" onclick="showView('devices')">Devices</button>
+  </nav>
+  <div class="view" id="view-focus" role="tabpanel" aria-label="Focus">
   <section class="focus-shell">
     <div class="focus-shell-head">
       <div class="focus-title">
@@ -3969,6 +4074,8 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
       <button id="stopFocus" class="focus-btn" onclick="stopFocus()" disabled>Turn off Local Focus</button>
     </div>
   </aside>
+  </div>
+  <div class="view" id="view-rules" role="tabpanel" aria-label="Blocking">
   <section id="distractionCard" class="control-shell distraction-card" aria-label="Distraction rules">
     <div>
       <h2>Add distraction rule</h2>
@@ -3992,6 +4099,8 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
       <button id="blockSubmit" class="block-submit" onclick="addBlock()">Add block</button>
     </div>
   </section>
+  </div>
+  <div class="view" id="view-journal" role="tabpanel" aria-label="Journal">
   <section id="journalCard" class="control-shell journal-card" aria-label="Daily journal">
     <div class="journal-head">
       <div>
@@ -4038,6 +4147,8 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
       </div>
     </div>
   </section>
+  </div>
+  <div class="view" id="view-reports" role="tabpanel" aria-label="Reports">
   <section id="reportsCard" class="control-shell" aria-label="Reports">
     <div>
       <h2>Reports</h2>
@@ -4073,6 +4184,30 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
       <div id="switchTargets" class="muted">No switches recorded yet.</div>
     </div>
   </section>
+  <section class="explain" id="explainPanel">
+    <h2>Report meaning</h2>
+    <div class="explain-grid">
+      <div><h3>Total time</h3><p>All tracked time in the current report window: productive, distracted, and idle.</p></div>
+      <div><h3>Productive</h3><p>During a targeted focus session, only activity matching one of your focus apps or sites counts here. Outside targeted focus, productive keywords are used.</p></div>
+      <div><h3>Distracted</h3><p>Any activity that is not productive. During targeted focus, every app or site outside your focus list is tracked here.</p></div>
+      <div><h3>Idle</h3><p>If there is no keyboard or mouse input for 60 seconds, time is tracked as idle even when the focused app or website matches your focus list.</p></div>
+      <div><h3>Blocked</h3><p>Blocked apps or sites are actively closed when detected, and the blocked time is tracked as distracted.</p></div>
+      <div><h3>Switches</h3><p>Every time the foreground app or window title changes, in the same window as the report above. Independent of duration — a low distracted-minutes total can still hide constant switching.</p></div>
+    </div>
+  </section>
+  <section class="bar">
+    <button id="historyToggle" onclick="toggleHistory()" aria-expanded="false">Previous reports</button>
+  </section>
+  <section class="history" id="historyPanel">
+    <h2>Previous reports</h2>
+    <div id="historyList"></div>
+  </section>
+  <section class="two">
+    <section class="timeline"><h2>Timeline</h2><div id="timeline"></div></section>
+    <section class="apps"><h2>Top apps and URLs</h2><div id="apps"></div></section>
+  </section>
+  </div>
+  <div class="view" id="view-devices" role="tabpanel" aria-label="Devices">
   <section id="devicesCard" class="control-shell" aria-label="Connect to device">
     <div>
       <h2>Connect to device</h2>
@@ -4099,28 +4234,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
       <div id="deviceList" class="device-list"></div>
     </div>
   </section>
-  <section class="explain" id="explainPanel">
-    <h2>Report meaning</h2>
-    <div class="explain-grid">
-      <div><h3>Total time</h3><p>All tracked time in the current report window: productive, distracted, and idle.</p></div>
-      <div><h3>Productive</h3><p>During a targeted focus session, only activity matching one of your focus apps or sites counts here. Outside targeted focus, productive keywords are used.</p></div>
-      <div><h3>Distracted</h3><p>Any activity that is not productive. During targeted focus, every app or site outside your focus list is tracked here.</p></div>
-      <div><h3>Idle</h3><p>If there is no keyboard or mouse input for 60 seconds, time is tracked as idle even when the focused app or website matches your focus list.</p></div>
-      <div><h3>Blocked</h3><p>Blocked apps or sites are actively closed when detected, and the blocked time is tracked as distracted.</p></div>
-      <div><h3>Switches</h3><p>Every time the foreground app or window title changes, in the same window as the report above. Independent of duration — a low distracted-minutes total can still hide constant switching.</p></div>
-    </div>
-  </section>
-  <section class="bar">
-    <button id="historyToggle" onclick="toggleHistory()" aria-expanded="false">Previous reports</button>
-  </section>
-  <section class="history" id="historyPanel">
-    <h2>Previous reports</h2>
-    <div id="historyList"></div>
-  </section>
-  <section class="two">
-    <section class="timeline"><h2>Timeline</h2><div id="timeline"></div></section>
-    <section class="apps"><h2>Top apps and URLs</h2><div id="apps"></div></section>
-  </section>
+  </div>
 </main>
 <script>
 // Look-and-feel templates: swap the CSS variable palette via a data-theme
@@ -4136,6 +4250,29 @@ function setTheme(value) {
   let saved = 'vibrant';
   try { saved = localStorage.getItem('lfTheme') || 'vibrant'; } catch (e) {}
   setTheme(saved);
+})();
+// One screen, one job: the dashboard used to stack focus setup, blocking,
+// journal, reports, and pairing on a single scroll, so "am I focused right
+// now?" competed with everything else. Each group is its own view now, and
+// the choice is remembered per device.
+const DASHBOARD_VIEWS = ['focus', 'rules', 'journal', 'reports', 'devices'];
+function showView(name) {
+  const target = DASHBOARD_VIEWS.includes(name) ? name : 'focus';
+  for (const view of DASHBOARD_VIEWS) {
+    const panel = document.querySelector(`#view-${view}`);
+    if (panel) panel.hidden = view !== target;
+  }
+  for (const tab of document.querySelectorAll('.view-tab')) {
+    const active = tab.dataset.view === target;
+    tab.classList.toggle('is-active', active);
+    tab.setAttribute('aria-current', active ? 'page' : 'false');
+  }
+  try { localStorage.setItem('lfView', target); } catch (e) {}
+}
+(function initView() {
+  let saved = 'focus';
+  try { saved = localStorage.getItem('lfView') || 'focus'; } catch (e) {}
+  showView(saved);
 })();
 // Shrink the sticky header once the page scrolls past the focus setup.
 (function initHeaderShrink() {
@@ -5007,17 +5144,17 @@ async function refresh() {
   const stopBanner = document.querySelector('#stopBanner');
   if (stopBanner) stopBanner.style.display = state.stopped ? 'flex' : 'none';
   const totalSeconds = reportTotalSeconds(report);
-  document.querySelector('#metrics').innerHTML = `
+  setHtml('#metrics', `
     <div class="metric"><span class="muted">Total time</span><strong>${formatDuration(totalSeconds)}</strong></div>
     <div class="metric"><span class="muted">Productive</span><strong>${formatDuration(report.productiveMinutes * 60)}</strong></div>
     <div class="metric"><span class="muted">Distracted</span><strong>${formatDuration(report.distractingMinutes * 60)}</strong></div>
-    <div class="metric"><span class="muted">Idle</span><strong>${formatDuration((report.idleMinutes || 0) * 60)}</strong></div>`;
-  document.querySelector('#switchMetrics').innerHTML = `
+    <div class="metric"><span class="muted">Idle</span><strong>${formatDuration((report.idleMinutes || 0) * 60)}</strong></div>`);
+  setHtml('#switchMetrics', `
     <div class="metric"><span class="muted">Switches</span><strong>${switches.totalSwitches || 0}</strong></div>
     <div class="metric"><span class="muted">Per hour</span><strong>${(switches.switchesPerHour || 0).toFixed(1)}</strong></div>
-    <div class="metric"><span class="muted">Into distractions</span><strong>${switches.distractingSwitches || 0}</strong></div>`;
-  document.querySelector('#switchTargets').innerHTML = (switches.topSwitchTargets || []).map(target => `<p><strong>${escapeHtml(target.app)}</strong><br><span class="muted">${target.switches} switch${target.switches === 1 ? '' : 'es'}</span></p>`).join('') || '<div class="muted">No switches recorded yet.</div>';
-  document.querySelector('#timeline').innerHTML = timeline.slice(-80).reverse().map((item, index) => {
+    <div class="metric"><span class="muted">Into distractions</span><strong>${switches.distractingSwitches || 0}</strong></div>`);
+  setHtml('#switchTargets', (switches.topSwitchTargets || []).map(target => `<p><strong>${escapeHtml(target.app)}</strong><br><span class="muted">${target.switches} switch${target.switches === 1 ? '' : 'es'}</span></p>`).join('') || '<div class="muted">No switches recorded yet.</div>');
+  setHtml('#timeline', timeline.slice(-80).reverse().map((item, index) => {
     const longAttention = item.durationSeconds > 15 * 60 && (item.category === 'idle' || item.category === 'distracting');
     const longClass = longAttention ? ` long-attention ${item.category === 'idle' ? 'long-idle' : 'long-distracting'}` : '';
     const longNote = longAttention ? `<span class="long-note">${item.category === 'idle' ? 'Long idle' : 'Long distraction'}</span>` : '';
@@ -5027,10 +5164,10 @@ async function refresh() {
       <div><strong>${escapeHtml(item.app)}</strong><div>${escapeHtml(item.title)}</div><div class="muted">${sourceMarkup(item.source || 'local', `timeline-${index}`)}</div></div>
       <div class="tag ${item.category}">${item.category}</div>
     </div>`;
-  }).join('') || '<div class="muted">No activity yet.</div>';
-  document.querySelector('#apps').innerHTML = report.topApps.map((app, index) => `<p><strong>${escapeHtml(app.app)}</strong><br>${sourceMarkup(app.source || 'local', index)}<br><span class="muted">${formatDuration(app.seconds || app.minutes * 60)}</span></p>`).join('') || '<div class="muted">No apps yet.</div>';
+  }).join('') || '<div class="muted">No activity yet.</div>');
+  setHtml('#apps', report.topApps.map((app, index) => `<p><strong>${escapeHtml(app.app)}</strong><br>${sourceMarkup(app.source || 'local', index)}<br><span class="muted">${formatDuration(app.seconds || app.minutes * 60)}</span></p>`).join('') || '<div class="muted">No apps yet.</div>');
   blockedRules = (state.blockedRules || []).map(rule => ({...rule, target: normalizedBlockValue(rule.target || '')}));
-  document.querySelector('#blockedList').innerHTML = blockedRules.map(rule => `<span class="blocked-chip${rule.target === editingBlockTarget ? ' editing' : ''}" data-target="${escapeTextAttr(rule.target || '')}">${escapeHtml(shortenSource(rule.target || ''))} <small>${rule.mode === 'password' ? 'password' : 'full'}</small><button class="edit-chip" type="button" data-target="${escapeTextAttr(rule.target || '')}" onclick="editBlockFromButton(this)" aria-label="Edit ${escapeTextAttr(rule.target || '')}">edit</button><button type="button" data-target="${escapeTextAttr(rule.target || '')}" onclick="removeBlockFromButton(this)" aria-label="Remove ${escapeTextAttr(rule.target || '')}">x</button></span>`).join('') || '<div class="muted">No blocked apps or sites yet.</div>';
+  setHtml('#blockedList', blockedRules.map(rule => `<span class="blocked-chip${rule.target === editingBlockTarget ? ' editing' : ''}" data-target="${escapeTextAttr(rule.target || '')}">${escapeHtml(shortenSource(rule.target || ''))} <small>${rule.mode === 'password' ? 'password' : 'full'}</small><button class="edit-chip" type="button" data-target="${escapeTextAttr(rule.target || '')}" onclick="editBlockFromButton(this)" aria-label="Edit ${escapeTextAttr(rule.target || '')}">edit</button><button type="button" data-target="${escapeTextAttr(rule.target || '')}" onclick="removeBlockFromButton(this)" aria-label="Remove ${escapeTextAttr(rule.target || '')}">x</button></span>`).join('') || '<div class="muted">No blocked apps or sites yet.</div>');
   syncBlockEditState();
   const connectUrl = state.deviceConnectUrl || 'http://127.0.0.1:4799/device';
   document.querySelector('#deviceConnectUrl').textContent = connectUrl;
@@ -5043,8 +5180,8 @@ async function refresh() {
   const macLink = document.querySelector('#macDownloadLink');
   if (macLink) macLink.href = state.macAppUrl || `${location.origin}/download/local-focus-macos.dmg`;
   const connectedDevices = (state.devices || []).filter(device => String(device.endpoint || '').startsWith('browser:') || String(device.endpoint || '').startsWith('mobile:'));
-  document.querySelector('#deviceList').innerHTML = connectedDevices.map(connectedDeviceRowMarkup).join('') || '<div class="muted">No devices connected yet.</div>';
-  document.querySelector('#historyList').innerHTML = history.map(item => {
+  setHtml('#deviceList', connectedDevices.map(connectedDeviceRowMarkup).join('') || '<div class="muted">No devices connected yet.</div>');
+  setHtml('#historyList', history.map(item => {
     const r = item.report;
     return `<div class="item">
       <div class="muted">${new Date(item.archivedAt * 1000).toLocaleString([], {dateStyle:'short', timeStyle:'short'})}</div>
@@ -5056,7 +5193,7 @@ async function refresh() {
       </div>
       <div class="muted">${(r.topApps || []).slice(0, 2).map(app => escapeHtml(`${app.app}${app.source ? ' - ' + app.source : ''}`)).join(', ')}</div>
     </div>`;
-  }).join('') || '<div class="muted">No previous reports yet.</div>';
+  }).join('') || '<div class="muted">No previous reports yet.</div>');
   updateFocusButtons(state.focus, state.stopped);
   updateFocusTimer(state.focus, state.stopped);
   seedFocusInputsFromActiveSession(state.focus);
@@ -5067,6 +5204,18 @@ async function refresh() {
     chip.className = 'status-chip paused';
   }
   updateJournalControlState(state.journal);
+}
+// The dashboard re-polls every 10s and used to rewrite every list wholesale
+// each time, which threw away scroll position, text selection, and hover
+// state even when nothing had actually changed. Rendering to a string is
+// cheap; touching the DOM is not — so only write when the markup differs.
+const renderedHtml = new WeakMap();
+function setHtml(target, html) {
+  const node = typeof target === 'string' ? document.querySelector(target) : target;
+  if (!node) return;
+  if (renderedHtml.get(node) === html) return;
+  renderedHtml.set(node, html);
+  node.innerHTML = html;
 }
 // Live session countdown. The server already sends remainingSeconds on every
 // /api/state poll; it is authoritative, and the local 1s tick below just fills
@@ -5128,11 +5277,11 @@ function updateFocusSummary(focus) {
   if (!focus) {
     chip.textContent = 'No session';
     chip.className = 'status-chip';
-    details.innerHTML = `<div class="detail-grid">
+    setHtml(details, `<div class="detail-grid">
       <div class="detail-card"><span>Focus apps/sites</span><strong>None active</strong></div>
       <div class="detail-card"><span>Warn me after</span><strong>Off</strong></div>
       <div class="detail-card"><span>Off-task action</span><strong>Start a session to turn on warnings</strong></div>
-    </div>`;
+    </div>`);
     quickTask.textContent = 'None';
     quickStatus.textContent = 'No session';
     quickDelay.textContent = '1m';
@@ -5148,14 +5297,14 @@ function updateFocusSummary(focus) {
   const alertMessage = focus.alertMessage || DEFAULT_ALERT_MESSAGE_TEMPLATE;
   const targets = String(focus.target || '').split(/[,\n]/).map(value => value.trim()).filter(Boolean);
   const targetChips = targets.map(value => `<span class="target-chip">${escapeHtml(shortenSource(value))}</span>`).join('') || '<span class="target-chip">No target set</span>';
-  details.innerHTML = `
+  setHtml(details, `
     <div class="target-chips">${targetChips}</div>
     <div class="detail-grid">
       <div class="detail-card"><span>Full focus list</span><strong>${escapeHtml(focus.target || 'No target set')}</strong></div>
       <div class="detail-card"><span>Warn me after</span><strong>${formatDuration(focus.alertDelaySeconds || 60)} off task</strong></div>
       <div class="detail-card"><span>Off-task action</span><strong>${escapeHtml(action)}</strong></div>
       <div class="detail-card"><span>Warning message</span><strong>${escapeHtml(alertMessage)}</strong></div>
-    </div>`;
+    </div>`);
   quickTask.textContent = focus.task || 'Focus session';
   quickStatus.textContent = paused ? 'Paused' : 'Focusing';
   quickDelay.textContent = formatDuration(focus.alertDelaySeconds || 60);
@@ -5679,6 +5828,55 @@ fn save_focus(data_dir: &Path, focus: &FocusSession) -> io::Result<()> {
     )
 }
 
+/// The settings from the last session started, kept after the session itself
+/// is cleared. Quick-start entry points (the menu bar extra, `/api/focus/start`
+/// with no parameters) reuse these so starting a session without opening the
+/// dashboard doesn't silently drop the focus list the user set up.
+fn save_last_focus_settings(data_dir: &Path, focus: &FocusSession) -> io::Result<()> {
+    fs::write(
+        data_dir.join("last_focus.json"),
+        format!(
+            "{{\"task\":\"{}\",\"target\":\"{}\",\"durationMinutes\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\"}}",
+            json_escape(&focus.task),
+            json_escape(&focus.target),
+            focus.duration_minutes,
+            focus.alert_delay_seconds,
+            focus.action_delay_seconds,
+            json_escape(&focus.alert_action),
+            json_escape(&clean_alert_message_template(&focus.alert_message)),
+            json_escape(&focus.redirect_app),
+        ),
+    )
+}
+
+struct LastFocusSettings {
+    task: String,
+    target: String,
+    duration_minutes: u64,
+    alert_delay_seconds: u64,
+    action_delay_seconds: u64,
+    alert_action: String,
+    alert_message: String,
+    redirect_app: String,
+}
+
+fn load_last_focus_settings(data_dir: &Path) -> Option<LastFocusSettings> {
+    let value = fs::read_to_string(data_dir.join("last_focus.json")).ok()?;
+    Some(LastFocusSettings {
+        task: json_string(&value, "task")?,
+        target: json_string(&value, "target").unwrap_or_default(),
+        duration_minutes: json_number(&value, "durationMinutes").unwrap_or(25) as u64,
+        alert_delay_seconds: json_number(&value, "alertDelaySeconds")
+            .unwrap_or(DEFAULT_ALERT_DELAY_SECONDS as i64) as u64,
+        action_delay_seconds: json_number(&value, "actionDelaySeconds")
+            .unwrap_or(DEFAULT_ACTION_DELAY_SECONDS as i64) as u64,
+        alert_action: json_string(&value, "alertAction").unwrap_or_else(|| "alert".into()),
+        alert_message: json_string(&value, "alertMessage")
+            .unwrap_or_else(|| DEFAULT_ALERT_MESSAGE_TEMPLATE.into()),
+        redirect_app: json_string(&value, "redirectApp").unwrap_or_default(),
+    })
+}
+
 fn load_focus(data_dir: &Path) -> Option<FocusSession> {
     let value = fs::read_to_string(data_dir.join("focus.json")).ok()?;
     Some(FocusSession {
@@ -5713,16 +5911,73 @@ fn clear_focus(data_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Notifications waiting for the native macOS host to collect, plus when that
+/// host last checked in. `osascript` can post a banner, but it posts it *as
+/// osascript* — wrong name, wrong icon, and nothing the user can manage under
+/// Local Focus in System Settings. So when the native host is running we hand
+/// it the notification to post as itself, and fall back to `osascript` only
+/// when nothing is there to collect (CLI `serve`, or notifications denied).
+struct MacNotifications {
+    host_seen_at: i64,
+    queued: Vec<(i64, String, String)>,
+}
+
+static MAC_NOTIFICATIONS: OnceLock<Mutex<MacNotifications>> = OnceLock::new();
+const MAC_HOST_TIMEOUT_SECONDS: i64 = 15;
+const MAX_QUEUED_MAC_NOTIFICATIONS: usize = 50;
+
+fn mac_notifications() -> &'static Mutex<MacNotifications> {
+    MAC_NOTIFICATIONS.get_or_init(|| {
+        Mutex::new(MacNotifications {
+            host_seen_at: 0,
+            queued: Vec::new(),
+        })
+    })
+}
+
+/// True when the native host has checked in recently enough to be trusted to
+/// deliver the banner itself.
+fn native_host_is_live(host_seen_at: i64, now: i64) -> bool {
+    host_seen_at > 0 && now - host_seen_at <= MAC_HOST_TIMEOUT_SECONDS
+}
+
 fn notify(title: &str, message: &str) {
     #[cfg(target_os = "macos")]
-    let _ = Command::new("osascript")
-        .arg("-e")
-        .arg(format!(
-            "display notification \"{}\" with title \"{}\"",
-            apple_escape(message),
-            apple_escape(title)
-        ))
-        .output();
+    {
+        let now_ts = now();
+        let handled_by_host = {
+            match mac_notifications().lock() {
+                Ok(mut queue) => {
+                    let live = native_host_is_live(queue.host_seen_at, now_ts);
+                    if live {
+                        queue
+                            .queued
+                            .push((now_ts, title.to_string(), message.to_string()));
+                        // Bound the queue so a host that goes away mid-run
+                        // cannot grow it without limit.
+                        let overflow = queue
+                            .queued
+                            .len()
+                            .saturating_sub(MAX_QUEUED_MAC_NOTIFICATIONS);
+                        queue.queued.drain(..overflow);
+                    }
+                    live
+                }
+                Err(_) => false,
+            }
+        };
+
+        if !handled_by_host {
+            let _ = Command::new("osascript")
+                .arg("-e")
+                .arg(format!(
+                    "display notification \"{}\" with title \"{}\"",
+                    apple_escape(message),
+                    apple_escape(title)
+                ))
+                .output();
+        }
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -7155,6 +7410,76 @@ mod tests {
         assert!(report.contains("WhatsApp"));
         assert!(!report.contains("YouTube"));
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn integration_quick_start_reuses_the_last_session_setup() {
+        // Starting from the menu bar sends no parameters. It must not wipe the
+        // focus list the user configured in the dashboard.
+        let (port, dir) = start_test_server("integration-quick-start");
+
+        let (status, _) = test_get(
+            port,
+            "/api/focus/start?task=Thesis&minutes=45&target=Pages&alertSeconds=120",
+        );
+        assert_eq!(status, 200);
+        // End the session, which clears focus.json.
+        let (status, _) = test_get(port, "/api/focus/stop");
+        assert_eq!(status, 200);
+
+        // Bare quick start: same task, targets, and length as before.
+        let (status, _) = test_get(port, "/api/focus/start");
+        assert_eq!(status, 200);
+        let (_, body) = test_get(port, "/api/state");
+        assert_eq!(json_string(&body, "task").as_deref(), Some("Thesis"));
+        assert_eq!(json_string(&body, "target").as_deref(), Some("Pages"));
+        assert_eq!(json_number(&body, "durationMinutes"), Some(45));
+        assert_eq!(json_number(&body, "alertDelaySeconds"), Some(120));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn native_host_must_be_recent_to_take_over_notifications() {
+        let now_ts = 1_000_000;
+        // Never checked in: the server has to post the banner itself.
+        assert!(!native_host_is_live(0, now_ts));
+        // Checked in just now, and still inside the window.
+        assert!(native_host_is_live(now_ts, now_ts));
+        assert!(native_host_is_live(
+            now_ts - MAC_HOST_TIMEOUT_SECONDS,
+            now_ts
+        ));
+        // Gone quiet (quit, or notifications denied) — fall back rather than
+        // queue banners nobody will post.
+        assert!(!native_host_is_live(
+            now_ts - MAC_HOST_TIMEOUT_SECONDS - 1,
+            now_ts
+        ));
+    }
+
+    #[test]
+    fn integration_peeking_at_mac_notifications_does_not_claim_the_host() {
+        // A plain read must not mark a host live, or notify() would queue
+        // banners for a host that cannot post them.
+        let (port, dir) = start_test_server("integration-mac-notify");
+        let (status, body) = test_get(port, "/api/mac/notifications");
+        assert_eq!(status, 200);
+        assert!(body.contains("\"notifications\""));
+        {
+            let mut queue = mac_notifications().lock().expect("queue");
+            assert!(!native_host_is_live(queue.host_seen_at, now()));
+            queue.host_seen_at = 0;
+        }
+        // The host's own call does claim it.
+        let (status, _) = test_get(port, "/api/mac/notifications?host=1");
+        assert_eq!(status, 200);
+        {
+            let mut queue = mac_notifications().lock().expect("queue");
+            assert!(native_host_is_live(queue.host_seen_at, now()));
+            queue.host_seen_at = 0;
+        }
         let _ = fs::remove_dir_all(dir);
     }
 
