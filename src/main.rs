@@ -4038,7 +4038,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
 .focus-title { display:flex; align-items:center; gap:12px; }
 .focus-mark { width:44px; height:44px; border-radius:14px; background:var(--accent-grad); color:white; display:grid; place-items:center; font-weight:850; letter-spacing:.04em; box-shadow:0 8px 20px color-mix(in srgb, var(--accent) 35%, transparent); }
 .focus-shell h2 { margin:0; font-size:18px; }
-.control-shell { background:var(--panel); border:1px solid var(--line); border-radius:22px; padding:18px; display:grid; gap:14px; box-shadow:var(--shadow); }
+.control-shell { background:var(--panel); border:1px solid var(--line); border-radius:22px; padding:18px; display:grid; grid-template-columns:minmax(0, 1fr); gap:14px; box-shadow:var(--shadow); }
 .control-shell h2 { margin:0; font-size:16px; }
 .report-calendar { display:grid; gap:12px; }
 .calendar-head { display:grid; grid-template-columns:auto 1fr auto; gap:10px; align-items:center; }
@@ -4071,7 +4071,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
 .switch-headline { font-size:22px; font-weight:800; line-height:1.35; margin:0; }
 .switch-headline .switch-count { color:var(--accent); }
 .switch-chart-wrap { border:1px solid var(--line); border-radius:10px; background:var(--panel-soft); padding:14px; display:grid; gap:8px; }
-.switch-chart { display:flex; align-items:flex-end; gap:6px; min-height:132px; overflow-x:auto; }
+.switch-chart { display:flex; align-items:flex-end; gap:6px; min-height:132px; overflow-x:auto; min-width:0; }
 .switch-bar { flex:1 1 0; min-width:26px; display:grid; gap:6px; justify-items:center; align-content:end; }
 .switch-bar-track { width:100%; height:96px; display:flex; align-items:flex-end; }
 .switch-bar-fill { width:100%; border-radius:8px 8px 4px 4px; background:var(--accent-grad); min-height:4px; transition:height .35s ease; }
@@ -4092,7 +4092,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
 .switch-target-track { height:14px; border-radius:999px; background:color-mix(in srgb, var(--line) 55%, transparent); overflow:hidden; }
 .switch-target-fill { height:100%; border-radius:999px; background:var(--accent-grad); min-width:3px; }
 .switch-target-count { font-weight:800; }
-.block-table-wrap { border:1px solid var(--line); border-radius:10px; background:var(--panel-soft); overflow-x:auto; }
+.block-table-wrap { position:relative; border:1px solid var(--line); border-radius:10px; background:var(--panel-soft); overflow-x:auto; min-width:0; }
 .block-table { width:100%; border-collapse:collapse; font-size:13px; }
 .block-table th { text-align:left; font-size:11px; font-weight:800; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; padding:10px 12px; border-bottom:1px solid var(--line); white-space:nowrap; }
 .block-table td { padding:8px 12px; border-bottom:1px solid color-mix(in srgb, var(--line) 60%, transparent); vertical-align:middle; }
@@ -4296,7 +4296,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
 .distracting { color:var(--bad); background:color-mix(in srgb, var(--bad) 14%, transparent); }
 .idle { color:var(--warn); background:color-mix(in srgb, var(--warn) 16%, transparent); }
 .two { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
-@media (max-width:980px) { .focus-layout, .control-shell { grid-template-columns:1fr; } .focus-actions { justify-content:flex-start; } }
+@media (max-width:980px) { .focus-layout, .control-shell { grid-template-columns:minmax(0, 1fr); } .focus-actions { justify-content:flex-start; } }
 @media (max-width:900px) { .focus-shell-head { align-items:start; display:grid; } .top-actions { justify-content:flex-start; } }
 @media (max-width:760px) { header, .two, .grid, .item, .explain-grid, .history-grid, .report-grid, .report-two, .bar-row, .focus-form, .detail-grid, .block-fields, .activity-row, .calendar-actions, .journal-settings, .journal-row, .journal-task-form { grid-template-columns:1fr; display:grid; } header { align-items:start; padding:12px 16px; gap:8px; } .header-sub { display:none; } #themeSelect { padding:6px 9px; } .header-actions { justify-content:flex-start; } .hour-bars, .period-bars { grid-template-columns:repeat(6, minmax(12px, 1fr)); } .focus-shell-head { align-items:start; display:grid; } .quick-metrics { grid-template-columns:1fr; } .calendar-grid { grid-template-columns:48px repeat(7, minmax(28px, 1fr)); gap:4px; } .block-type-options { grid-template-columns:1fr; } .block-password-field { grid-column:auto; } }
 </style>
@@ -8273,6 +8273,46 @@ mod tests {
         assert_eq!(json_number(&report, "distractingSwitches"), Some(1));
         assert!(report.contains("WhatsApp"));
         assert!(!report.contains("YouTube"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn integration_wide_content_is_contained_for_small_screens() {
+        // The Android app shows this same dashboard in a WebView, so a phone's
+        // layout is this CSS. The blocking table is wider than a phone; it has
+        // to scroll inside its own box rather than pushing the page sideways.
+        // Two things are needed for that and both were once missing: the
+        // scroll container needs min-width:0 (a grid item defaults to
+        // min-width:auto and grows past its track), and position:relative, or
+        // the visually-hidden header label escapes to the page and widens it.
+        let (port, dir) = start_test_server("integration-small-screens");
+        let (status, body) = test_get(port, "/");
+        assert_eq!(status, 200);
+
+        let wrap = body
+            .split(".block-table-wrap {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("block table wrap rule");
+        assert!(wrap.contains("overflow-x:auto"), "{wrap}");
+        assert!(wrap.contains("min-width:0"), "{wrap}");
+        assert!(wrap.contains("position:relative"), "{wrap}");
+
+        // The card holding it must not let a grid item exceed its track either.
+        let shell = body
+            .split(".control-shell {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("control shell rule");
+        assert!(shell.contains("minmax(0, 1fr)"), "{shell}");
+
+        // And there are breakpoints for phone and tablet widths at all.
+        assert!(body.contains("@media (max-width:980px)"));
+        assert!(body.contains("@media (max-width:760px)"));
+        // Narrow widths must not reset the track to a bare 1fr, whose implicit
+        // min-width:auto is the very thing minmax(0, ...) is here to avoid.
+        assert!(!body.contains(".control-shell { grid-template-columns:1fr;"));
 
         let _ = fs::remove_dir_all(dir);
     }
