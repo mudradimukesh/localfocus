@@ -678,6 +678,13 @@ fn enforce_blocked_access(
         return Ok(());
     }
 
+    // Distraction rules belong to a focus session. Outside one, Local Focus
+    // still tracks and reports but must not close tabs or quit apps.
+    let focus = lock_state(state).focus.clone();
+    if !block_rules_are_active(focus.as_ref()) {
+        return Ok(());
+    }
+
     let Some((rule, rule_kind)) = blocked_keyword_match(config, sample) else {
         return Ok(());
     };
@@ -709,6 +716,14 @@ fn enforce_blocked_access(
         BlockMode::Password => password_block_activity_access(sample, &rule, &message),
     }
     append_event(data_dir, "blocked_access", &message)
+}
+
+/// Whether the distraction rules should be enforced right now. They only apply
+/// while a focus session is actually running: with no session, or one that is
+/// paused, the block list must not close tabs or quit apps. This mirrors
+/// `high_focus_should_block`, which has always required a running session.
+fn block_rules_are_active(focus: Option<&FocusSession>) -> bool {
+    focus.is_some_and(|focus| focus.paused_at.is_none())
 }
 
 fn activity_is_block_exempt(state: &Arc<Mutex<AppState>>, sample: &ActivitySample) -> bool {
@@ -4146,7 +4161,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
   <section id="distractionCard" class="control-shell distraction-card" aria-label="Distraction rules">
     <div>
       <h2>Blocked apps and websites</h2>
-      <div class="muted">Websites close their active tab; apps are quit. A password block asks for the password instead, so you have to stop and decide.</div>
+      <div class="muted">These apply while a focus session is running — start focus and websites close their active tab, apps are quit. A password block asks for the password instead, so you have to stop and decide.</div>
     </div>
     <div class="block-table-wrap">
       <table id="blockTable" class="block-table">
@@ -7293,6 +7308,54 @@ mod tests {
         let active = sample("System Settings", "Wi-Fi connection", "local");
 
         assert!(is_system_connection_activity(&active));
+    }
+
+    #[test]
+    fn enforce_blocked_access_does_nothing_without_a_running_session() {
+        // Drives the real enforcement path, not just the predicate: with no
+        // session, a sample that matches a block rule must not be acted on and
+        // must not log a block. (Only the no-session case is exercised here —
+        // the blocking branch really does quit apps.)
+        let dir = temp_test_dir("block-gate");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let config = Config {
+            blocked_keywords: vec![format_block_rule_record("news.example", BlockMode::Full, "")],
+            ..Default::default()
+        };
+        let sample = ActivitySample {
+            timestamp: now(),
+            app: "Safari".into(),
+            title: "News".into(),
+            source: "https://news.example/story".into(),
+            category: "distracting".into(),
+        };
+        // Sanity: the rule really does match this sample.
+        assert!(blocked_keyword_match(&config, &sample).is_some());
+
+        enforce_blocked_access(&dir, &state, &config, &sample).expect("enforce");
+
+        let events = fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
+        assert!(
+            !events.contains("blocked_access"),
+            "block fired with no focus session: {events}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn block_rules_only_apply_during_a_running_session() {
+        // No session: the block list must not close tabs or quit apps.
+        assert!(!block_rules_are_active(None));
+
+        let running = focus("Pages");
+        assert!(block_rules_are_active(Some(&running)));
+
+        // Paused counts as not running, matching high focus mode.
+        let mut paused = focus("Pages");
+        paused.paused_at = Some(now());
+        assert!(!block_rules_are_active(Some(&paused)));
     }
 
     #[test]
