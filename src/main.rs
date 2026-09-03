@@ -58,6 +58,10 @@ struct FocusSession {
     alert_message: String,
     redirect_app: String,
     high_focus_mode: bool,
+    // A locked session cannot be paused or stopped, and its block rules cannot
+    // be edited, until its timer runs out. This is the commitment, and it is
+    // the only thing that makes a block hold against the person who set it.
+    locked: bool,
 }
 
 #[derive(Default)]
@@ -363,11 +367,15 @@ fn tracking_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<(
             sample.category = "idle".into();
         }
 
-        enforce_blocked_access(&data_dir, &state, &config, &sample)?;
+        let blocked = enforce_blocked_access(&data_dir, &state, &config, &sample)?;
         notify_devices_for_attention_event(&data_dir, &state, &config, &sample)?;
         append_sample(&data_dir, &sample)?;
         detect_distraction(&data_dir, &state, &sample)?;
-        thread::sleep(Duration::from_secs(SAMPLE_SECONDS));
+        if blocked {
+            guard_blocked_activity(&data_dir, &state, &config)?;
+        } else {
+            thread::sleep(Duration::from_secs(SAMPLE_SECONDS));
+        }
     }
 }
 
@@ -482,6 +490,7 @@ fn start_focus(
         alert_message: DEFAULT_ALERT_MESSAGE_TEMPLATE.into(),
         redirect_app: String::new(),
         high_focus_mode: false,
+        locked: false,
     };
     save_focus(&data_dir, &session)?;
     append_focus_session(&data_dir, &session)?;
@@ -664,29 +673,31 @@ fn clean_alert_message_template(value: &str) -> String {
     }
 }
 
+/// Returns whether something was actually blocked, so the caller can tighten
+/// its cadence while the user is pushing against a rule.
 fn enforce_blocked_access(
     data_dir: &Path,
     state: &Arc<Mutex<AppState>>,
     config: &Config,
     sample: &ActivitySample,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     if activity_is_block_exempt(state, sample) {
-        return Ok(());
+        return Ok(false);
     }
 
     if enforce_high_focus_block(data_dir, state, sample)? {
-        return Ok(());
+        return Ok(true);
     }
 
     // Distraction rules belong to a focus session. Outside one, Local Focus
     // still tracks and reports but must not close tabs or quit apps.
     let focus = lock_state(state).focus.clone();
     if !block_rules_are_active(focus.as_ref()) {
-        return Ok(());
+        return Ok(false);
     }
 
     let Some((rule, rule_kind)) = blocked_keyword_match(config, sample) else {
-        return Ok(());
+        return Ok(false);
     };
     let blocked_key = format!(
         "{}|{}|{}",
@@ -695,14 +706,38 @@ fn enforce_blocked_access(
         normalize_match_text(&sample.source)
     );
 
-    {
+    // The cooldown used to gate the block itself, which handed back a free
+    // window on the same target: get blocked, reopen it, and nothing touched
+    // you for another BLOCK_COOLDOWN_SECONDS. Enforcement now runs every time
+    // a blocked thing is in front of you; only the notification and the log
+    // entry are rate-limited, which is all the cooldown was ever needed for.
+    let repeat_within_cooldown = {
         let mut guard = lock_state(state);
-        let within_cooldown = sample.timestamp - guard.last_blocked_at < BLOCK_COOLDOWN_SECONDS;
-        if within_cooldown && guard.last_blocked_key == blocked_key {
-            return Ok(());
-        }
+        let repeat = sample.timestamp - guard.last_blocked_at < BLOCK_COOLDOWN_SECONDS
+            && guard.last_blocked_key == blocked_key;
         guard.last_blocked_at = sample.timestamp;
         guard.last_blocked_key = blocked_key;
+        repeat
+    };
+
+    match rule.mode {
+        BlockMode::Full => block_activity_access(sample, &rule.target, rule_kind),
+        BlockMode::Password => {
+            // Only raise the password prompt once per cooldown; stacking
+            // dialogs every second would be unusable.
+            if !repeat_within_cooldown {
+                let message = format!(
+                    "Blocked access to '{}' because it matches your distraction rule '{}'.",
+                    blocked_activity_label(sample),
+                    rule.target
+                );
+                password_block_activity_access(sample, &rule, &message);
+            }
+        }
+    }
+
+    if repeat_within_cooldown {
+        return Ok(true);
     }
 
     let message = format!(
@@ -711,11 +746,57 @@ fn enforce_blocked_access(
         rule.target
     );
     notify("Blocked by Local Focus", &message);
-    match rule.mode {
-        BlockMode::Full => block_activity_access(sample, &rule.target, rule_kind),
-        BlockMode::Password => password_block_activity_access(sample, &rule, &message),
+    append_event(data_dir, "blocked_access", &message)?;
+    Ok(true)
+}
+
+/// After a block fires, re-check every second for the length of one normal
+/// sample instead of waiting the full interval — reopening the tab used to buy
+/// several seconds of access. Deliberately does not record samples: the reports
+/// treat one sample as SAMPLE_SECONDS of time, so recording here would inflate
+/// them. This replaces the normal sleep rather than adding to it, so the
+/// sampling cadence is unchanged.
+fn guard_blocked_activity(
+    data_dir: &Path,
+    state: &Arc<Mutex<AppState>>,
+    config: &Config,
+) -> io::Result<()> {
+    for _ in 0..SAMPLE_SECONDS {
+        thread::sleep(Duration::from_secs(1));
+        let focus = {
+            let guard = lock_state(state);
+            if guard.stopped {
+                return Ok(());
+            }
+            guard.focus.clone()
+        };
+        let raw = foreground_activity();
+        let category = classify(config, &raw.0, &raw.1);
+        let mut sample = ActivitySample {
+            timestamp: now(),
+            app: raw.0,
+            title: raw.1,
+            source: raw.2,
+            category,
+        };
+        apply_focus_productivity_gate(&focus, &mut sample);
+        enforce_blocked_access(data_dir, state, config, &sample)?;
     }
-    append_event(data_dir, "blocked_access", &message)
+    Ok(())
+}
+
+/// Whether a session's commitment lock is still holding. Derived from the
+/// clock rather than a flag, so it always releases on its own when the timer
+/// runs out — there is no state anyone can get permanently stuck in. A paused
+/// session cannot exist while locked (pausing is refused), so elapsed time is
+/// simply now minus the start.
+fn focus_lock_is_active(focus: &FocusSession, at: i64) -> bool {
+    focus.locked && focus_elapsed_seconds(focus, at) < (focus.duration_minutes * 60) as i64
+}
+
+/// The same question for the optional session the request handlers hold.
+fn session_is_locked(focus: Option<&FocusSession>, at: i64) -> bool {
+    focus.is_some_and(|focus| focus_lock_is_active(focus, at))
 }
 
 /// Whether the distraction rules should be enforced right now. They only apply
@@ -1734,6 +1815,11 @@ fn handle_http(
                     .map(|settings| settings.alert_message.clone())
                     .unwrap_or_else(|| DEFAULT_ALERT_MESSAGE_TEMPLATE.into())
             });
+        // Opt-in commitment: once set, this session cannot be paused or
+        // stopped, and its block rules cannot be edited, until the timer ends.
+        let locked = params
+            .get("lock")
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"));
         let redirect_app = params
             .get("redirectApp")
             .map(|s| s.trim().to_string())
@@ -1757,6 +1843,7 @@ fn handle_http(
             alert_message,
             redirect_app,
             high_focus_mode: false,
+            locked,
         };
         save_focus(&data_dir, &session)?;
         save_last_focus_settings(&data_dir, &session)?;
@@ -1834,6 +1921,14 @@ fn handle_http(
             )?;
         }
     } else if path.starts_with("/api/focus/pause") {
+        if session_is_locked(lock_state(&state).focus.as_ref(), now()) {
+            write_response(
+                &mut stream,
+                "application/json",
+                "{\"ok\":false,\"locked\":true,\"error\":\"This session is locked until its timer ends.\"}",
+            )?;
+            return Ok(());
+        }
         let updated = {
             let mut guard = lock_state(&state);
             if let Some(mut focus) = guard.focus.clone() {
@@ -1908,6 +2003,14 @@ fn handle_http(
         }
         write_response(&mut stream, "application/json", "{\"ok\":true}")?;
     } else if path.starts_with("/api/focus/stop") {
+        if session_is_locked(lock_state(&state).focus.as_ref(), now()) {
+            write_response(
+                &mut stream,
+                "application/json",
+                "{\"ok\":false,\"locked\":true,\"error\":\"This session is locked until its timer ends.\"}",
+            )?;
+            return Ok(());
+        }
         // Stop is the master off switch: end the focus session and halt all
         // tracking, blocking, alerts, device notifications, and reminders until
         // the app is resumed (Resume button, a new focus session, or relaunch).
@@ -1935,6 +2038,14 @@ fn handle_http(
         );
         write_response(&mut stream, "application/json", "{\"ok\":true,\"stopped\":false}")?;
     } else if path.starts_with("/api/block/add") {
+        if session_is_locked(lock_state(&state).focus.as_ref(), now()) {
+            write_response(
+                &mut stream,
+                "application/json",
+                "{\"ok\":false,\"locked\":true,\"error\":\"Block rules are locked until this session ends.\"}",
+            )?;
+            return Ok(());
+        }
         let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
         let params = parse_query(query);
         // Comma/newline-separated input becomes one block rule per keyword.
@@ -1973,6 +2084,14 @@ fn handle_http(
 
         write_response(&mut stream, "application/json", "{\"ok\":true}")?;
     } else if path.starts_with("/api/block/remove") {
+        if session_is_locked(lock_state(&state).focus.as_ref(), now()) {
+            write_response(
+                &mut stream,
+                "application/json",
+                "{\"ok\":false,\"locked\":true,\"error\":\"Block rules are locked until this session ends.\"}",
+            )?;
+            return Ok(());
+        }
         let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
         let params = parse_query(query);
         let keyword = params
@@ -3691,7 +3810,7 @@ fn state_json(
             let elapsed = focus_elapsed_seconds(&focus, now());
             let remaining = ((focus.duration_minutes * 60) as i64 - elapsed).max(0);
             format!(
-                "{{\"stopped\":{},\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"paused\":{},\"remainingSeconds\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"journal\":{},\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
+                "{{\"stopped\":{},\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"paused\":{},\"remainingSeconds\":{},\"locked\":{},\"lockActive\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"journal\":{},\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
                 stopped,
                 json_escape(&focus.task),
                 json_escape(&focus.target),
@@ -3705,6 +3824,8 @@ fn state_json(
                 focus.high_focus_mode,
                 focus.paused_at.is_some(),
                 remaining,
+                focus.locked,
+                focus_lock_is_active(&focus, now()),
                 devices_json,
                 blocks_json,
                 journal_json,
@@ -4142,6 +4263,13 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
     <section class="grid focus-summary-grid" id="metrics" aria-label="Current focus summary"></section>
     <div class="high-focus-control">
       <div class="high-focus-row">
+        <label class="high-focus-check" for="lockSession">
+          <input id="lockSession" type="checkbox">
+          Lock this session
+        </label>
+        <span id="lockSessionHint" class="muted">Blocks hold until the timer ends.</span>
+      </div>
+      <div class="high-focus-row">
         <label class="high-focus-check" for="highFocusMode">
           <input id="highFocusMode" type="checkbox" onchange="toggleHighFocusMode()" disabled>
           High focus mode
@@ -4404,7 +4532,10 @@ async function startFocus() {
   const alertAction = encodeURIComponent(document.querySelector('#alertAction').value || 'alert');
   const alertMessage = encodeURIComponent(document.querySelector('#alertMessage').value || DEFAULT_ALERT_MESSAGE_TEMPLATE);
   const redirectApp = encodeURIComponent(document.querySelector('#redirectApp').value || '');
-  await fetch(`/api/focus/start?task=${task}&target=${target}&minutes=${mins}&alertSeconds=${alertSeconds}&actionSeconds=${actionSeconds}&alertAction=${alertAction}&alertMessage=${alertMessage}&redirectApp=${redirectApp}`);
+  const lockInput = document.querySelector('#lockSession');
+  const lock = lockInput && lockInput.checked ? '1' : '0';
+  if (lock === '1' && !confirm(`Lock this session for ${document.querySelector('#minutes').value || '25'} minutes?\n\nYou will not be able to pause it, stop it, or change your block rules until the timer ends.`)) return;
+  await fetch(`/api/focus/start?task=${task}&target=${target}&minutes=${mins}&alertSeconds=${alertSeconds}&actionSeconds=${actionSeconds}&alertAction=${alertAction}&alertMessage=${alertMessage}&redirectApp=${redirectApp}&lock=${lock}`);
   refresh();
 }
 async function saveFocusEdits() {
@@ -5544,7 +5675,10 @@ function updateFocusButtons(focus, stopped) {
   const paused = Boolean(focus && focus.paused);
   startButton.className = `focus-btn ${running ? 'focus-running' : 'focus-idle'}`;
   startButton.textContent = stopped ? 'Start focus' : paused ? 'Start new session' : running ? 'Focusing' : 'Start focus';
-  pauseButton.disabled = !focus || Boolean(stopped);
+  // A locked session refuses these server-side; disabling them here just
+  // stops the buttons lying about what they will do.
+  const lockHolds = Boolean(focus && focus.lockActive);
+  pauseButton.disabled = !focus || Boolean(stopped) || lockHolds;
   // Pause uses the same treatment as the off switch so it reads differently
   // from the green "Focusing" button.
   pauseButton.className = `focus-btn ${paused ? 'focus-paused' : running ? 'focus-stop-active' : ''}`;
@@ -5554,9 +5688,27 @@ function updateFocusButtons(focus, stopped) {
   // available whenever the app is running, even without an active focus
   // session, and disabled once already off. It pairs with the banner's
   // "Resume Local Focus".
-  stopButton.disabled = Boolean(stopped);
+  stopButton.disabled = Boolean(stopped) || lockHolds;
   stopButton.className = `focus-btn ${stopped ? '' : 'focus-stop-active'}`;
-  stopButton.title = 'Turn off all tracking, blocking, warnings, and reminders until you resume';
+  stopButton.title = lockHolds
+    ? 'Locked until this session\'s timer ends'
+    : 'Turn off all tracking, blocking, warnings, and reminders until you resume';
+  if (lockHolds) pauseButton.title = 'Locked until this session\'s timer ends';
+  // The lock is chosen before a session starts, so the control only applies
+  // while one is not running.
+  const lockInput = document.querySelector('#lockSession');
+  const lockHint = document.querySelector('#lockSessionHint');
+  if (lockInput) {
+    lockInput.disabled = Boolean(focus) || Boolean(stopped);
+    if (focus) lockInput.checked = Boolean(focus.locked);
+  }
+  if (lockHint) {
+    lockHint.textContent = lockHolds
+      ? 'Locked. Pause, stop, and block edits are unavailable until the timer ends.'
+      : focus
+        ? 'Set before starting a session.'
+        : 'Blocks hold until the timer ends.';
+  }
   // Show the editor's Save button only while a session is active to edit.
   const saveEditsButton = document.querySelector('#saveFocusEdits');
   if (saveEditsButton) saveEditsButton.style.display = focus && !stopped ? '' : 'none';
@@ -5995,7 +6147,7 @@ fn save_focus(data_dir: &Path, focus: &FocusSession) -> io::Result<()> {
     fs::write(
         data_dir.join("focus.json"),
         format!(
-            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{}}}",
+            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"locked\":{}}}",
             json_escape(&focus.task),
             json_escape(&focus.target),
             focus.started_at,
@@ -6009,7 +6161,8 @@ fn save_focus(data_dir: &Path, focus: &FocusSession) -> io::Result<()> {
             json_escape(&focus.alert_action),
             json_escape(&clean_alert_message_template(&focus.alert_message)),
             json_escape(&focus.redirect_app),
-            focus.high_focus_mode
+            focus.high_focus_mode,
+            focus.locked
         ),
     )
 }
@@ -6086,6 +6239,7 @@ fn load_focus(data_dir: &Path) -> Option<FocusSession> {
             .unwrap_or_else(|| DEFAULT_ALERT_MESSAGE_TEMPLATE.into()),
         redirect_app: json_string(&value, "redirectApp").unwrap_or_default(),
         high_focus_mode: json_bool(&value, "highFocusMode").unwrap_or(false),
+        locked: json_bool(&value, "locked").unwrap_or(false),
     })
 }
 
@@ -7203,6 +7357,7 @@ mod tests {
             alert_message: DEFAULT_ALERT_MESSAGE_TEMPLATE.into(),
             redirect_app: String::new(),
             high_focus_mode: true,
+            locked: false,
         }
     }
 
@@ -7340,6 +7495,82 @@ mod tests {
             !events.contains("blocked_access"),
             "block fired with no focus session: {events}"
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_locked_session_releases_itself_when_the_timer_ends() {
+        let mut session = focus("Pages");
+        session.duration_minutes = 25;
+        session.started_at = now();
+
+        // Not locked: nothing is ever held.
+        assert!(!focus_lock_is_active(&session, now()));
+        assert!(!session_is_locked(Some(&session), now()));
+
+        session.locked = true;
+        assert!(focus_lock_is_active(&session, session.started_at));
+        // Still inside the 25 minutes.
+        assert!(focus_lock_is_active(&session, session.started_at + 24 * 60));
+        // The moment the timer runs out the lock lets go on its own, so there
+        // is no way to end up permanently locked.
+        assert!(!focus_lock_is_active(&session, session.started_at + 25 * 60));
+        assert!(!focus_lock_is_active(&session, session.started_at + 60 * 60));
+
+        // No session at all is never locked.
+        assert!(!session_is_locked(None, now()));
+    }
+
+    #[test]
+    fn integration_a_locked_session_refuses_stop_pause_and_block_edits() {
+        let (port, dir) = start_test_server("integration-lock");
+
+        let (status, _) = test_get(
+            port,
+            "/api/focus/start?task=Locked&minutes=25&target=Pages&lock=1",
+        );
+        assert_eq!(status, 200);
+        let (_, body) = test_get(port, "/api/state");
+        assert_eq!(json_bool(&body, "lockActive"), Some(true));
+
+        // Every escape hatch is refused while the timer runs.
+        for route in [
+            "/api/focus/pause",
+            "/api/focus/stop",
+            "/api/block/add?keyword=escape.example&mode=full",
+            "/api/block/remove?keyword=escape.example",
+        ] {
+            let (status, body) = test_get(port, route);
+            assert_eq!(status, 200, "{route}");
+            assert_eq!(json_bool(&body, "ok"), Some(false), "{route} was allowed");
+            assert_eq!(json_bool(&body, "locked"), Some(true), "{route}");
+        }
+
+        // The session really is still running and unpaused after all that.
+        let (_, body) = test_get(port, "/api/state");
+        assert_eq!(json_bool(&body, "paused"), Some(false));
+        assert_eq!(json_bool(&body, "stopped"), Some(false));
+        assert_eq!(json_string(&body, "task").as_deref(), Some("Locked"));
+        // And no block rule slipped through.
+        assert!(!body.contains("escape.example"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn integration_an_unlocked_session_can_still_be_stopped() {
+        // The guards must not leak into ordinary sessions.
+        let (port, dir) = start_test_server("integration-unlocked");
+        let (status, _) = test_get(port, "/api/focus/start?task=Open&minutes=25&target=Pages");
+        assert_eq!(status, 200);
+        let (_, body) = test_get(port, "/api/state");
+        assert_eq!(json_bool(&body, "lockActive"), Some(false));
+
+        let (_, body) = test_get(port, "/api/focus/pause");
+        assert_eq!(json_bool(&body, "ok"), Some(true));
+        let (_, body) = test_get(port, "/api/focus/stop");
+        assert_eq!(json_bool(&body, "stopped"), Some(true));
 
         let _ = fs::remove_dir_all(dir);
     }
