@@ -2701,24 +2701,54 @@ fn switch_report_json(data_dir: &Path) -> io::Result<String> {
     let mut total_switches: u64 = 0;
     let mut distracting_switches: u64 = 0;
     let mut switch_targets: BTreeMap<(String, String), usize> = BTreeMap::new();
+    // Switches bucketed into clock hours, so the dashboard can draw when the
+    // jumping happened rather than just how much of it there was. Keyed by the
+    // unix timestamp of the hour's start; the browser turns that into a local
+    // hour label, which keeps timezone handling out of here.
+    let mut by_hour: BTreeMap<i64, usize> = BTreeMap::new();
+    // Longest unbroken stretch on one thing, counting only non-idle samples so
+    // walking away from the machine cannot masquerade as deep focus.
+    let mut longest_calm_seconds: u64 = 0;
+    let mut current_run_seconds: u64 = 0;
     let mut previous: Option<&ActivitySample> = None;
     for sample in &recent {
-        if let Some(prev) = previous {
-            if prev.app != sample.app || prev.title != sample.title {
-                total_switches += 1;
-                if sample.category == "distracting" {
-                    distracting_switches += 1;
-                }
-                *switch_targets
-                    .entry((sample.app.clone(), sample.source.clone()))
-                    .or_default() += 1;
+        let switched = previous
+            .is_some_and(|prev| prev.app != sample.app || prev.title != sample.title);
+        if switched {
+            total_switches += 1;
+            if sample.category == "distracting" {
+                distracting_switches += 1;
             }
+            *switch_targets
+                .entry((sample.app.clone(), sample.source.clone()))
+                .or_default() += 1;
+            *by_hour
+                .entry(sample.timestamp - sample.timestamp.rem_euclid(3600))
+                .or_default() += 1;
+            longest_calm_seconds = longest_calm_seconds.max(current_run_seconds);
+            current_run_seconds = 0;
+        }
+        if sample.category != "idle" {
+            current_run_seconds += SAMPLE_SECONDS;
         }
         previous = Some(sample);
     }
+    longest_calm_seconds = longest_calm_seconds.max(current_run_seconds);
 
     let window_minutes = (recent.len() as u64 * SAMPLE_SECONDS / 60).max(1);
     let switches_per_hour = total_switches as f64 / (window_minutes as f64 / 60.0);
+    // "About once every N minutes" reads far more plainly than a rate.
+    let minutes_between_switches = if total_switches > 0 {
+        window_minutes as f64 / total_switches as f64
+    } else {
+        0.0
+    };
+
+    let hours_json = by_hour
+        .into_iter()
+        .map(|(start, count)| format!("{{\"start\":{},\"switches\":{}}}", start, count))
+        .collect::<Vec<_>>()
+        .join(",");
 
     let mut top: Vec<_> = switch_targets.into_iter().collect();
     top.sort_by_key(|entry| std::cmp::Reverse(entry.1));
@@ -2737,8 +2767,15 @@ fn switch_report_json(data_dir: &Path) -> io::Result<String> {
         .join(",");
 
     Ok(format!(
-        "{{\"totalSwitches\":{},\"distractingSwitches\":{},\"switchesPerHour\":{:.1},\"topSwitchTargets\":[{}]}}",
-        total_switches, distracting_switches, switches_per_hour, top_json
+        "{{\"totalSwitches\":{},\"distractingSwitches\":{},\"switchesPerHour\":{:.1},\"minutesBetweenSwitches\":{:.1},\"longestCalmSeconds\":{},\"windowMinutes\":{},\"byHour\":[{}],\"topSwitchTargets\":[{}]}}",
+        total_switches,
+        distracting_switches,
+        switches_per_hour,
+        minutes_between_switches,
+        longest_calm_seconds,
+        window_minutes,
+        hours_json,
+        top_json
     ))
 }
 
@@ -3765,6 +3802,30 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
 .focus-session-list { display:grid; gap:8px; }
 .focus-session-row { border:1px solid var(--line); border-radius:8px; padding:9px; background:var(--panel); }
 .check-field { display:grid; gap:7px; }
+.switch-headline { font-size:22px; font-weight:800; line-height:1.35; margin:0; }
+.switch-headline .switch-count { color:var(--accent); }
+.switch-chart-wrap { border:1px solid var(--line); border-radius:10px; background:var(--panel-soft); padding:14px; display:grid; gap:8px; }
+.switch-chart { display:flex; align-items:flex-end; gap:6px; min-height:132px; overflow-x:auto; }
+.switch-bar { flex:1 1 0; min-width:26px; display:grid; gap:6px; justify-items:center; align-content:end; }
+.switch-bar-track { width:100%; height:96px; display:flex; align-items:flex-end; }
+.switch-bar-fill { width:100%; border-radius:8px 8px 4px 4px; background:var(--accent-grad); min-height:4px; transition:height .35s ease; }
+.switch-bar.is-calm .switch-bar-fill { background:var(--good); }
+.switch-bar.is-busy .switch-bar-fill { background:var(--bad); }
+.switch-bar.is-quiet .switch-bar-track { border-bottom:2px dashed color-mix(in srgb, var(--line) 80%, transparent); }
+.switch-bar.is-quiet .switch-bar-label { opacity:.55; }
+.switch-bar-value { font-size:12px; font-weight:800; }
+.switch-bar-label { font-size:11px; color:var(--muted); white-space:nowrap; }
+.switch-chart-empty { color:var(--muted); align-self:center; margin:auto; }
+.switch-chart-caption { font-size:12px; }
+.switch-facts { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:10px; }
+.switch-fact { border:1px solid var(--line); border-radius:10px; padding:10px 12px; background:var(--panel); }
+.switch-fact span { display:block; font-size:11px; font-weight:800; }
+.switch-fact strong { display:block; margin-top:2px; font-size:20px; }
+.switch-targets { display:grid; gap:8px; margin-top:10px; }
+.switch-target-row { display:grid; grid-template-columns:minmax(90px, 160px) 1fr auto; gap:10px; align-items:center; font-size:13px; }
+.switch-target-track { height:14px; border-radius:999px; background:color-mix(in srgb, var(--line) 55%, transparent); overflow:hidden; }
+.switch-target-fill { height:100%; border-radius:999px; background:var(--accent-grad); min-width:3px; }
+.switch-target-count { font-weight:800; }
 .block-table-wrap { border:1px solid var(--line); border-radius:10px; background:var(--panel-soft); overflow-x:auto; }
 .block-table { width:100%; border-collapse:collapse; font-size:13px; }
 .block-table th { text-align:left; font-size:11px; font-weight:800; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; padding:10px 12px; border-bottom:1px solid var(--line); white-space:nowrap; }
@@ -4179,15 +4240,23 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
     </div>
     <section class="report report-inline" id="focusReportPanel" aria-live="polite"></section>
   </section>
-  <section id="switchReportCard" class="control-shell" aria-label="Interruption frequency">
+  <section id="switchReportCard" class="control-shell" aria-label="How often you jumped">
     <div>
-      <h2>Interruption frequency</h2>
-      <div class="muted">A second, independent report: how often your attention actually shifts, not how many minutes were distracted. Frequent switching fragments focus even on a day where the duration report above looks fine.</div>
+      <h2>How often you jumped</h2>
+      <div class="muted">Every time you swapped to a different app or page. Lots of small jumps break focus even on a day when your total distracted time looks fine.</div>
     </div>
-    <section class="grid focus-summary-grid" id="switchMetrics" aria-label="Interruption frequency summary"></section>
+    <p id="switchHeadline" class="switch-headline">No jumps yet today.</p>
+    <div class="switch-chart-wrap">
+      <div id="switchChart" class="switch-chart" role="img" aria-label="Jumps per hour"></div>
+      <div class="switch-chart-caption muted">When you jumped, hour by hour</div>
+    </div>
+    <div class="switch-facts">
+      <div class="switch-fact"><span class="muted">Longest stretch on one thing</span><strong id="switchLongest">--</strong></div>
+      <div class="switch-fact"><span class="muted">Jumps onto something distracting</span><strong id="switchDistracting">--</strong></div>
+    </div>
     <div>
-      <strong>Most switched-to</strong>
-      <div id="switchTargets" class="muted">No switches recorded yet.</div>
+      <strong>What you jumped to most</strong>
+      <div id="switchTargets" class="switch-targets muted">No jumps recorded yet.</div>
     </div>
   </section>
   <section class="explain" id="explainPanel">
@@ -4198,7 +4267,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
       <div><h3>Distracted</h3><p>Any activity that is not productive. During targeted focus, every app or site outside your focus list is tracked here.</p></div>
       <div><h3>Idle</h3><p>If there is no keyboard or mouse input for 60 seconds, time is tracked as idle even when the focused app or website matches your focus list.</p></div>
       <div><h3>Blocked</h3><p>Blocked apps or sites are actively closed when detected, and the blocked time is tracked as distracted.</p></div>
-      <div><h3>Switches</h3><p>Every time the foreground app or window title changes, in the same window as the report above. Independent of duration — a low distracted-minutes total can still hide constant switching.</p></div>
+      <div><h3>Jumps</h3><p>Every time the foreground app or page changes, over the same window as the report above. Independent of duration — a low distracted-minutes total can still hide constant jumping. An empty hour in the chart means no jumps at all.</p></div>
     </div>
   </section>
   <section class="bar">
@@ -4504,6 +4573,78 @@ function renderJournalTaskReminders() {
     list.innerHTML = '<div class="muted">No task reminders yet.</div>';
     if (status) status.textContent = 'No reminder added yet.';
   }
+}
+// "How often you jumped" is meant to be readable at a glance, so it leads with
+// a plain sentence and a bar per hour instead of a row of rate figures. Bars
+// are coloured by how jumpy that hour was, against this hour-by-hour rule of
+// thumb: a handful of switches an hour is normal, dozens is fragmented.
+const CALM_HOUR_SWITCHES = 6;
+const BUSY_HOUR_SWITCHES = 20;
+const MAX_CHART_HOURS = 24;
+/// Turns the sparse hours the server sends into a continuous run of clock
+/// hours, so a gap in the chart means "quiet hour" rather than "missing bar".
+function fillQuietHours(hours) {
+  if (!hours.length) return [];
+  const HOUR = 3600;
+  const first = hours[0].start;
+  const last = hours[hours.length - 1].start;
+  const counts = new Map(hours.map(hour => [hour.start, hour.switches || 0]));
+  const span = Math.floor((last - first) / HOUR) + 1;
+  // A very long gap (a machine idle for days) would make the chart unreadable,
+  // so fall back to just the hours that had activity.
+  if (span > MAX_CHART_HOURS) return hours;
+  const series = [];
+  for (let start = first; start <= last; start += HOUR) {
+    series.push({ start, switches: counts.get(start) || 0 });
+  }
+  return series;
+}
+function renderSwitchReport(switches) {
+  const total = switches.totalSwitches || 0;
+  const gap = switches.minutesBetweenSwitches || 0;
+  const headline = document.querySelector('#switchHeadline');
+  if (headline) {
+    setHtml(headline, total === 0
+      ? 'No jumps recorded yet.'
+      : `You jumped <span class="switch-count">${total}</span> time${total === 1 ? '' : 's'}${gap >= 1 ? ` — about once every ${Math.round(gap)} minute${Math.round(gap) === 1 ? '' : 's'}.` : '.'}`);
+  }
+
+  // The server only sends hours that had a jump. Drawing those side by side
+  // would imply they were consecutive, so fill the quiet hours back in — an
+  // empty bar is the honest picture of an hour you were away or heads-down.
+  const series = fillQuietHours(switches.byHour || []);
+  const peak = series.reduce((most, hour) => Math.max(most, hour.switches || 0), 0);
+  setHtml('#switchChart', series.length === 0
+    ? '<div class="switch-chart-empty">Nothing to show yet. Bars appear here as you use your Mac.</div>'
+    : series.map(hour => {
+        const count = hour.switches || 0;
+        // Small counts still get a visible stub; zero stays visibly empty.
+        const height = count === 0 ? 0 : peak > 0 ? Math.max(12, Math.round((count / peak) * 96)) : 12;
+        const tone = count === 0 ? 'is-quiet' : count <= CALM_HOUR_SWITCHES ? 'is-calm' : count >= BUSY_HOUR_SWITCHES ? 'is-busy' : '';
+        const label = new Date((hour.start || 0) * 1000).toLocaleTimeString([], { hour: 'numeric' });
+        return `<div class="switch-bar ${tone}" title="${escapeTextAttr(`${count} jump${count === 1 ? '' : 's'} at ${label}`)}">
+          <span class="switch-bar-value">${count === 0 ? '' : count}</span>
+          <div class="switch-bar-track">${count === 0 ? '' : `<div class="switch-bar-fill" style="height:${height}px"></div>`}</div>
+          <span class="switch-bar-label">${escapeHtml(label)}</span>
+        </div>`;
+      }).join(''));
+
+  const longest = document.querySelector('#switchLongest');
+  if (longest) longest.textContent = switches.longestCalmSeconds ? formatDuration(switches.longestCalmSeconds) : '--';
+  const distracting = document.querySelector('#switchDistracting');
+  if (distracting) distracting.textContent = total === 0 ? '--' : String(switches.distractingSwitches || 0);
+
+  const targets = switches.topSwitchTargets || [];
+  const busiest = targets.reduce((most, target) => Math.max(most, target.switches || 0), 0);
+  setHtml('#switchTargets', targets.map(target => {
+    const count = target.switches || 0;
+    const width = busiest > 0 ? Math.max(3, Math.round((count / busiest) * 100)) : 3;
+    return `<div class="switch-target-row">
+      <span>${escapeHtml(target.app)}</span>
+      <div class="switch-target-track"><div class="switch-target-fill" style="width:${width}%"></div></div>
+      <span class="switch-target-count">${count}</span>
+    </div>`;
+  }).join('') || '<div class="muted">No jumps recorded yet.</div>');
 }
 function normalizedBlockValue(value) {
   return String(value || '').trim().toLowerCase();
@@ -5185,11 +5326,7 @@ async function refresh() {
     <div class="metric"><span class="muted">Productive</span><strong>${formatDuration(report.productiveMinutes * 60)}</strong></div>
     <div class="metric"><span class="muted">Distracted</span><strong>${formatDuration(report.distractingMinutes * 60)}</strong></div>
     <div class="metric"><span class="muted">Idle</span><strong>${formatDuration((report.idleMinutes || 0) * 60)}</strong></div>`);
-  setHtml('#switchMetrics', `
-    <div class="metric"><span class="muted">Switches</span><strong>${switches.totalSwitches || 0}</strong></div>
-    <div class="metric"><span class="muted">Per hour</span><strong>${(switches.switchesPerHour || 0).toFixed(1)}</strong></div>
-    <div class="metric"><span class="muted">Into distractions</span><strong>${switches.distractingSwitches || 0}</strong></div>`);
-  setHtml('#switchTargets', (switches.topSwitchTargets || []).map(target => `<p><strong>${escapeHtml(target.app)}</strong><br><span class="muted">${target.switches} switch${target.switches === 1 ? '' : 'es'}</span></p>`).join('') || '<div class="muted">No switches recorded yet.</div>');
+  renderSwitchReport(switches);
   setHtml('#timeline', timeline.slice(-80).reverse().map((item, index) => {
     const longAttention = item.durationSeconds > 15 * 60 && (item.category === 'idle' || item.category === 'distracting');
     const longClass = longAttention ? ` long-attention ${item.category === 'idle' ? 'long-idle' : 'long-distracting'}` : '';
@@ -7368,6 +7505,56 @@ mod tests {
     }
 
     #[test]
+    fn switch_report_buckets_jumps_by_hour_and_measures_the_longest_stretch() {
+        let dir = temp_test_dir("switch-report-hours");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        // Anchor on an exact hour boundary so the buckets are predictable.
+        let hour = (now() / 3600) * 3600;
+        let samples = [
+            // Two samples on one app, then a jump: a 10s stretch.
+            ("Claude", "Claude", "productive", hour + 10),
+            ("Claude", "Claude", "productive", hour + 15),
+            ("Chrome", "YouTube", "distracting", hour + 20),
+            // Idle time must not count toward the longest stretch.
+            ("Chrome", "YouTube", "idle", hour + 25),
+            ("Chrome", "YouTube", "idle", hour + 30),
+            // A jump in the next hour lands in its own bucket.
+            ("Pages", "Draft", "productive", hour + 3600 + 10),
+        ];
+        for (app, title, category, timestamp) in samples {
+            append_sample(
+                &dir,
+                &ActivitySample {
+                    timestamp,
+                    app: app.into(),
+                    title: title.into(),
+                    source: "local".into(),
+                    category: category.into(),
+                },
+            )
+            .expect("append sample");
+        }
+
+        let report = switch_report_json(&dir).expect("switch report");
+
+        // Claude -> Chrome, then Chrome -> Pages. The two extra Chrome samples
+        // only change category, not app or title, so they are not jumps.
+        assert_eq!(json_number(&report, "totalSwitches"), Some(2));
+        // Claude ran for two non-idle samples before jumping; the Chrome run
+        // that follows is mostly idle, so it must not beat it.
+        assert_eq!(
+            json_number(&report, "longestCalmSeconds"),
+            Some(2 * SAMPLE_SECONDS as i64)
+        );
+        // One jump in each hour, each in its own bucket.
+        assert!(report.contains(&format!("{{\"start\":{},\"switches\":1}}", hour)));
+        assert!(report.contains(&format!("{{\"start\":{},\"switches\":1}}", hour + 3600)));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn switch_report_handles_no_samples_without_panicking() {
         let dir = temp_test_dir("switch-report-empty");
         fs::create_dir_all(&dir).expect("create temp dir");
@@ -7825,6 +8012,10 @@ mod tests {
         assert!(body.contains("totalSwitches"));
         assert!(body.contains("distractingSwitches"));
         assert!(body.contains("topSwitchTargets"));
+        // Fields the chart is drawn from.
+        assert!(body.contains("byHour"));
+        assert!(body.contains("longestCalmSeconds"));
+        assert!(body.contains("minutesBetweenSwitches"));
         let _ = fs::remove_dir_all(dir);
     }
 
