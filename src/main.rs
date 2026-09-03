@@ -17,11 +17,6 @@ const BLOCK_COOLDOWN_SECONDS: i64 = 10;
 // only showing it on a chart afterwards. ADHD self-report is unreliable — the
 // research is clear that people do not notice they are doing this — so the
 // intervention is to name it out loud the moment it starts.
-// High Focus quits whatever is not on the focus list. Doing that the instant
-// an app comes forward means one stray click can close the thing you were
-// working in, mid-sentence, with no warning — so warn first and only act if
-// the person is still there after this long.
-const HIGH_FOCUS_GRACE_SECONDS: i64 = 12;
 const JUMP_GUARD_WINDOW_SECONDS: i64 = 5 * 60;
 const JUMP_GUARD_SWITCHES: usize = 12;
 const JUMP_GUARD_COOLDOWN_SECONDS: i64 = 10 * 60;
@@ -97,9 +92,6 @@ struct AppState {
     last_sample_key: String,
     recent_switch_times: Vec<i64>,
     last_jump_guard_at: i64,
-    // What High Focus is currently counting down on, and since when.
-    high_focus_pending_key: String,
-    high_focus_pending_since: i64,
     // Master switch. When true, the whole app is stopped: no tracking, blocking,
     // alerts, device notifications, or journal reminders until it is resumed.
     stopped: bool,
@@ -278,8 +270,6 @@ fn run_app(data_dir: PathBuf) -> io::Result<()> {
         last_sample_key: String::new(),
         recent_switch_times: Vec::new(),
         last_jump_guard_at: 0,
-        high_focus_pending_key: String::new(),
-        high_focus_pending_since: 0,
     }));
 
     {
@@ -364,8 +354,6 @@ fn run_tracker(data_dir: PathBuf) -> io::Result<()> {
         last_sample_key: String::new(),
         recent_switch_times: Vec::new(),
         last_jump_guard_at: 0,
-        high_focus_pending_key: String::new(),
-        high_focus_pending_since: 0,
     }));
     tracking_loop(data_dir, state)
 }
@@ -925,11 +913,6 @@ fn enforce_high_focus_block(
         return Ok(false);
     };
     if !high_focus_should_block(&focus, sample) {
-        // Back on the focus list (or paused): forget any countdown, so the
-        // next slip gets its own full grace instead of being closed instantly.
-        let mut guard = lock_state(state);
-        guard.high_focus_pending_key.clear();
-        guard.high_focus_pending_since = 0;
         return Ok(false);
     }
 
@@ -940,45 +923,6 @@ fn enforce_high_focus_block(
         normalize_match_text(&sample.source),
         normalize_match_text(&sample.title)
     );
-
-    // Give the person a moment, and tell them what is about to happen. Landing
-    // somewhere off-list by accident should cost a warning, not the app you had
-    // open. Only once they are still there after the grace does it close.
-    let waiting_out_grace = {
-        let mut guard = lock_state(state);
-        if guard.high_focus_pending_key != block_key {
-            guard.high_focus_pending_key = block_key.clone();
-            guard.high_focus_pending_since = sample.timestamp;
-            true
-        } else {
-            sample.timestamp - guard.high_focus_pending_since < HIGH_FOCUS_GRACE_SECONDS
-        }
-    };
-    if waiting_out_grace {
-        let warned = {
-            let mut guard = lock_state(state);
-            let already = guard.last_blocked_key == block_key
-                && sample.timestamp - guard.last_blocked_at < BLOCK_COOLDOWN_SECONDS;
-            if !already {
-                guard.last_blocked_at = sample.timestamp;
-                guard.last_blocked_key = block_key.clone();
-            }
-            already
-        };
-        if !warned {
-            notify(
-                "Outside your focus list",
-                &format!(
-                    "{} closes in {HIGH_FOCUS_GRACE_SECONDS} seconds unless you go back to {}.",
-                    blocked_activity_label(sample),
-                    focus.target
-                ),
-            );
-        }
-        // Handled: nothing else should act on this sample yet.
-        return Ok(true);
-    }
-
     {
         let mut guard = lock_state(state);
         let within_cooldown = sample.timestamp - guard.last_blocked_at < BLOCK_COOLDOWN_SECONDS;
@@ -1954,13 +1898,12 @@ fn handle_http(
                     .map(|settings| settings.alert_message.clone())
                     .unwrap_or_else(|| DEFAULT_ALERT_MESSAGE_TEMPLATE.into())
             });
-        // Hyper focus is the app's whole point, so it is on unless switched
-        // off. With an empty focus list it blocks nothing, so a session with
-        // no targets is still harmless.
+        // Off unless explicitly asked for: High Focus quits anything outside
+        // the focus list the moment it appears, which is far too much to hand
+        // someone by default.
         let high_focus = params
             .get("highFocus")
-            .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
-            .unwrap_or(true);
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"));
         // On unless explicitly switched off.
         let jump_guard = params
             .get("jumpGuard")
@@ -4381,7 +4324,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
   <section id="onboarding" class="onboarding" hidden aria-label="Welcome">
     <div class="onboarding-card">
       <h2>What do you want to focus on?</h2>
-      <p class="muted">Add the apps and websites that count as work. While you focus, everything else gets blocked.</p>
+      <p class="muted">Add the apps and websites that count as work. Everything else gets tracked as a distraction, so you can see where your attention actually went.</p>
       <div class="target-entry">
         <input id="onboardingTarget" placeholder="Pages, https://claude.ai/" aria-label="App or website to focus on">
         <button type="button" onclick="addOnboardingTarget()">Add</button>
@@ -7822,9 +7765,18 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+
     #[test]
-    fn high_focus_warns_before_it_closes_anything() {
-        let dir = temp_test_dir("high-focus-grace");
+    fn high_focus_acts_on_the_first_sighting() {
+        // High Focus must close an off-list app as soon as it appears. A
+        // "warn first, act later" version of this keyed on the window title,
+        // which changes constantly in real apps, so the countdown reset
+        // forever and High Focus silently stopped working.
+        //
+        // The app name here is deliberately one that cannot exist: this test
+        // goes down the branch that really does quit applications, and it must
+        // never fire that at something on the machine running the suite.
+        let dir = temp_test_dir("high-focus-immediate");
         fs::create_dir_all(&dir).expect("create temp dir");
         let mut session = focus("Pages");
         session.high_focus_mode = true;
@@ -7832,34 +7784,21 @@ mod tests {
             focus: Some(session),
             ..Default::default()
         }));
-        let off_list = sample("Claude", "Claude", "local");
+        let off_list = sample(
+            "LocalFocusNonexistentTestApp",
+            "LocalFocusNonexistentTestApp",
+            "local",
+        );
 
-        // First sighting: handled, but only as a warning — the countdown starts
-        // and nothing is closed.
-        assert!(enforce_high_focus_block(&dir, &state, &off_list).expect("first"));
+        assert!(enforce_high_focus_block(&dir, &state, &off_list).expect("enforce"));
+
         let events = fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
         assert!(
-            !events.contains("high_focus_blocked_access"),
-            "closed on first sight instead of warning: {events}"
+            events.contains("high_focus_blocked_access"),
+            "High Focus did not act on first sight: {events}"
         );
-        {
-            let guard = lock_state(&state);
-            assert!(!guard.high_focus_pending_key.is_empty());
-        }
-
-        // Going back to the focus list clears the countdown, so the next slip
-        // gets a fresh grace rather than being closed instantly.
-        let on_list = sample("Pages", "Draft", "local");
-        assert!(!enforce_high_focus_block(&dir, &state, &on_list).expect("on list"));
-        {
-            let guard = lock_state(&state);
-            assert!(guard.high_focus_pending_key.is_empty());
-            assert_eq!(guard.high_focus_pending_since, 0);
-        }
-
         let _ = fs::remove_dir_all(dir);
     }
-
     #[test]
     fn jump_guard_fires_only_on_a_spiral_and_not_repeatedly() {
         // Below the threshold: no nudge, however long it has been.
