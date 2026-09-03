@@ -13,6 +13,13 @@ const APP_NAME: &str = "local-focus";
 const SAMPLE_SECONDS: u64 = 5;
 const DISTRACTION_SECONDS: i64 = 90;
 const BLOCK_COOLDOWN_SECONDS: i64 = 10;
+// Jump guard: catching a switching spiral while it is happening, rather than
+// only showing it on a chart afterwards. ADHD self-report is unreliable — the
+// research is clear that people do not notice they are doing this — so the
+// intervention is to name it out loud the moment it starts.
+const JUMP_GUARD_WINDOW_SECONDS: i64 = 5 * 60;
+const JUMP_GUARD_SWITCHES: usize = 12;
+const JUMP_GUARD_COOLDOWN_SECONDS: i64 = 10 * 60;
 const DEVICE_NOTIFY_COOLDOWN_SECONDS: i64 = 60;
 const DEFAULT_ALERT_DELAY_SECONDS: u64 = 60;
 // The "move to app" action has its own, usually longer, timer than the alert.
@@ -58,6 +65,8 @@ struct FocusSession {
     alert_message: String,
     redirect_app: String,
     high_focus_mode: bool,
+    // Nudge when a switching spiral starts. On by default.
+    jump_guard: bool,
     // A locked session cannot be paused or stopped, and its block rules cannot
     // be edited, until its timer runs out. This is the commitment, and it is
     // the only thing that makes a block hold against the person who set it.
@@ -78,6 +87,11 @@ struct AppState {
     last_blocked_key: String,
     last_device_notify_at: i64,
     last_device_notify_key: String,
+    // Live switch detection for the jump guard. The switch report reads the
+    // samples file after the fact; this is the same signal, in the moment.
+    last_sample_key: String,
+    recent_switch_times: Vec<i64>,
+    last_jump_guard_at: i64,
     // Master switch. When true, the whole app is stopped: no tracking, blocking,
     // alerts, device notifications, or journal reminders until it is resumed.
     stopped: bool,
@@ -253,6 +267,9 @@ fn run_app(data_dir: PathBuf) -> io::Result<()> {
         last_device_notify_key: String::new(),
         stopped: false,
         browser_last_seen: HashMap::new(),
+        last_sample_key: String::new(),
+        recent_switch_times: Vec::new(),
+        last_jump_guard_at: 0,
     }));
 
     {
@@ -334,6 +351,9 @@ fn run_tracker(data_dir: PathBuf) -> io::Result<()> {
         last_device_notify_key: String::new(),
         stopped: false,
         browser_last_seen: HashMap::new(),
+        last_sample_key: String::new(),
+        recent_switch_times: Vec::new(),
+        last_jump_guard_at: 0,
     }));
     tracking_loop(data_dir, state)
 }
@@ -367,6 +387,7 @@ fn tracking_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<(
             sample.category = "idle".into();
         }
 
+        run_jump_guard(&data_dir, &state, &sample)?;
         let blocked = enforce_blocked_access(&data_dir, &state, &config, &sample)?;
         notify_devices_for_attention_event(&data_dir, &state, &config, &sample)?;
         append_sample(&data_dir, &sample)?;
@@ -491,6 +512,7 @@ fn start_focus(
         redirect_app: String::new(),
         high_focus_mode: false,
         locked: false,
+        jump_guard: true,
     };
     save_focus(&data_dir, &session)?;
     append_focus_session(&data_dir, &session)?;
@@ -783,6 +805,67 @@ fn guard_blocked_activity(
         enforce_blocked_access(data_dir, state, config, &sample)?;
     }
     Ok(())
+}
+
+/// Whether a switching spiral is underway and worth interrupting: enough
+/// switches inside the rolling window, and long enough since the last nudge
+/// that this is not nagging. Kept pure so the thresholds are testable.
+fn jump_guard_should_fire(switches_in_window: usize, seconds_since_last_nudge: i64) -> bool {
+    switches_in_window >= JUMP_GUARD_SWITCHES
+        && seconds_since_last_nudge >= JUMP_GUARD_COOLDOWN_SECONDS
+}
+
+/// Records a switch if this sample moved to a different app or page, drops
+/// anything that has aged out of the window, and reports how many remain.
+fn track_switch_for_jump_guard(guard: &mut AppState, sample: &ActivitySample) -> usize {
+    let key = format!("{}|{}", sample.app, sample.title);
+    let switched = !guard.last_sample_key.is_empty() && guard.last_sample_key != key;
+    guard.last_sample_key = key;
+    if switched {
+        guard.recent_switch_times.push(sample.timestamp);
+    }
+    let cutoff = sample.timestamp - JUMP_GUARD_WINDOW_SECONDS;
+    guard.recent_switch_times.retain(|at| *at > cutoff);
+    guard.recent_switch_times.len()
+}
+
+/// The intervention. Rize pops a window you cannot dismiss for ten seconds;
+/// this names the pattern instead, because the thing an ADHD brain is missing
+/// here is the noticing, not another wall. Only runs inside a session, so it
+/// cannot nag someone who never asked Local Focus to help.
+fn run_jump_guard(
+    data_dir: &Path,
+    state: &Arc<Mutex<AppState>>,
+    sample: &ActivitySample,
+) -> io::Result<()> {
+    let (switches, focus) = {
+        let mut guard = lock_state(state);
+        let switches = track_switch_for_jump_guard(&mut guard, sample);
+        (switches, guard.focus.clone())
+    };
+
+    let Some(focus) = focus.filter(|focus| focus.paused_at.is_none()) else {
+        return Ok(());
+    };
+    if !focus.jump_guard {
+        return Ok(());
+    }
+
+    let should_fire = {
+        let guard = lock_state(state);
+        jump_guard_should_fire(switches, sample.timestamp - guard.last_jump_guard_at)
+    };
+    if !should_fire {
+        return Ok(());
+    }
+    lock_state(state).last_jump_guard_at = sample.timestamp;
+
+    let minutes = JUMP_GUARD_WINDOW_SECONDS / 60;
+    let message = format!(
+        "You have jumped between apps {switches} times in {minutes} minutes. Pick one thing and stay with it for a few minutes."
+    );
+    notify("Lots of jumping", &message);
+    append_event(data_dir, "jump_guard", &message)
 }
 
 /// Whether a session's commitment lock is still holding. Derived from the
@@ -1815,6 +1898,11 @@ fn handle_http(
                     .map(|settings| settings.alert_message.clone())
                     .unwrap_or_else(|| DEFAULT_ALERT_MESSAGE_TEMPLATE.into())
             });
+        // On unless explicitly switched off.
+        let jump_guard = params
+            .get("jumpGuard")
+            .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+            .unwrap_or(true);
         // Opt-in commitment: once set, this session cannot be paused or
         // stopped, and its block rules cannot be edited, until the timer ends.
         let locked = params
@@ -1844,6 +1932,7 @@ fn handle_http(
             redirect_app,
             high_focus_mode: false,
             locked,
+            jump_guard,
         };
         save_focus(&data_dir, &session)?;
         save_last_focus_settings(&data_dir, &session)?;
@@ -2489,19 +2578,21 @@ fn handle_http(
             &switch_report_json(&data_dir)?,
         )?;
     } else if route == "/api/state" {
-        let (focus, devices, blocks, stopped) = {
+        let (focus, devices, blocks, stopped, recent_jumps) = {
             let guard = lock_state(&state);
+            let cutoff = now() - JUMP_GUARD_WINDOW_SECONDS;
             (
                 guard.focus.clone(),
                 guard.config.network_devices.clone(),
                 guard.config.blocked_keywords.clone(),
                 guard.stopped,
+                guard.recent_switch_times.iter().filter(|at| **at > cutoff).count(),
             )
         };
         write_response(
             &mut stream,
             "application/json",
-            &state_json(&data_dir, focus, &devices, &blocks, stopped),
+            &state_json(&data_dir, focus, &devices, &blocks, stopped, recent_jumps),
         )?;
     } else if route == "/connect" {
         write_response(
@@ -3753,6 +3844,7 @@ fn state_json(
     devices: &[String],
     blocks: &[String],
     stopped: bool,
+    recent_jumps: usize,
 ) -> String {
     let lan_url = local_network_url().unwrap_or_else(|| "http://127.0.0.1:4799".into());
     let device_connect_url = format!("{lan_url}/device");
@@ -3810,7 +3902,7 @@ fn state_json(
             let elapsed = focus_elapsed_seconds(&focus, now());
             let remaining = ((focus.duration_minutes * 60) as i64 - elapsed).max(0);
             format!(
-                "{{\"stopped\":{},\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"paused\":{},\"remainingSeconds\":{},\"locked\":{},\"lockActive\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"journal\":{},\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
+                "{{\"stopped\":{},\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"paused\":{},\"remainingSeconds\":{},\"locked\":{},\"lockActive\":{},\"jumpGuard\":{},\"recentJumps\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"journal\":{},\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
                 stopped,
                 json_escape(&focus.task),
                 json_escape(&focus.target),
@@ -3826,6 +3918,8 @@ fn state_json(
                 remaining,
                 focus.locked,
                 focus_lock_is_active(&focus, now()),
+                focus.jump_guard,
+                recent_jumps,
                 devices_json,
                 blocks_json,
                 journal_json,
@@ -4270,6 +4364,13 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
         <span id="lockSessionHint" class="muted">Blocks hold until the timer ends.</span>
       </div>
       <div class="high-focus-row">
+        <label class="high-focus-check" for="jumpGuard">
+          <input id="jumpGuard" type="checkbox" checked>
+          Tell me when I am jumping a lot
+        </label>
+        <span id="jumpGuardHint" class="muted">A nudge when you switch apps over and over.</span>
+      </div>
+      <div class="high-focus-row">
         <label class="high-focus-check" for="highFocusMode">
           <input id="highFocusMode" type="checkbox" onchange="toggleHighFocusMode()" disabled>
           High focus mode
@@ -4534,8 +4635,10 @@ async function startFocus() {
   const redirectApp = encodeURIComponent(document.querySelector('#redirectApp').value || '');
   const lockInput = document.querySelector('#lockSession');
   const lock = lockInput && lockInput.checked ? '1' : '0';
+  const jumpGuardInput = document.querySelector('#jumpGuard');
+  const jumpGuard = !jumpGuardInput || jumpGuardInput.checked ? '1' : '0';
   if (lock === '1' && !confirm(`Lock this session for ${document.querySelector('#minutes').value || '25'} minutes?\n\nYou will not be able to pause it, stop it, or change your block rules until the timer ends.`)) return;
-  await fetch(`/api/focus/start?task=${task}&target=${target}&minutes=${mins}&alertSeconds=${alertSeconds}&actionSeconds=${actionSeconds}&alertAction=${alertAction}&alertMessage=${alertMessage}&redirectApp=${redirectApp}&lock=${lock}`);
+  await fetch(`/api/focus/start?task=${task}&target=${target}&minutes=${mins}&alertSeconds=${alertSeconds}&actionSeconds=${actionSeconds}&alertAction=${alertAction}&alertMessage=${alertMessage}&redirectApp=${redirectApp}&lock=${lock}&jumpGuard=${jumpGuard}`);
   refresh();
 }
 async function saveFocusEdits() {
@@ -5702,6 +5805,19 @@ function updateFocusButtons(focus, stopped) {
     lockInput.disabled = Boolean(focus) || Boolean(stopped);
     if (focus) lockInput.checked = Boolean(focus.locked);
   }
+  const jumpInput = document.querySelector('#jumpGuard');
+  if (jumpInput) {
+    jumpInput.disabled = Boolean(focus) || Boolean(stopped);
+    if (focus) jumpInput.checked = Boolean(focus.jumpGuard);
+  }
+  const jumpHint = document.querySelector('#jumpGuardHint');
+  if (jumpHint) {
+    const recent = focus ? (focus.recentJumps || 0) : 0;
+    jumpHint.textContent = focus && recent >= 3
+      ? `${recent} jumps in the last 5 minutes.`
+      : 'A nudge when you switch apps over and over.';
+    jumpHint.className = focus && recent >= 12 ? 'switch-count' : 'muted';
+  }
   if (lockHint) {
     lockHint.textContent = lockHolds
       ? 'Locked. Pause, stop, and block edits are unavailable until the timer ends.'
@@ -6147,7 +6263,7 @@ fn save_focus(data_dir: &Path, focus: &FocusSession) -> io::Result<()> {
     fs::write(
         data_dir.join("focus.json"),
         format!(
-            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"locked\":{}}}",
+            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"locked\":{},\"jumpGuard\":{}}}",
             json_escape(&focus.task),
             json_escape(&focus.target),
             focus.started_at,
@@ -6162,7 +6278,8 @@ fn save_focus(data_dir: &Path, focus: &FocusSession) -> io::Result<()> {
             json_escape(&clean_alert_message_template(&focus.alert_message)),
             json_escape(&focus.redirect_app),
             focus.high_focus_mode,
-            focus.locked
+            focus.locked,
+            focus.jump_guard
         ),
     )
 }
@@ -6240,6 +6357,7 @@ fn load_focus(data_dir: &Path) -> Option<FocusSession> {
         redirect_app: json_string(&value, "redirectApp").unwrap_or_default(),
         high_focus_mode: json_bool(&value, "highFocusMode").unwrap_or(false),
         locked: json_bool(&value, "locked").unwrap_or(false),
+        jump_guard: json_bool(&value, "jumpGuard").unwrap_or(true),
     })
 }
 
@@ -7358,6 +7476,7 @@ mod tests {
             redirect_app: String::new(),
             high_focus_mode: true,
             locked: false,
+            jump_guard: true,
         }
     }
 
@@ -7497,6 +7616,55 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn jump_guard_fires_only_on_a_spiral_and_not_repeatedly() {
+        // Below the threshold: no nudge, however long it has been.
+        assert!(!jump_guard_should_fire(JUMP_GUARD_SWITCHES - 1, 60 * 60));
+        // At the threshold, with the cooldown served.
+        assert!(jump_guard_should_fire(
+            JUMP_GUARD_SWITCHES,
+            JUMP_GUARD_COOLDOWN_SECONDS
+        ));
+        // Spiralling, but nudged a moment ago: stay quiet rather than nag.
+        assert!(!jump_guard_should_fire(
+            JUMP_GUARD_SWITCHES * 3,
+            JUMP_GUARD_COOLDOWN_SECONDS - 1
+        ));
+    }
+
+    #[test]
+    fn jump_guard_counts_only_real_switches_inside_the_window() {
+        let mut state = AppState::default();
+        let base = now();
+        let at = |app: &str, timestamp: i64| ActivitySample {
+            timestamp,
+            app: app.into(),
+            title: app.into(),
+            source: "local".into(),
+            category: "distracting".into(),
+        };
+
+        // The first sample establishes a baseline; it is not a switch.
+        assert_eq!(track_switch_for_jump_guard(&mut state, &at("Claude", base)), 0);
+        // Same app again: still not a switch.
+        assert_eq!(
+            track_switch_for_jump_guard(&mut state, &at("Claude", base + 5)),
+            0
+        );
+        // Moving to something else counts.
+        assert_eq!(
+            track_switch_for_jump_guard(&mut state, &at("Chrome", base + 10)),
+            1
+        );
+        assert_eq!(
+            track_switch_for_jump_guard(&mut state, &at("Slack", base + 15)),
+            2
+        );
+        // A switch well outside the window ages the earlier ones out.
+        let later = base + JUMP_GUARD_WINDOW_SECONDS + 60;
+        assert_eq!(track_switch_for_jump_guard(&mut state, &at("Mail", later)), 1);
     }
 
     #[test]
