@@ -30,6 +30,7 @@
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT_DIR/scripts/lib-signing.sh"
 APP_NAME="Local Focus"
 APP_DIR="$ROOT_DIR/target/macos/$APP_NAME.app"
 CONTENTS_DIR="$APP_DIR/Contents"
@@ -39,7 +40,6 @@ INFO_PLIST="$CONTENTS_DIR/Info.plist"
 ENTITLEMENTS="$ROOT_DIR/macos/LocalFocusHardened.entitlements"
 BUNDLE_ID="${LOCAL_FOCUS_BUNDLE_ID:-com.localfocus.app}"
 ICONSET_DIR="$ROOT_DIR/target/macos/AppIcon.iconset"
-NOTARY_PROFILE="${NOTARY_PROFILE:-notary}"
 
 cd "$ROOT_DIR"
 cargo build --release
@@ -62,60 +62,22 @@ iconutil -c icns "$ICONSET_DIR" -o "$RESOURCES_DIR/AppIcon.icns"
 
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$INFO_PLIST"
 
-# Pick the best identity available unless one was named explicitly.
-IDENTITY="${DEVELOPER_ID_IDENTITY:-}"
-IS_DEVELOPER_ID=0
-if [ -n "$IDENTITY" ]; then
-  IS_DEVELOPER_ID=1
-else
-  IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
-    | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
-  if [ -n "$IDENTITY" ]; then
-    IS_DEVELOPER_ID=1
-  else
-    IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
-      | head -1 | sed 's/.*"\(.*\)".*/\1/')
-  fi
-fi
+lf_pick_identity
+lf_sign_app "$APP_DIR" "$ENTITLEMENTS" "$LF_IDENTITY"
 
-# The nested server binary must be signed before the bundle that contains it.
-if [ -n "$IDENTITY" ]; then
-  echo "==> Signing as: $IDENTITY"
-  codesign --force --options runtime --timestamp \
-    --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "$MACOS_DIR/local-focus-bin"
-  codesign --force --options runtime --timestamp \
-    --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "$APP_DIR"
-else
-  echo "==> No signing identity found; ad-hoc signing (this Mac only)."
-  codesign --force --deep --sign - "$APP_DIR"
-fi
-
-codesign --verify --deep --strict --verbose=2 "$APP_DIR"
-
-if [ "$IS_DEVELOPER_ID" -eq 0 ]; then
+if [ "$LF_IS_DEVELOPER_ID" -eq 0 ] || ! lf_notary_available; then
+  lf_explain_missing_notarization
   echo ""
-  echo "NOTE: not signed with a Developer ID Application certificate, so this"
-  echo "build is for THIS Mac only — Gatekeeper will block it elsewhere."
-  echo "See the header of this script for the one-time setup."
+  echo "Built: $APP_DIR"
   exit 0
 fi
 
-if ! xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
-  echo ""
-  echo "NOTE: signed with Developer ID, but no '$NOTARY_PROFILE' notary profile"
-  echo "was found, so the app is not notarized yet. Store credentials once with"
-  echo "'xcrun notarytool store-credentials' (see the header of this script),"
-  echo "then re-run to notarize and staple."
-  exit 0
-fi
-
+# Notarize the app itself by submitting a zip of it; distribution to other
+# people should go through scripts/package-dmg.sh, which notarizes the DMG.
 ZIP_PATH="$ROOT_DIR/target/macos/LocalFocus-notarize.zip"
-echo "==> Notarizing (this waits for Apple, usually a few minutes)"
 rm -f "$ZIP_PATH"
 ditto -c -k --keepParent "$APP_DIR" "$ZIP_PATH"
-xcrun notarytool submit "$ZIP_PATH" --keychain-profile "$NOTARY_PROFILE" --wait
-xcrun stapler staple "$APP_DIR"
-xcrun stapler validate "$APP_DIR"
+lf_notarize_and_staple "$ZIP_PATH" "$APP_DIR"
 rm -f "$ZIP_PATH"
 
 echo ""

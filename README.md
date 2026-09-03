@@ -175,6 +175,54 @@ The dashboard's **Stop** button is a master switch. Stopping ends any focus sess
 
 > Note: the LAN companion endpoints are not yet authenticated, so trust the networks you enable them on. Token-based auth is a planned improvement.
 
+## Sending it to someone else
+
+Build the disk image people download:
+
+```sh
+scripts/package-dmg.sh
+```
+
+This signs and hardens the app, puts it in a drag-to-Applications DMG, signs
+the DMG, and — when Developer ID credentials are present — notarizes and
+staples it. Check what your machine can currently produce before building:
+
+```sh
+scripts/signing-status.sh
+```
+
+### Opening a build that is not notarized
+
+Notarization needs a **Developer ID Application** certificate, which requires a
+paid Apple Developer account. Without one, macOS quarantines the download and
+refuses to open it with "Local Focus is damaged" or "unidentified developer".
+The app is fine; it simply has no ticket Apple recognises. Whoever you send it
+to can open it one of two ways:
+
+- Right-click the app in Finder, choose **Open**, then **Open** again in the
+  dialog. Only needed the first time.
+- Or remove the quarantine flag:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/Local Focus.app"
+```
+
+### Making it open with no warning at all
+
+One-time setup, after which `scripts/package-dmg.sh` notarizes automatically:
+
+1. Enrol at <https://developer.apple.com/programs/> (99 USD/year).
+2. In Xcode: **Settings > Accounts > Manage Certificates > + > Developer ID
+   Application**.
+3. Store notary credentials once:
+
+```sh
+xcrun notarytool store-credentials "notary" --apple-id "you@example.com" --team-id "YOURTEAMID" --password "app-specific-password"
+```
+
+The app-specific password comes from <https://account.apple.com> under
+Sign-In and Security.
+
 ## Build Release Binaries
 
 ```sh
