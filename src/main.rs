@@ -17,6 +17,11 @@ const BLOCK_COOLDOWN_SECONDS: i64 = 10;
 // only showing it on a chart afterwards. ADHD self-report is unreliable — the
 // research is clear that people do not notice they are doing this — so the
 // intervention is to name it out loud the moment it starts.
+// High Focus quits whatever is not on the focus list. Doing that the instant
+// an app comes forward means one stray click can close the thing you were
+// working in, mid-sentence, with no warning — so warn first and only act if
+// the person is still there after this long.
+const HIGH_FOCUS_GRACE_SECONDS: i64 = 12;
 const JUMP_GUARD_WINDOW_SECONDS: i64 = 5 * 60;
 const JUMP_GUARD_SWITCHES: usize = 12;
 const JUMP_GUARD_COOLDOWN_SECONDS: i64 = 10 * 60;
@@ -92,6 +97,9 @@ struct AppState {
     last_sample_key: String,
     recent_switch_times: Vec<i64>,
     last_jump_guard_at: i64,
+    // What High Focus is currently counting down on, and since when.
+    high_focus_pending_key: String,
+    high_focus_pending_since: i64,
     // Master switch. When true, the whole app is stopped: no tracking, blocking,
     // alerts, device notifications, or journal reminders until it is resumed.
     stopped: bool,
@@ -270,6 +278,8 @@ fn run_app(data_dir: PathBuf) -> io::Result<()> {
         last_sample_key: String::new(),
         recent_switch_times: Vec::new(),
         last_jump_guard_at: 0,
+        high_focus_pending_key: String::new(),
+        high_focus_pending_since: 0,
     }));
 
     {
@@ -354,6 +364,8 @@ fn run_tracker(data_dir: PathBuf) -> io::Result<()> {
         last_sample_key: String::new(),
         recent_switch_times: Vec::new(),
         last_jump_guard_at: 0,
+        high_focus_pending_key: String::new(),
+        high_focus_pending_since: 0,
     }));
     tracking_loop(data_dir, state)
 }
@@ -913,6 +925,11 @@ fn enforce_high_focus_block(
         return Ok(false);
     };
     if !high_focus_should_block(&focus, sample) {
+        // Back on the focus list (or paused): forget any countdown, so the
+        // next slip gets its own full grace instead of being closed instantly.
+        let mut guard = lock_state(state);
+        guard.high_focus_pending_key.clear();
+        guard.high_focus_pending_since = 0;
         return Ok(false);
     }
 
@@ -923,6 +940,45 @@ fn enforce_high_focus_block(
         normalize_match_text(&sample.source),
         normalize_match_text(&sample.title)
     );
+
+    // Give the person a moment, and tell them what is about to happen. Landing
+    // somewhere off-list by accident should cost a warning, not the app you had
+    // open. Only once they are still there after the grace does it close.
+    let waiting_out_grace = {
+        let mut guard = lock_state(state);
+        if guard.high_focus_pending_key != block_key {
+            guard.high_focus_pending_key = block_key.clone();
+            guard.high_focus_pending_since = sample.timestamp;
+            true
+        } else {
+            sample.timestamp - guard.high_focus_pending_since < HIGH_FOCUS_GRACE_SECONDS
+        }
+    };
+    if waiting_out_grace {
+        let warned = {
+            let mut guard = lock_state(state);
+            let already = guard.last_blocked_key == block_key
+                && sample.timestamp - guard.last_blocked_at < BLOCK_COOLDOWN_SECONDS;
+            if !already {
+                guard.last_blocked_at = sample.timestamp;
+                guard.last_blocked_key = block_key.clone();
+            }
+            already
+        };
+        if !warned {
+            notify(
+                "Outside your focus list",
+                &format!(
+                    "{} closes in {HIGH_FOCUS_GRACE_SECONDS} seconds unless you go back to {}.",
+                    blocked_activity_label(sample),
+                    focus.target
+                ),
+            );
+        }
+        // Handled: nothing else should act on this sample yet.
+        return Ok(true);
+    }
+
     {
         let mut guard = lock_state(state);
         let within_cooldown = sample.timestamp - guard.last_blocked_at < BLOCK_COOLDOWN_SECONDS;
@@ -1898,6 +1954,13 @@ fn handle_http(
                     .map(|settings| settings.alert_message.clone())
                     .unwrap_or_else(|| DEFAULT_ALERT_MESSAGE_TEMPLATE.into())
             });
+        // Hyper focus is the app's whole point, so it is on unless switched
+        // off. With an empty focus list it blocks nothing, so a session with
+        // no targets is still harmless.
+        let high_focus = params
+            .get("highFocus")
+            .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+            .unwrap_or(true);
         // On unless explicitly switched off.
         let jump_guard = params
             .get("jumpGuard")
@@ -1930,7 +1993,7 @@ fn handle_http(
             alert_action,
             alert_message,
             redirect_app,
-            high_focus_mode: false,
+            high_focus_mode: high_focus,
             locked,
             jump_guard,
         };
@@ -2526,6 +2589,10 @@ fn handle_http(
         )?;
     } else if route == "/api/report" {
         write_response(&mut stream, "application/json", &report_json(&data_dir)?)?;
+    } else if path.starts_with("/api/onboarding/done") {
+        mark_onboarding_done(&data_dir)?;
+        append_event(&data_dir, "onboarding_done", "Finished setup.")?;
+        write_response(&mut stream, "application/json", "{\"ok\":true}")?;
     } else if route == "/api/mac/notifications" {
         // Loopback-only by omission from remote_path_allowed: this is the app's
         // own window process talking to its own server, never the LAN.
@@ -2712,7 +2779,7 @@ fn remote_path_allowed(route: &str) -> bool {
 
 /// State-changing endpoints that must reject cross-site browser requests.
 fn is_mutation_path(route: &str) -> bool {
-    const MUTATION_PREFIXES: [&str; 12] = [
+    const MUTATION_PREFIXES: [&str; 13] = [
         "/api/focus/",
         "/api/app/",
         "/api/block/",
@@ -2725,6 +2792,7 @@ fn is_mutation_path(route: &str) -> bool {
         "/api/journal/reminders/add",
         "/api/journal/reminders/remove",
         "/api/journal/save",
+        "/api/onboarding/done",
     ];
     MUTATION_PREFIXES
         .iter()
@@ -3828,6 +3896,17 @@ fn command_text(program: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// First run is anything before the user has finished onboarding. Kept as its
+/// own marker file rather than inferred from config, so clearing a focus list
+/// never drags someone back through the intro.
+fn onboarding_is_done(data_dir: &Path) -> bool {
+    data_dir.join("onboarded.txt").exists()
+}
+
+fn mark_onboarding_done(data_dir: &Path) -> io::Result<()> {
+    fs::write(data_dir.join("onboarded.txt"), now().to_string())
+}
+
 fn report_window_start(data_dir: &Path) -> io::Result<i64> {
     let path = data_dir.join("report_start.txt");
     if !path.exists() {
@@ -3902,7 +3981,7 @@ fn state_json(
             let elapsed = focus_elapsed_seconds(&focus, now());
             let remaining = ((focus.duration_minutes * 60) as i64 - elapsed).max(0);
             format!(
-                "{{\"stopped\":{},\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"paused\":{},\"remainingSeconds\":{},\"locked\":{},\"lockActive\":{},\"jumpGuard\":{},\"recentJumps\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"journal\":{},\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
+                "{{\"stopped\":{},\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"paused\":{},\"remainingSeconds\":{},\"locked\":{},\"lockActive\":{},\"jumpGuard\":{},\"recentJumps\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"journal\":{},\"onboarded\":{},\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
                 stopped,
                 json_escape(&focus.task),
                 json_escape(&focus.target),
@@ -3923,6 +4002,7 @@ fn state_json(
                 devices_json,
                 blocks_json,
                 journal_json,
+                onboarding_is_done(data_dir),
                 json_escape(&device_connect_url),
                 json_escape(&device_install_url),
                 json_escape(&android_app_url),
@@ -3930,11 +4010,12 @@ fn state_json(
             )
         }
         None => format!(
-            "{{\"stopped\":{},\"focus\":null,\"devices\":[{}],\"blockedRules\":[{}],\"journal\":{},\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
+            "{{\"stopped\":{},\"focus\":null,\"devices\":[{}],\"blockedRules\":[{}],\"journal\":{},\"onboarded\":{},\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
             stopped,
             devices_json,
             blocks_json,
             journal_json,
+            onboarding_is_done(data_dir),
             json_escape(&device_connect_url),
             json_escape(&device_install_url),
             json_escape(&android_app_url),
@@ -3995,6 +4076,7 @@ header.compact .header-sub { display:none; }
 h1 { margin:0; font-size:23px; font-weight:850; letter-spacing:-.02em; background:var(--accent-grad); -webkit-background-clip:text; background-clip:text; color:transparent; transition:font-size .18s ease; }
 main { max-width:1180px; margin:0 auto; padding:24px; display:grid; gap:18px; }
 .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+.view-nav[hidden] { display:none; }
 .view-nav { display:flex; gap:6px; flex-wrap:wrap; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:6px; box-shadow:var(--shadow); }
 .view-tab { border:0; background:transparent; color:var(--muted); font-weight:800; font-size:13px; padding:9px 16px; border-radius:10px; cursor:pointer; }
 .view-tab:hover { color:var(--ink); background:var(--panel-soft); }
@@ -4032,6 +4114,17 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
 .focus-session-list { display:grid; gap:8px; }
 .focus-session-row { border:1px solid var(--line); border-radius:8px; padding:9px; background:var(--panel); }
 .check-field { display:grid; gap:7px; }
+.onboarding { display:grid; place-items:center; padding:40px 0; }
+.onboarding[hidden] { display:none; }
+.onboarding-card { width:min(560px, 100%); background:var(--panel); border:1px solid var(--line); border-radius:22px; padding:28px; display:grid; gap:14px; box-shadow:var(--shadow); }
+.onboarding-card h2 { margin:0; font-size:24px; }
+.onboarding-card p { margin:0; }
+.onboarding-actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:6px; }
+.onboarding-skip { border:0; background:transparent; color:var(--muted); font-weight:700; cursor:pointer; box-shadow:none; }
+.onboarding-skip:hover { color:var(--ink); }
+.help-dot { display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; min-width:18px; padding:0; margin-left:6px; border-radius:999px; border:1px solid var(--line); background:var(--panel); color:var(--muted); font-size:11px; font-weight:800; line-height:1; cursor:help; vertical-align:middle; box-shadow:none; }
+.help-dot:hover, .help-dot[aria-expanded="true"] { border-color:var(--accent); color:var(--accent); background:color-mix(in srgb, var(--accent) 12%, var(--panel)); }
+.help-text { grid-column:1 / -1; margin:6px 0 2px; padding:10px 12px; border-radius:8px; border-left:3px solid var(--accent); background:color-mix(in srgb, var(--accent) 8%, transparent); color:var(--ink); font-size:12px; line-height:1.5; font-weight:500; }
 .switch-headline { font-size:22px; font-weight:800; line-height:1.35; margin:0; }
 .switch-headline .switch-count { color:var(--accent); }
 .switch-chart-wrap { border:1px solid var(--line); border-radius:10px; background:var(--panel-soft); padding:14px; display:grid; gap:8px; }
@@ -4277,7 +4370,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
       <option value="professional">💼 Professional</option>
     </select>
     <div id="focusState" class="status-chip"></div>
-    <button id="explainToggle" onclick="toggleExplain()" aria-expanded="false">Explain</button>
+    <button id="explainToggle" class="help-dot" onclick="toggleExplain()" aria-expanded="false" aria-label="What do these reports mean?">?</button>
   </div>
 </header>
 <main>
@@ -4285,6 +4378,21 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
     <strong>Local Focus is off — tracking, blocking, warnings, and reminders stay off until you turn it back on.</strong>
     <button onclick="resumeApp()" style="background:var(--good); border-color:var(--good); color:#fff; white-space:nowrap;">Turn on Local Focus</button>
   </div>
+  <section id="onboarding" class="onboarding" hidden aria-label="Welcome">
+    <div class="onboarding-card">
+      <h2>What do you want to focus on?</h2>
+      <p class="muted">Add the apps and websites that count as work. While you focus, everything else gets blocked.</p>
+      <div class="target-entry">
+        <input id="onboardingTarget" placeholder="Pages, https://claude.ai/" aria-label="App or website to focus on">
+        <button type="button" onclick="addOnboardingTarget()">Add</button>
+      </div>
+      <div id="onboardingList" class="target-list-editor empty" aria-live="polite"></div>
+      <div class="onboarding-actions">
+        <button type="button" class="focus-btn focus-idle" onclick="finishOnboarding(true)">Start focusing</button>
+        <button type="button" class="onboarding-skip" onclick="finishOnboarding(false)">Set this up later</button>
+      </div>
+    </div>
+  </section>
   <nav class="view-nav" aria-label="Sections">
     <button type="button" class="view-tab is-active" data-view="focus" onclick="showView('focus')">Focus</button>
     <button type="button" class="view-tab" data-view="rules" onclick="showView('rules')">Blocking</button>
@@ -4307,9 +4415,9 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
     <div id="focusDetails" class="focus-details"></div>
     <div id="focusEditor" class="focus-layout">
       <div class="focus-form">
-        <div class="field field-wide"><label for="task">Focus task</label><input id="task" value="Deep work" placeholder="Deep work" aria-label="Focus task"></div>
+        <div class="field field-wide"><label for="task">Focus task <button type="button" class="help-dot" data-help="focusTask" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></label><input id="task" value="Deep work" placeholder="Deep work" aria-label="Focus task"></div>
         <div class="field field-wide target-builder">
-          <label for="targetInput">Focus apps and websites</label>
+          <label for="targetInput">Focus apps and websites <button type="button" class="help-dot" data-help="focusTargets" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></label>
           <div class="target-entry">
             <input id="targetInput" placeholder="Pages, https://claude.ai/" aria-label="Focus app or website">
             <button type="button" onclick="addFocusTarget()">Add</button>
@@ -4317,16 +4425,16 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
           <div id="targetListEditor" class="target-list-editor empty" aria-live="polite"></div>
           <input id="target" type="hidden" aria-label="Focus targets">
         </div>
-        <div class="field"><label for="minutes">Session length (minutes)</label><input id="minutes" type="number" min="1" max="180" value="25" aria-label="Session length in minutes"></div>
-        <div class="field"><label for="alertMinutes">Warn me after (minutes off task)</label><input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Warn me after this many minutes off task" title="Warn me once I have been off task this long, then repeat every interval"></div>
-        <div class="field"><label for="alertAction">If I stay off task</label><select id="alertAction" aria-label="What to do if I stay off task" title="What happens once the off-task timer runs out">
+        <div class="field"><label for="minutes">Session length (minutes) <button type="button" class="help-dot" data-help="sessionLength" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></label><input id="minutes" type="number" min="1" max="180" value="25" aria-label="Session length in minutes"></div>
+        <div class="field"><label for="alertMinutes">Warn me after (minutes off task) <button type="button" class="help-dot" data-help="warnAfter" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></label><input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Warn me after this many minutes off task" title="Warn me once I have been off task this long, then repeat every interval"></div>
+        <div class="field"><label for="alertAction">If I stay off task <button type="button" class="help-dot" data-help="offTaskAction" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></label><select id="alertAction" aria-label="What to do if I stay off task" title="What happens once the off-task timer runs out">
           <option value="alert">Just warn me</option>
           <option value="switch">Switch me to an app</option>
         </select></div>
-        <div class="field"><label for="actionMinutes">Switch me back every (minutes)</label><input id="actionMinutes" type="number" min="1" max="60" value="2" aria-label="Switch me back every this many minutes" title="Switch me back once I have been off task this long, then repeat on its own timer"></div>
-        <div class="field"><label for="redirectApp">App to switch me to</label><input id="redirectApp" placeholder="Pages" aria-label="App to switch me to"></div>
+        <div class="field"><label for="actionMinutes">Switch me back every (minutes) <button type="button" class="help-dot" data-help="switchEvery" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></label><input id="actionMinutes" type="number" min="1" max="60" value="2" aria-label="Switch me back every this many minutes" title="Switch me back once I have been off task this long, then repeat on its own timer"></div>
+        <div class="field"><label for="redirectApp">App to switch me to <button type="button" class="help-dot" data-help="switchApp" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></label><input id="redirectApp" placeholder="Pages" aria-label="App to switch me to"></div>
         <div class="field field-wide alert-message-field">
-          <label for="alertMessage">Warning message</label>
+          <label for="alertMessage">Warning message <button type="button" class="help-dot" data-help="warningMessage" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></label>
           <textarea id="alertMessage" aria-label="Warning message">You have been outside your focus apps/sites for over {delay}. Allowed: '{targets}'. Current activity: {app}</textarea>
           <div class="muted">Use {delay}, {targets}, {app}, {title}, or {url}.</div>
         </div>
@@ -4337,7 +4445,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
     </div>
   </section>
   <aside class="focus-side">
-    <h3>Current focus session</h3>
+    <h3>Current focus session <button type="button" class="help-dot" data-help="sessionTimer" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></h3>
     <div id="focusTimer" class="focus-timer is-idle">
       <svg class="timer-ring" viewBox="0 0 120 120" aria-hidden="true">
         <circle class="timer-ring-track" cx="60" cy="60" r="54"></circle>
@@ -4359,14 +4467,14 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
       <div class="high-focus-row">
         <label class="high-focus-check" for="lockSession">
           <input id="lockSession" type="checkbox">
-          Lock this session
+          Lock this session <button type="button" class="help-dot" data-help="lockSession" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button>
         </label>
         <span id="lockSessionHint" class="muted">Blocks hold until the timer ends.</span>
       </div>
       <div class="high-focus-row">
         <label class="high-focus-check" for="jumpGuard">
           <input id="jumpGuard" type="checkbox" checked>
-          Tell me when I am jumping a lot
+          Tell me when I am jumping a lot <button type="button" class="help-dot" data-help="jumpGuard" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button>
         </label>
         <span id="jumpGuardHint" class="muted">A nudge when you switch apps over and over.</span>
       </div>
@@ -4375,9 +4483,8 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
           <input id="highFocusMode" type="checkbox" onchange="toggleHighFocusMode()" disabled>
           High focus mode
         </label>
-        <button id="highFocusExplainToggle" type="button" onclick="toggleHighFocusExplanation()" aria-expanded="false">Explain</button>
+        <button type="button" class="help-dot" data-help="highFocus" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button>
       </div>
-      <div id="highFocusExplanation" class="high-focus-explain">When High Focus is checked, Local Focus fully blocks active apps or websites outside the current focus list. Your Local Focus dashboard stays allowed so you can turn this off.</div>
     </div>
     <div class="focus-actions">
       <button id="startFocus" class="focus-btn focus-idle" onclick="startFocus()">Start focus</button>
@@ -4389,7 +4496,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
   <div class="view" id="view-rules" role="tabpanel" aria-label="Blocking">
   <section id="distractionCard" class="control-shell distraction-card" aria-label="Distraction rules">
     <div>
-      <h2>Blocked apps and websites</h2>
+      <h2>Blocked apps and websites <button type="button" class="help-dot" data-help="blockTable" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></h2>
       <div class="muted">These apply while a focus session is running — start focus and websites close their active tab, apps are quit. A password block asks for the password instead, so you have to stop and decide.</div>
     </div>
     <div class="block-table-wrap">
@@ -4397,8 +4504,8 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
         <thead>
           <tr>
             <th scope="col">Site or app</th>
-            <th scope="col" class="block-col-check">Full block</th>
-            <th scope="col" class="block-col-check">Password block</th>
+            <th scope="col" class="block-col-check">Full block <button type="button" class="help-dot" data-help="fullBlock" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></th>
+            <th scope="col" class="block-col-check">Password block <button type="button" class="help-dot" data-help="passwordBlock" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></th>
             <th scope="col" class="block-col-password">Password</th>
             <th scope="col"><span class="visually-hidden">Remove</span></th>
           </tr>
@@ -4415,7 +4522,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
   <section id="journalCard" class="control-shell journal-card" aria-label="Daily journal">
     <div class="journal-head">
       <div>
-        <h2>Daily journal</h2>
+        <h2>Daily journal <button type="button" class="help-dot" data-help="journal" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></h2>
         <div class="muted">Optional private notes for each day. Entries stay on this device.</div>
       </div>
       <label class="journal-toggle" for="journalEnabled">
@@ -4425,7 +4532,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
     </div>
     <div class="journal-settings">
       <div class="field">
-        <label for="journalReminderMode">Reminder</label>
+        <label for="journalReminderMode">Reminder <button type="button" class="help-dot" data-help="journalReminder" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></label>
         <select id="journalReminderMode" onchange="saveJournalSettings()">
           <option value="evening">Evening, 8-10 PM</option>
           <option value="next_morning">Next morning, about yesterday</option>
@@ -4435,7 +4542,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
     </div>
     <div class="journal-editor">
       <div class="journal-row">
-        <div class="field"><label for="journalDate">Journal date</label><input id="journalDate" type="date" onchange="loadJournalEntry()"></div>
+        <div class="field"><label for="journalDate">Journal date <button type="button" class="help-dot" data-help="journal" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></label><input id="journalDate" type="date" onchange="loadJournalEntry()"></div>
         <button type="button" onclick="openJournalDate(todayYmd())">Today</button>
         <div id="journalStatus" class="muted">Ready.</div>
       </div>
@@ -4449,7 +4556,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
           <div class="muted">Add a task and a 24-hour time. Local Focus will alert you at that time.</div>
         </div>
         <div class="journal-task-form">
-          <div class="field"><label for="journalReminderTask">Task</label><input id="journalReminderTask" placeholder="Reflect on writing progress" aria-label="Reminder task"></div>
+          <div class="field"><label for="journalReminderTask">Task <button type="button" class="help-dot" data-help="journalTasks" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></label><input id="journalReminderTask" placeholder="Reflect on writing progress" aria-label="Reminder task"></div>
           <div class="field"><label for="journalReminderTime">Time (24 hr)</label><input id="journalReminderTime" inputmode="numeric" pattern="[0-2][0-9]:[0-5][0-9]" placeholder="18:30" aria-label="Reminder time in 24 hour HH:MM format"></div>
           <button type="button" onclick="addJournalTaskReminder()">Add reminder</button>
         </div>
@@ -4462,7 +4569,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
   <div class="view" id="view-reports" role="tabpanel" aria-label="Reports">
   <section id="reportsCard" class="control-shell" aria-label="Reports">
     <div>
-      <h2>Reports</h2>
+      <h2>Reports <button type="button" class="help-dot" data-help="reports" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></h2>
       <div class="muted">Click a year, month, week, or date to generate that report.</div>
     </div>
     <div class="report-calendar">
@@ -4486,7 +4593,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
   </section>
   <section id="switchReportCard" class="control-shell" aria-label="How often you jumped">
     <div>
-      <h2>How often you jumped</h2>
+      <h2>How often you jumped <button type="button" class="help-dot" data-help="jumpsReport" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></h2>
       <div class="muted">Every time you swapped to a different app or page. Lots of small jumps break focus even on a day when your total distracted time looks fine.</div>
     </div>
     <p id="switchHeadline" class="switch-headline">No jumps yet today.</p>
@@ -4529,7 +4636,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
   <div class="view" id="view-devices" role="tabpanel" aria-label="Devices">
   <section id="devicesCard" class="control-shell" aria-label="Connect to device">
     <div>
-      <h2>Connect to device</h2>
+      <h2>Connect to device <button type="button" class="help-dot" data-help="devices" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></h2>
       <div class="muted">Open the Local Focus companion app on your phone, tablet, or another computer, then enter the connection code below. Local Focus does not scan the network for devices.</div>
     </div>
     <div class="connect-code-panel">
@@ -4570,6 +4677,109 @@ function setTheme(value) {
   try { saved = localStorage.getItem('lfTheme') || 'vibrant'; } catch (e) {}
   setTheme(saved);
 })();
+// First run asks one question and nothing else: what counts as work. The
+// answer becomes the focus list, hyper focus is on, and the session starts —
+// so someone can be focusing within a few seconds of opening the app.
+let onboardingTargets = [];
+function renderOnboardingTargets() {
+  const list = document.querySelector('#onboardingList');
+  if (!list) return;
+  list.className = onboardingTargets.length ? 'target-list-editor' : 'target-list-editor empty';
+  setHtml(list, onboardingTargets.map((target, index) => `<button type="button" class="target-chip-editor" onclick="removeOnboardingTarget(${index})" aria-label="Remove ${escapeTextAttr(target)}">${escapeHtml(shortenSource(target))} <span aria-hidden="true">x</span></button>`).join(''));
+}
+function addOnboardingTarget() {
+  const input = document.querySelector('#onboardingTarget');
+  const value = (input.value || '').trim();
+  if (!value) { input.focus(); return; }
+  if (!onboardingTargets.includes(value)) onboardingTargets.push(value);
+  input.value = '';
+  input.focus();
+  renderOnboardingTargets();
+}
+function removeOnboardingTarget(index) {
+  onboardingTargets.splice(index, 1);
+  renderOnboardingTargets();
+}
+async function finishOnboarding(startNow) {
+  const input = document.querySelector('#onboardingTarget');
+  // Don't lose something typed but not yet added.
+  if (input && input.value.trim()) addOnboardingTarget();
+  await fetch('/api/onboarding/done');
+  if (startNow && onboardingTargets.length) {
+    setFocusTargets(onboardingTargets.join(', '));
+    const params = new URLSearchParams();
+    params.set('task', 'Focus');
+    params.set('target', onboardingTargets.join(', '));
+    params.set('minutes', '25');
+    await fetch(`/api/focus/start?${params.toString()}`);
+  }
+  const panel = document.querySelector('#onboarding');
+  if (panel) panel.hidden = true;
+  document.querySelector('.view-nav').hidden = false;
+  showView('focus');
+  refresh();
+}
+function updateOnboarding(state) {
+  const panel = document.querySelector('#onboarding');
+  if (!panel) return;
+  const show = state.onboarded === false;
+  panel.hidden = !show;
+  // Hide the rest of the app behind the one question.
+  const nav = document.querySelector('.view-nav');
+  if (nav) nav.hidden = show;
+  for (const view of DASHBOARD_VIEWS) {
+    const el = document.querySelector(`#view-${view}`);
+    if (el && show) el.hidden = true;
+  }
+  if (show) {
+    const input = document.querySelector('#onboardingTarget');
+    if (input && document.activeElement !== input) input.focus();
+  }
+}
+// Every feature carries a "?" that explains it in place. One map of plain
+// explanations and one toggle, rather than a bespoke Explain button per
+// feature — adding help to something new is then just a data-help attribute.
+const HELP = {
+  focusTask: 'A name for what you are working on. It only labels the session and shows up in your reports, so call it whatever makes sense to you.',
+  focusTargets: 'The apps and websites that count as work for this session. Anything you add here is allowed; everything else counts as a distraction. You can add up to 15.',
+  sessionLength: 'How long this focus session runs. When the time is up Local Focus tells you, but it keeps tracking until you stop it. Shorter is often better to start with — 10 to 15 minutes is a normal place to begin.',
+  warnAfter: 'How long you can be off task before Local Focus says something. It then repeats at the same interval while you stay off task.',
+  offTaskAction: 'What happens if you stay off task. "Just warn me" shows a message. "Switch me to an app" also brings a chosen app back to the front, which is useful when a warning alone is easy to ignore.',
+  switchEvery: 'How often to switch you back, once switching is turned on. It runs on its own timer, separate from the warning.',
+  switchApp: 'The app to bring back to the front when Local Focus switches you back.',
+  warningMessage: 'The wording of the warning. {delay} is how long you have been off task, {targets} your focus list, {app} the current app, {title} the window title and {url} the page.',
+  lockSession: 'Commit to the session. While it is locked you cannot pause it, stop it, or change your block rules — the whole point being that the person who set the block cannot undo it five minutes later. It unlocks itself when the timer ends.',
+  jumpGuard: 'Watches for jumping between apps over and over. If you switch twelve times in five minutes it tells you once, then stays quiet for ten minutes. Most people do not notice they are doing this, which is the reason it exists.',
+  highFocus: 'Blocks everything outside your focus list, not just the sites on your block list. The Local Focus window stays available so you can always turn it off.',
+  sessionTimer: 'Time left in this session. The ring empties as it counts down. It turns amber when paused and green when the time is up.',
+  blockTable: 'Apps and websites to block while a session runs. Websites have their active tab closed; apps are quit. Nothing here is blocked when no session is running.',
+  fullBlock: 'Closes the tab or quits the app as soon as it appears, every time.',
+  passwordBlock: 'Asks for a password instead of closing it outright, so you have to stop and decide rather than being stopped or waved through.',
+  journal: 'Private notes for each day, kept on this device. Writing down what pulled your focus is the simplest way to notice patterns the reports cannot see.',
+  journalReminder: 'When to nudge you to write the day up — during the evening, or the next morning about the day before.',
+  journalTasks: 'A task and a 24-hour time. Local Focus tells you at that time.',
+  reports: 'Pick a year, month, week or day to see what happened in that period.',
+  jumpsReport: 'How often your attention moved, which is a different thing from how long you were distracted. A day can have little distracted time and still be full of jumping, and the jumping is what breaks focus.',
+  devices: 'Type the connection code into the companion app on your phone to pair it. Nothing goes through the internet — both devices just talk over your own Wi-Fi.'
+};
+function toggleHelp(button) {
+  const key = button.dataset.help;
+  const text = HELP[key];
+  if (!text) return;
+  const anchor = button.closest('.field, .high-focus-row, .journal-row, .block-table-wrap, .switch-chart-wrap, .focus-timer, .quick-metrics') || button.parentElement;
+  const open = anchor.parentElement.querySelector(`.help-text[data-help-for="${key}"]`);
+  if (open) {
+    open.remove();
+    button.setAttribute('aria-expanded', 'false');
+    return;
+  }
+  const panel = document.createElement('div');
+  panel.className = 'help-text';
+  panel.dataset.helpFor = key;
+  panel.textContent = text;
+  anchor.insertAdjacentElement('afterend', panel);
+  button.setAttribute('aria-expanded', 'true');
+}
 // One screen, one job: the dashboard used to stack focus setup, blocking,
 // journal, reports, and pairing on a single scroll, so "am I focused right
 // now?" competed with everything else. Each group is its own view now, and
@@ -4665,13 +4875,6 @@ async function toggleHighFocusMode() {
   checkbox.disabled = true;
   await fetch(`/api/focus/high-focus?enabled=${checkbox.checked ? '1' : '0'}`);
   refresh();
-}
-function toggleHighFocusExplanation() {
-  const panel = document.querySelector('#highFocusExplanation');
-  const button = document.querySelector('#highFocusExplainToggle');
-  const open = panel.classList.toggle('open');
-  button.setAttribute('aria-expanded', String(open));
-  button.textContent = open ? 'Hide explanation' : 'Explain';
 }
 function todayYmd(date = new Date()) {
   const year = date.getFullYear();
@@ -5615,6 +5818,7 @@ async function refresh() {
       <div class="muted">${(r.topApps || []).slice(0, 2).map(app => escapeHtml(`${app.app}${app.source ? ' - ' + app.source : ''}`)).join(', ')}</div>
     </div>`;
   }).join('') || '<div class="muted">No previous reports yet.</div>');
+  updateOnboarding(state);
   updateFocusButtons(state.focus, state.stopped);
   updateFocusTimer(state.focus, state.stopped);
   seedFocusInputsFromActiveSession(state.focus);
@@ -7614,6 +7818,44 @@ mod tests {
             !events.contains("blocked_access"),
             "block fired with no focus session: {events}"
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn high_focus_warns_before_it_closes_anything() {
+        let dir = temp_test_dir("high-focus-grace");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let mut session = focus("Pages");
+        session.high_focus_mode = true;
+        let state = Arc::new(Mutex::new(AppState {
+            focus: Some(session),
+            ..Default::default()
+        }));
+        let off_list = sample("Claude", "Claude", "local");
+
+        // First sighting: handled, but only as a warning — the countdown starts
+        // and nothing is closed.
+        assert!(enforce_high_focus_block(&dir, &state, &off_list).expect("first"));
+        let events = fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
+        assert!(
+            !events.contains("high_focus_blocked_access"),
+            "closed on first sight instead of warning: {events}"
+        );
+        {
+            let guard = lock_state(&state);
+            assert!(!guard.high_focus_pending_key.is_empty());
+        }
+
+        // Going back to the focus list clears the countdown, so the next slip
+        // gets a fresh grace rather than being closed instantly.
+        let on_list = sample("Pages", "Draft", "local");
+        assert!(!enforce_high_focus_block(&dir, &state, &on_list).expect("on list"));
+        {
+            let guard = lock_state(&state);
+            assert!(guard.high_focus_pending_key.is_empty());
+            assert_eq!(guard.high_focus_pending_since, 0);
+        }
 
         let _ = fs::remove_dir_all(dir);
     }
