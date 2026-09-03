@@ -3764,12 +3764,24 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
 .focus-task-window.disabled { opacity:.55; }
 .focus-session-list { display:grid; gap:8px; }
 .focus-session-row { border:1px solid var(--line); border-radius:8px; padding:9px; background:var(--panel); }
-.block-fields { border:1px solid var(--line); border-radius:10px; padding:12px; background:var(--panel-soft); display:grid; grid-template-columns:minmax(0, 1fr); gap:12px; align-items:start; }
-.block-fields button { min-height:42px; min-width:140px; white-space:nowrap; }
 .check-field { display:grid; gap:7px; }
-.block-type-options { display:grid; grid-template-columns:repeat(2, minmax(140px, 1fr)); gap:8px; max-width:520px; }
-.block-password-field { max-width:520px; }
-.block-submit { justify-self:start; align-self:start; }
+.block-table-wrap { border:1px solid var(--line); border-radius:10px; background:var(--panel-soft); overflow-x:auto; }
+.block-table { width:100%; border-collapse:collapse; font-size:13px; }
+.block-table th { text-align:left; font-size:11px; font-weight:800; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; padding:10px 12px; border-bottom:1px solid var(--line); white-space:nowrap; }
+.block-table td { padding:8px 12px; border-bottom:1px solid color-mix(in srgb, var(--line) 60%, transparent); vertical-align:middle; }
+.block-table tr:last-child td { border-bottom:0; }
+.block-table input[type="text"], .block-table input[type="password"] { width:100%; min-width:150px; }
+.block-col-check { width:110px; text-align:center; }
+.block-table td.block-col-check { text-align:center; }
+.block-table input[type="checkbox"] { width:18px; height:18px; accent-color:var(--accent); cursor:pointer; }
+/* The password column only earns its space once a rule actually uses one. */
+.block-col-password { display:none; }
+.block-table.show-password .block-col-password { display:table-cell; }
+.block-remove { border:0; background:transparent; color:var(--muted); font-weight:800; cursor:pointer; padding:6px 10px; border-radius:8px; }
+.block-remove:hover { color:var(--bad); background:color-mix(in srgb, var(--bad) 12%, transparent); }
+.block-row-pending td { background:color-mix(in srgb, var(--warn) 10%, transparent); }
+.block-empty td { color:var(--muted); text-align:center; padding:18px 12px; }
+.visually-hidden { position:absolute; width:1px; height:1px; margin:-1px; padding:0; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
 .inline-check { min-height:42px; border:1px solid var(--line); border-radius:8px; padding:8px 10px; display:flex; align-items:center; gap:9px; background:var(--panel); font-weight:800; cursor:pointer; }
 .inline-check.selected, .inline-check:has(input:checked) { border-color:color-mix(in srgb, var(--accent) 55%, var(--line)); background:color-mix(in srgb, var(--accent) 10%, var(--panel)); color:var(--ink); }
 .inline-check input { width:18px; height:18px; accent-color:var(--accent); }
@@ -3789,12 +3801,6 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
 .connect-advanced > *:not(summary) { margin-top:10px; }
 .connect-downloads { display:grid; gap:6px; }
 .connect-downloads a { color:var(--accent); font-weight:800; overflow-wrap:anywhere; }
-.blocked-list { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
-.blocked-chip { display:inline-flex; align-items:center; gap:8px; border:1px solid color-mix(in srgb, var(--bad) 38%, var(--line)); border-radius:999px; padding:6px 10px; background:color-mix(in srgb, var(--bad) 7%, transparent); color:var(--ink); font-weight:700; max-width:100%; overflow-wrap:anywhere; }
-.blocked-chip.editing { border-color:color-mix(in srgb, var(--accent) 65%, var(--line)); background:color-mix(in srgb, var(--accent) 12%, transparent); }
-.blocked-chip small { color:var(--muted); font-weight:800; }
-.blocked-chip button { width:auto; min-width:0; border:0; background:transparent; color:var(--bad); padding:0 2px; font-weight:900; box-shadow:none; }
-.blocked-chip .edit-chip { color:var(--accent); }
 .focus-layout { display:grid; gap:16px; align-items:start; }
 .focus-layout.editor-collapsed { grid-template-columns:minmax(0, 520px); }
 .focus-layout.editor-collapsed .focus-form { display:none; }
@@ -4078,25 +4084,25 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
   <div class="view" id="view-rules" role="tabpanel" aria-label="Blocking">
   <section id="distractionCard" class="control-shell distraction-card" aria-label="Distraction rules">
     <div>
-      <h2>Add distraction rule</h2>
-      <div class="muted">Block matching apps or sites. Websites close their active tab; apps are quit.</div>
+      <h2>Blocked apps and websites</h2>
+      <div class="muted">Websites close their active tab; apps are quit. A password block asks for the password instead, so you have to stop and decide.</div>
     </div>
-    <div>
-      <strong>Blocked apps and websites</strong>
-      <div id="blockedList" class="blocked-list"></div>
+    <div class="block-table-wrap">
+      <table id="blockTable" class="block-table">
+        <thead>
+          <tr>
+            <th scope="col">Site or app</th>
+            <th scope="col" class="block-col-check">Full block</th>
+            <th scope="col" class="block-col-check">Password block</th>
+            <th scope="col" class="block-col-password">Password</th>
+            <th scope="col"><span class="visually-hidden">Remove</span></th>
+          </tr>
+        </thead>
+        <tbody id="blockRows"></tbody>
+      </table>
     </div>
-    <div class="block-fields">
-      <div class="field"><label for="blockKeyword">Block keyword, app, or site</label><input id="blockKeyword" placeholder="youtube, reddit, games" aria-label="Block keyword" oninput="syncBlockEditState()"></div>
-      <div class="field check-field">
-        <label>Block type</label>
-        <div class="block-type-options" role="group" aria-label="Block type">
-          <label id="fullBlockOption" class="inline-check selected" for="fullBlock"><input id="fullBlock" type="checkbox" checked onchange="setBlockMode('full')" aria-label="Use full block"> Full block</label>
-          <label id="passwordBlockOption" class="inline-check" for="passwordBlock"><input id="passwordBlock" type="checkbox" onchange="setBlockMode('password')" aria-label="Use password block"> Password block</label>
-        </div>
-        <div id="blockModeHint" class="muted">Full block is active.</div>
-      </div>
-      <div id="blockPasswordField" class="field block-password-field password-hidden"><label for="blockPassword">Password</label><input id="blockPassword" type="password" placeholder="Enter password to continue when blocked" aria-label="Block password"></div>
-      <button id="blockSubmit" class="block-submit" onclick="addBlock()">Add block</button>
+    <div class="focus-actions">
+      <button type="button" onclick="addBlockRow()">Add row</button>
     </div>
   </section>
   </div>
@@ -4296,7 +4302,6 @@ let activeReportYear = selectedReportDate.getFullYear();
 let activeReportMonth = selectedReportDate.getMonth();
 let activeReportWeek = 0;
 let blockedRules = [];
-let editingBlockTarget = '';
 let activeFocusSession = null;
 let journalEntryDirty = false;
 let activeJournalDate = '';
@@ -4500,110 +4505,149 @@ function renderJournalTaskReminders() {
     if (status) status.textContent = 'No reminder added yet.';
   }
 }
-async function addBlock() {
-  const input = document.querySelector('#blockKeyword');
-  const fullModeInput = document.querySelector('#fullBlock');
-  const passwordModeInput = document.querySelector('#passwordBlock');
-  const passwordInput = document.querySelector('#blockPassword');
-  const keyword = encodeURIComponent(input.value || '');
-  const passwordMode = Boolean(passwordModeInput && passwordModeInput.checked);
-  const mode = encodeURIComponent(passwordMode ? 'password' : 'full');
-  const password = encodeURIComponent(passwordInput.value || '');
-  const original = encodeURIComponent(editingBlockTarget || '');
-  if (!keyword) return;
-  if (passwordMode && !passwordInput.value) {
-    passwordInput.focus();
-    return;
-  }
-  await fetch(`/api/block/add?keyword=${keyword}&mode=${mode}&password=${password}&original=${original}`);
-  editingBlockTarget = '';
-  input.value = '';
-  passwordInput.value = '';
-  if (fullModeInput) fullModeInput.checked = true;
-  if (passwordModeInput) passwordModeInput.checked = false;
-  syncBlockMode();
-  syncBlockEditState();
-  refresh();
-}
-function selectBlockRule(target) {
-  const rule = blockedRules.find(item => item.target === target);
-  if (!rule) return;
-  editingBlockTarget = rule.target || '';
-  const input = document.querySelector('#blockKeyword');
-  const passwordInput = document.querySelector('#blockPassword');
-  input.value = rule.target || '';
-  passwordInput.value = '';
-  passwordInput.placeholder = rule.mode === 'password' && rule.hasPassword ? 'Enter password to update this block' : 'Enter password to continue when blocked';
-  setBlockMode(rule.mode === 'password' ? 'password' : 'full');
-  syncBlockEditState();
-  input.focus();
-}
-function editBlockFromButton(button) {
-  selectBlockRule(button.dataset.target || '');
-}
 function normalizedBlockValue(value) {
   return String(value || '').trim().toLowerCase();
 }
-function syncBlockEditState() {
-  const input = document.querySelector('#blockKeyword');
-  const button = document.querySelector('#blockSubmit');
-  if (!input || !button) return;
-  const current = normalizedBlockValue(input.value);
-  const selectedExists = editingBlockTarget && blockedRules.some(rule => rule.target === editingBlockTarget);
-  const typedRule = blockedRules.find(rule => rule.target === current);
-  if (!selectedExists && typedRule) editingBlockTarget = typedRule.target;
-  if (selectedExists && current !== editingBlockTarget) editingBlockTarget = '';
-  button.textContent = editingBlockTarget ? 'Edit block' : 'Add block';
-  document.querySelectorAll('.blocked-chip').forEach(chip => {
-    chip.classList.toggle('editing', chip.dataset.target === editingBlockTarget);
-  });
+// One blank row at a time, held client-side until it has enough to save.
+let draftBlockRow = null;
+function addBlockRow() {
+  if (draftBlockRow) {
+    const existing = document.querySelector('#blockRows .block-row-draft .block-target');
+    if (existing) existing.focus();
+    return;
+  }
+  draftBlockRow = { target: '', mode: 'full', password: '' };
+  renderBlockTable(true);
+  const input = document.querySelector('#blockRows .block-row-draft .block-target');
+  if (input) input.focus();
 }
-function setBlockMode(mode) {
-  const fullModeInput = document.querySelector('#fullBlock');
-  const passwordModeInput = document.querySelector('#passwordBlock');
-  if (mode === 'password') {
-    if (fullModeInput) fullModeInput.checked = false;
-    if (passwordModeInput) passwordModeInput.checked = true;
+function discardBlockDraft() {
+  draftBlockRow = null;
+  renderBlockTable(true);
+}
+/// A password rule with no password yet cannot be saved, so the row stays
+/// pending (highlighted, password focused) instead of being written half-formed.
+function blockRowIsSavable(row) {
+  if (!normalizedBlockValue(row.target)) return false;
+  if (row.mode === 'password') return Boolean(row.password) || row.hasPassword;
+  return true;
+}
+async function saveBlockRow(row, original) {
+  const params = new URLSearchParams();
+  params.set('keyword', row.target);
+  params.set('mode', row.mode);
+  params.set('password', row.password || '');
+  params.set('original', original || '');
+  await fetch(`/api/block/add?${params.toString()}`);
+  draftBlockRow = null;
+  await refresh();
+  // refresh() leaves the table alone while it has focus, which is right for the
+  // background poll but would strand the row we just saved (and its now-stale
+  // draft). This edit is ours, so redraw it.
+  renderBlockTable(true);
+}
+/// Reads a row's controls, saves when it is complete, and otherwise leaves it
+/// pending. `original` is the target as the server knows it, so renaming a rule
+/// replaces it rather than creating a second one.
+async function commitBlockRow(element) {
+  const tr = element.closest('tr');
+  if (!tr) return;
+  const original = tr.dataset.target || '';
+  const row = {
+    target: (tr.querySelector('.block-target') || {}).value || '',
+    mode: tr.querySelector('.block-mode-password') && tr.querySelector('.block-mode-password').checked ? 'password' : 'full',
+    password: (tr.querySelector('.block-password') || {}).value || '',
+    hasPassword: tr.dataset.hasPassword === 'true' && tr.dataset.mode === 'password'
+  };
+  if (draftBlockRow && tr.classList.contains('block-row-draft')) {
+    draftBlockRow = row;
+  }
+  if (!blockRowIsSavable(row)) {
+    tr.classList.add('block-row-pending');
+    if (normalizedBlockValue(row.target) && row.mode === 'password') {
+      const password = tr.querySelector('.block-password');
+      if (password) password.focus();
+    }
+    return;
+  }
+  tr.classList.remove('block-row-pending');
+  await saveBlockRow(row, original);
+}
+/// Checkboxes act as one choice: turning either on turns the other off.
+function setBlockRowMode(element, mode) {
+  const tr = element.closest('tr');
+  if (!tr) return;
+  const full = tr.querySelector('.block-mode-full');
+  const password = tr.querySelector('.block-mode-password');
+  if (full) full.checked = mode === 'full';
+  if (password) password.checked = mode === 'password';
+  syncBlockPasswordColumn();
+  syncBlockRowPasswordCell(tr);
+  commitBlockRow(element);
+}
+/// Only rows that use a password get a password box; the rest show a dash, so
+/// an empty field never implies a rule has a password it does not. Swapped in
+/// place rather than by re-rendering, which would revert the checkbox to
+/// whatever the server still thinks the mode is.
+function syncBlockRowPasswordCell(tr) {
+  const cell = tr.querySelector('.block-col-password');
+  if (!cell) return;
+  const wantsPassword = Boolean(tr.querySelector('.block-mode-password') && tr.querySelector('.block-mode-password').checked);
+  const existing = cell.querySelector('.block-password');
+  if (wantsPassword && !existing) {
+    const label = tr.querySelector('.block-target');
+    const placeholder = tr.dataset.hasPassword === 'true' ? 'Saved. Type to replace' : 'Password to continue';
+    cell.innerHTML = `<input class="block-password" type="password" value="" placeholder="${escapeTextAttr(placeholder)}" aria-label="Password for ${escapeTextAttr((label && label.value) || 'new rule')}" onchange="commitBlockRow(this)">`;
+    const input = cell.querySelector('.block-password');
+    if (input) input.focus();
+  } else if (!wantsPassword && existing) {
+    cell.innerHTML = '<span class="muted">&mdash;</span>';
+  }
+}
+/// The password column appears as soon as any row uses one.
+function syncBlockPasswordColumn() {
+  const table = document.querySelector('#blockTable');
+  if (!table) return;
+  const anyPassword = [...table.querySelectorAll('.block-mode-password')].some(input => input.checked);
+  table.classList.toggle('show-password', anyPassword);
+}
+function blockRowMarkup(rule, isDraft) {
+  const target = rule.target || '';
+  const password = rule.mode === 'password';
+  const placeholder = password && rule.hasPassword
+    ? 'Saved. Type to replace'
+    : 'Password to continue';
+  return `<tr data-target="${escapeTextAttr(isDraft ? '' : target)}" data-mode="${escapeTextAttr(rule.mode || 'full')}" data-has-password="${rule.hasPassword ? 'true' : 'false'}" class="${isDraft ? 'block-row-draft' : ''}">
+    <td><input class="block-target" type="text" value="${escapeTextAttr(target)}" placeholder="youtube.com, Messages" aria-label="Blocked site or app" onchange="commitBlockRow(this)"></td>
+    <td class="block-col-check"><input class="block-mode-full" type="checkbox" ${password ? '' : 'checked'} aria-label="Full block for ${escapeTextAttr(target || 'new rule')}" onchange="setBlockRowMode(this, 'full')"></td>
+    <td class="block-col-check"><input class="block-mode-password" type="checkbox" ${password ? 'checked' : ''} aria-label="Password block for ${escapeTextAttr(target || 'new rule')}" onchange="setBlockRowMode(this, 'password')"></td>
+    <td class="block-col-password">${password ? `<input class="block-password" type="password" value="" placeholder="${escapeTextAttr(placeholder)}" aria-label="Password for ${escapeTextAttr(target || 'new rule')}" onchange="commitBlockRow(this)">` : '<span class="muted">&mdash;</span>'}</td>
+    <td><button type="button" class="block-remove" aria-label="Remove ${escapeTextAttr(target || 'new rule')}" onclick="${isDraft ? 'discardBlockDraft()' : `removeBlock('${escapeTextAttr(target)}')`}">Remove</button></td>
+  </tr>`;
+}
+/// Rebuilds the table from `blockedRules` plus any draft row. Skipped while the
+/// user is typing inside it, so the 10s poll cannot pull the row out from under
+/// them; `force` is for edits we made ourselves.
+function renderBlockTable(force) {
+  const body = document.querySelector('#blockRows');
+  if (!body) return;
+  const table = document.querySelector('#blockTable');
+  if (!force && table && table.contains(document.activeElement)) return;
+  const rows = blockedRules.map(rule => blockRowMarkup(rule, false));
+  if (draftBlockRow) rows.push(blockRowMarkup(draftBlockRow, true));
+  const markup = rows.join('') || '<tr class="block-empty"><td colspan="5">Nothing blocked yet. Add a row to block a site or app.</td></tr>';
+  if (force) {
+    body.innerHTML = markup;
+    renderedHtml.set(body, markup);
   } else {
-    if (fullModeInput) fullModeInput.checked = true;
-    if (passwordModeInput) passwordModeInput.checked = false;
+    setHtml(body, markup);
   }
-  syncBlockMode();
-}
-function syncBlockMode() {
-  const fullModeInput = document.querySelector('#fullBlock');
-  const passwordModeInput = document.querySelector('#passwordBlock');
-  const fullOption = document.querySelector('#fullBlockOption');
-  const passwordOption = document.querySelector('#passwordBlockOption');
-  const passwordField = document.querySelector('#blockPasswordField');
-  const passwordInput = document.querySelector('#blockPassword');
-  const modeHint = document.querySelector('#blockModeHint');
-  let passwordMode = Boolean(passwordModeInput && passwordModeInput.checked);
-  if (!passwordMode && fullModeInput && !fullModeInput.checked) {
-    fullModeInput.checked = true;
-  }
-  if (passwordMode && fullModeInput) fullModeInput.checked = false;
-  if (fullOption) fullOption.classList.toggle('selected', !passwordMode);
-  if (passwordOption) passwordOption.classList.toggle('selected', passwordMode);
-  if (passwordField) passwordField.classList.toggle('password-hidden', !passwordMode);
-  if (modeHint) modeHint.textContent = passwordMode ? 'Password block is active.' : 'Full block is active.';
-  if (passwordInput) {
-    passwordInput.required = passwordMode;
-    if (!passwordMode) passwordInput.value = '';
-  }
+  syncBlockPasswordColumn();
 }
 async function removeBlock(target) {
   await fetch(`/api/block/remove?keyword=${encodeURIComponent(target)}`);
-  if (editingBlockTarget === target) {
-    editingBlockTarget = '';
-    document.querySelector('#blockKeyword').value = '';
-    document.querySelector('#blockPassword').value = '';
-    setBlockMode('full');
-  }
-  refresh();
-}
-function removeBlockFromButton(button) {
-  removeBlock(button.dataset.target || '');
+  await refresh();
+  renderBlockTable(true);
 }
 function connectedDeviceRowMarkup(device) {
   const endpoint = device.endpoint || '';
@@ -5159,8 +5203,7 @@ async function refresh() {
   }).join('') || '<div class="muted">No activity yet.</div>');
   setHtml('#apps', report.topApps.map((app, index) => `<p><strong>${escapeHtml(app.app)}</strong><br>${sourceMarkup(app.source || 'local', index)}<br><span class="muted">${formatDuration(app.seconds || app.minutes * 60)}</span></p>`).join('') || '<div class="muted">No apps yet.</div>');
   blockedRules = (state.blockedRules || []).map(rule => ({...rule, target: normalizedBlockValue(rule.target || '')}));
-  setHtml('#blockedList', blockedRules.map(rule => `<span class="blocked-chip${rule.target === editingBlockTarget ? ' editing' : ''}" data-target="${escapeTextAttr(rule.target || '')}">${escapeHtml(shortenSource(rule.target || ''))} <small>${rule.mode === 'password' ? 'password' : 'full'}</small><button class="edit-chip" type="button" data-target="${escapeTextAttr(rule.target || '')}" onclick="editBlockFromButton(this)" aria-label="Edit ${escapeTextAttr(rule.target || '')}">edit</button><button type="button" data-target="${escapeTextAttr(rule.target || '')}" onclick="removeBlockFromButton(this)" aria-label="Remove ${escapeTextAttr(rule.target || '')}">x</button></span>`).join('') || '<div class="muted">No blocked apps or sites yet.</div>');
-  syncBlockEditState();
+  renderBlockTable(false);
   const connectUrl = state.deviceConnectUrl || 'http://127.0.0.1:4799/device';
   document.querySelector('#deviceConnectUrl').textContent = connectUrl;
   const connectHost = hostFromUrl(connectUrl);
@@ -5416,7 +5459,6 @@ function escapeTextAttr(value) {
   return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
 }
 restoreFocusDraft();
-syncBlockMode();
 openJournalDate(todayYmd());
 loadJournalTaskReminders();
 activeReportWeek = isoWeekNumber(selectedReportDate);
@@ -7401,6 +7443,34 @@ mod tests {
         assert_eq!(json_number(&report, "distractingSwitches"), Some(1));
         assert!(report.contains("WhatsApp"));
         assert!(!report.contains("YouTube"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn integration_blocking_is_an_editable_table() {
+        let (port, dir) = start_test_server("integration-block-table");
+        let (status, body) = test_get(port, "/");
+        assert_eq!(status, 200);
+
+        // The four columns, in order, plus the row-adding control.
+        let site = body.find("Site or app").expect("site column");
+        let full = body.find("Full block").expect("full block column");
+        let password_block = body.find("Password block").expect("password block column");
+        let password = body
+            .find("class=\"block-col-password\"")
+            .expect("password column");
+        assert!(site < full && full < password_block && password_block < password);
+        assert!(body.contains("id=\"blockRows\""));
+        assert!(body.contains("addBlockRow()"));
+
+        // The password column is hidden until a rule actually uses one.
+        assert!(body.contains(".block-col-password { display:none; }"));
+        assert!(body.contains(".block-table.show-password .block-col-password"));
+
+        // The old single-rule chip form is gone.
+        assert!(!body.contains("id=\"blockKeyword\""));
+        assert!(!body.contains("id=\"blockSubmit\""));
 
         let _ = fs::remove_dir_all(dir);
     }
