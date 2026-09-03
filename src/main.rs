@@ -4769,23 +4769,15 @@ async function runCalendarReport(period, dateValue = selectedReportDate) {
     currentFocusReport = report;
     panel.innerHTML = renderFocusReport(report);
     panel.classList.add('open');
-    moveDistractionCard(true);
   } catch (error) {
     panel.innerHTML = `<div class="report-head"><p class="muted">Could not generate report.</p><button class="report-close" onclick="closeFocusReport()" aria-label="Close report">X</button></div>`;
     panel.classList.add('open');
-    moveDistractionCard(true);
   }
 }
 function closeFocusReport() {
   const panel = document.querySelector('#focusReportPanel');
   panel.classList.remove('open');
   panel.innerHTML = '';
-  moveDistractionCard(false);
-}
-function moveDistractionCard(afterReport) {
-  const card = document.querySelector('#distractionCard');
-  const reportsCard = document.querySelector('#reportsCard');
-  reportsCard.insertAdjacentElement('afterend', card);
 }
 function calendarPeriodWindow(period, dateValue) {
   const start = new Date(dateValue);
@@ -7409,6 +7401,27 @@ mod tests {
         assert_eq!(json_number(&report, "distractingSwitches"), Some(1));
         assert!(report.contains("WhatsApp"));
         assert!(!report.contains("YouTube"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn integration_blocking_card_stays_inside_the_blocking_view() {
+        // Generating a report used to relocate the blocking card in the DOM
+        // (a leftover from the single-page layout), which moved it out of
+        // Blocking and into Reports. Nothing may move it between views.
+        let (port, dir) = start_test_server("integration-card-home");
+        let (status, body) = test_get(port, "/");
+        assert_eq!(status, 200);
+
+        let rules_view = body.find("id=\"view-rules\"").expect("rules view");
+        let journal_view = body.find("id=\"view-journal\"").expect("journal view");
+        let card = body.find("id=\"distractionCard\"").expect("distraction card");
+        assert!(
+            card > rules_view && card < journal_view,
+            "the blocking card must be markup-nested in the Blocking view"
+        );
+        assert!(!body.contains("moveDistractionCard"));
 
         let _ = fs::remove_dir_all(dir);
     }
