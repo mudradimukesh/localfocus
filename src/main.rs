@@ -17,6 +17,17 @@ const BLOCK_COOLDOWN_SECONDS: i64 = 10;
 // only showing it on a chart afterwards. ADHD self-report is unreliable — the
 // research is clear that people do not notice they are doing this — so the
 // intervention is to name it out loud the moment it starts.
+// Adaptive interventions. The app fires warnings, switches and blocks, and
+// until now never checked whether any of them worked. On this machine the
+// warning had fired over 1,500 times and changed behaviour about 2% of the
+// time. So: watch what happens after each one, and stop using the rung that
+// is being ignored. All of it is derived from local samples — nothing about
+// how someone responds ever leaves the device.
+const RECOVERY_WINDOW_SECONDS: i64 = 120;
+// Enough attempts to judge by, so one bad afternoon does not rewrite anything.
+const MIN_INTERVENTIONS_TO_JUDGE: u32 = 20;
+// Below this hit rate the rung is not doing its job.
+const INTERVENTION_FAILING_RATE: f64 = 0.2;
 const JUMP_GUARD_WINDOW_SECONDS: i64 = 5 * 60;
 const JUMP_GUARD_SWITCHES: usize = 12;
 const JUMP_GUARD_COOLDOWN_SECONDS: i64 = 10 * 60;
@@ -38,6 +49,10 @@ struct Config {
     distracting_keywords: Vec<String>,
     blocked_keywords: Vec<String>,
     network_devices: Vec<String>,
+    // How blunt the nudges should be. ADHD carries a lot of rejection
+    // sensitivity, and the same nudge lands very differently depending on
+    // wording, so this is a real setting rather than a cosmetic one.
+    tone: String,
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +82,9 @@ struct FocusSession {
     high_focus_mode: bool,
     // Nudge when a switching spiral starts. On by default.
     jump_guard: bool,
+    // Let Local Focus change tack when something it is doing is not working.
+    // On by default; it only ever escalates as far as "switch me back".
+    adapt: bool,
     // A locked session cannot be paused or stopped, and its block rules cannot
     // be edited, until its timer runs out. This is the commitment, and it is
     // the only thing that makes a block hold against the person who set it.
@@ -92,6 +110,10 @@ struct AppState {
     last_sample_key: String,
     recent_switch_times: Vec<i64>,
     last_jump_guard_at: i64,
+    // An intervention that fired and is waiting to see whether it worked.
+    pending_intervention: Option<(String, i64)>,
+    // What has been learned about each rung: (fired, worked).
+    intervention_stats: BTreeMap<String, (u32, u32)>,
     // Master switch. When true, the whole app is stopped: no tracking, blocking,
     // alerts, device notifications, or journal reminders until it is resumed.
     stopped: bool,
@@ -203,6 +225,7 @@ impl Default for Config {
             ],
             blocked_keywords: Vec::new(),
             network_devices: Vec::new(),
+            tone: "neutral".into(),
         }
     }
 }
@@ -270,6 +293,8 @@ fn run_app(data_dir: PathBuf) -> io::Result<()> {
         last_sample_key: String::new(),
         recent_switch_times: Vec::new(),
         last_jump_guard_at: 0,
+        pending_intervention: None,
+        intervention_stats: load_intervention_stats(&data_dir),
     }));
 
     {
@@ -354,6 +379,8 @@ fn run_tracker(data_dir: PathBuf) -> io::Result<()> {
         last_sample_key: String::new(),
         recent_switch_times: Vec::new(),
         last_jump_guard_at: 0,
+        pending_intervention: None,
+        intervention_stats: load_intervention_stats(&data_dir),
     }));
     tracking_loop(data_dir, state)
 }
@@ -387,6 +414,7 @@ fn tracking_loop(data_dir: PathBuf, state: Arc<Mutex<AppState>>) -> io::Result<(
             sample.category = "idle".into();
         }
 
+        watch_intervention_outcome(&data_dir, &state, &sample)?;
         run_jump_guard(&data_dir, &state, &sample)?;
         let blocked = enforce_blocked_access(&data_dir, &state, &config, &sample)?;
         notify_devices_for_attention_event(&data_dir, &state, &config, &sample)?;
@@ -513,6 +541,7 @@ fn start_focus(
         high_focus_mode: false,
         locked: false,
         jump_guard: true,
+        adapt: true,
     };
     save_focus(&data_dir, &session)?;
     append_focus_session(&data_dir, &session)?;
@@ -624,18 +653,28 @@ fn detect_distraction(
                 os_alert("Focus warning", &message);
             }
             guard.last_focus_mismatch_at = sample.timestamp;
+            note_intervention_fired(&mut guard, "alert", sample.timestamp);
             append_event(data_dir, "focus_target_mismatch", &message)?;
         }
 
         // 2) Action: its own timer. Move the user to the redirect app once
         //    off-focus past the action time, then repeat every action interval.
         let action_cooldown = sample.timestamp - guard.last_focus_action_at;
+        let stats_snapshot = guard.intervention_stats.clone();
         let (switch_enabled, redirect_app) = guard
             .focus
             .as_ref()
             .map(|focus| {
+                // If warning has been failing for this person, this promotes
+                // the action to "switch me back" on its own.
+                let action = adapted_alert_action(
+                    &focus.alert_action,
+                    &stats_snapshot,
+                    &focus.redirect_app,
+                    focus.adapt,
+                );
                 (
-                    focus_alert_switches_app(&focus.alert_action, &focus.redirect_app),
+                    focus_alert_switches_app(&action, &focus.redirect_app),
                     focus.redirect_app.clone(),
                 )
             })
@@ -643,6 +682,7 @@ fn detect_distraction(
         if !sample_is_remote
             && should_move_to_app(off_focus_seconds, action_delay, action_cooldown, switch_enabled)
         {
+            note_intervention_fired(&mut guard, "switch", sample.timestamp);
             os_alert_then_activate(
                 "Time to refocus",
                 &format!("Moving you to {redirect_app} to get back on task."),
@@ -807,6 +847,247 @@ fn guard_blocked_activity(
     Ok(())
 }
 
+// --- Suggestions worked out from this device's own history ---
+//
+// Everything here is derived from samples already on disk and never leaves
+// the machine. Each one is offered, never applied silently: the app proposes
+// and the person decides. Layout is deliberately untouched — an interface
+// that rearranges itself is worse for the people this is built for.
+
+/// Enough of a day's samples in an hour to say anything about it.
+const MIN_SAMPLES_PER_HOUR: usize = 60;
+
+/// Distraction rate per clock hour, as (hour, samples, distracting fraction).
+/// Hours with too little history are left out rather than guessed at.
+fn distraction_by_hour(samples: &[ActivitySample]) -> Vec<(u32, usize, f64)> {
+    let mut totals: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
+    for sample in samples {
+        let hour = local_hour_of(sample.timestamp);
+        let entry = totals.entry(hour).or_insert((0, 0));
+        entry.0 += 1;
+        if sample.category == "distracting" {
+            entry.1 += 1;
+        }
+    }
+    totals
+        .into_iter()
+        .filter(|(_, (total, _))| *total >= MIN_SAMPLES_PER_HOUR)
+        .map(|(hour, (total, distracting))| {
+            (hour, total, distracting as f64 / total as f64)
+        })
+        .collect()
+}
+
+/// The calmest and the most scattered hour, when there is enough to tell them
+/// apart. Returns (best hour, worst hour).
+fn best_and_worst_hours(rhythm: &[(u32, usize, f64)]) -> Option<(u32, u32)> {
+    if rhythm.len() < 3 {
+        return None;
+    }
+    let best = rhythm
+        .iter()
+        .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))?;
+    let worst = rhythm
+        .iter()
+        .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))?;
+    // No point naming a best and worst that are the same.
+    if (worst.2 - best.2) < 0.15 {
+        return None;
+    }
+    Some((best.0, worst.0))
+}
+
+/// A session length this person actually finishes. Built from how long they
+/// really stay on one thing, rounded to something that reads like a choice
+/// rather than a measurement. Defaulting someone to 25 minutes when they have
+/// never once passed 12 just sets them up to fail.
+fn suggested_session_minutes(longest_calm_seconds: u64) -> Option<u64> {
+    if longest_calm_seconds < 60 {
+        return None;
+    }
+    let minutes = longest_calm_seconds / 60;
+    // Aim a little above what they manage, so it stretches without breaking.
+    let target = ((minutes as f64) * 1.2).ceil() as u64;
+    // Round *up* to the next familiar length. Rounding down would hand back
+    // roughly what they already do, which is not a stretch at all.
+    const LENGTHS: [u64; 6] = [5, 10, 15, 25, 35, 45];
+    Some(
+        LENGTHS
+            .into_iter()
+            .find(|length| *length >= target)
+            .unwrap_or(45),
+    )
+}
+
+/// When to warn, based on how long they typically last before drifting.
+/// Warning after a fixed minute is arbitrary; warning just before they
+/// usually go is not.
+fn suggested_warn_minutes(longest_calm_seconds: u64) -> Option<u64> {
+    if longest_calm_seconds < 60 {
+        return None;
+    }
+    Some(((longest_calm_seconds / 60) / 2).clamp(1, 15))
+}
+
+fn local_hour_of(timestamp: i64) -> u32 {
+    // Uses the platform's own local-time conversion, so this follows the
+    // machine's timezone and DST without carrying a date library.
+    #[cfg(unix)]
+    {
+        if let Some(text) = command_text("date", &["-r", &timestamp.to_string(), "+%H"]) {
+            if let Ok(hour) = text.trim().parse::<u32>() {
+                return hour.min(23);
+            }
+        }
+    }
+    (((timestamp % 86_400) / 3600).max(0) as u32).min(23)
+}
+
+// --- Learning which intervention actually works, per person ---
+
+/// Whether a rung has been tried enough times to judge, and is failing when
+/// judged. Kept pure: these two thresholds are the whole policy.
+fn intervention_is_failing(fired: u32, worked: u32) -> bool {
+    fired >= MIN_INTERVENTIONS_TO_JUDGE
+        && (worked as f64 / fired as f64) < INTERVENTION_FAILING_RATE
+}
+
+/// The action to actually use, which may be stronger than the one configured.
+/// Escalation stops at "switch me back": moving deliberately never escalates
+/// to quitting apps on its own, because High Focus closing things unasked is
+/// too much to arrive at by inference.
+fn adapted_alert_action(
+    configured: &str,
+    stats: &BTreeMap<String, (u32, u32)>,
+    redirect_app: &str,
+    adapt: bool,
+) -> String {
+    if !adapt || configured != "alert" || redirect_app.trim().is_empty() {
+        return configured.to_string();
+    }
+    let (fired, worked) = stats.get("alert").copied().unwrap_or((0, 0));
+    if intervention_is_failing(fired, worked) {
+        return "switch".into();
+    }
+    configured.to_string()
+}
+
+/// Starts watching an intervention. The result is decided by what the next
+/// couple of minutes of samples look like, not by asking the user anything.
+fn note_intervention_fired(guard: &mut AppState, kind: &str, at: i64) {
+    // Anything still pending when a new one fires did not work.
+    if let Some((previous, _)) = guard.pending_intervention.take() {
+        guard.intervention_stats.entry(previous).or_insert((0, 0)).0 += 1;
+    }
+    guard.pending_intervention = Some((kind.to_string(), at));
+}
+
+/// Resolves a pending intervention once the person is back on task, or once
+/// the window has run out. Returns the kind and whether it worked, so the
+/// caller can persist the result.
+fn resolve_pending_intervention(
+    guard: &mut AppState,
+    back_on_task: bool,
+    at: i64,
+) -> Option<(String, bool)> {
+    let (kind, fired_at) = guard.pending_intervention.clone()?;
+    let expired = at - fired_at >= RECOVERY_WINDOW_SECONDS;
+    if !back_on_task && !expired {
+        return None;
+    }
+    guard.pending_intervention = None;
+    let entry = guard.intervention_stats.entry(kind.clone()).or_insert((0, 0));
+    entry.0 += 1;
+    if back_on_task {
+        entry.1 += 1;
+    }
+    Some((kind, back_on_task))
+}
+
+fn intervention_stats_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("intervention_stats.json")
+}
+
+fn load_intervention_stats(data_dir: &Path) -> BTreeMap<String, (u32, u32)> {
+    let mut stats = BTreeMap::new();
+    let Ok(text) = fs::read_to_string(intervention_stats_path(data_dir)) else {
+        return stats;
+    };
+    for kind in ["alert", "switch", "block", "high_focus"] {
+        // Stored flat as "<kind>Fired" / "<kind>Worked" so the existing
+        // number lookup can read it without a JSON parser.
+        let fired = json_number(&text, &format!("{kind}Fired")).unwrap_or(0).max(0) as u32;
+        let worked = json_number(&text, &format!("{kind}Worked")).unwrap_or(0).max(0) as u32;
+        if fired > 0 || worked > 0 {
+            stats.insert(kind.to_string(), (fired, worked));
+        }
+    }
+    stats
+}
+
+fn save_intervention_stats(
+    data_dir: &Path,
+    stats: &BTreeMap<String, (u32, u32)>,
+) -> io::Result<()> {
+    let body = stats
+        .iter()
+        .map(|(kind, (fired, worked))| {
+            format!("\"{kind}Fired\":{fired},\"{kind}Worked\":{worked}")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    fs::write(intervention_stats_path(data_dir), format!("{{{body}}}"))
+}
+
+/// Decides whether a fired intervention worked, from the samples that follow
+/// it. "Worked" means back on the focus list, or at least no longer on
+/// something distracting, within the recovery window.
+fn watch_intervention_outcome(
+    data_dir: &Path,
+    state: &Arc<Mutex<AppState>>,
+    sample: &ActivitySample,
+) -> io::Result<()> {
+    let resolved = {
+        let mut guard = lock_state(state);
+        if guard.pending_intervention.is_none() {
+            return Ok(());
+        }
+        let back_on_task = guard
+            .focus
+            .as_ref()
+            .map(|focus| {
+                if focus_targets(focus).is_empty() {
+                    sample.category != "distracting"
+                } else {
+                    matches_focus_target(focus, sample)
+                }
+            })
+            .unwrap_or(sample.category != "distracting");
+        let outcome = resolve_pending_intervention(&mut guard, back_on_task, sample.timestamp);
+        outcome.map(|resolved| (resolved, guard.intervention_stats.clone()))
+    };
+
+    let Some(((kind, worked), stats)) = resolved else {
+        return Ok(());
+    };
+    save_intervention_stats(data_dir, &stats)?;
+    if worked {
+        return Ok(());
+    }
+    // Only log the misses; a rung that works needs no commentary.
+    let (fired, hits) = stats.get(&kind).copied().unwrap_or((0, 0));
+    if intervention_is_failing(fired, hits) {
+        append_event(
+            data_dir,
+            "intervention_failing",
+            &format!(
+                "'{kind}' has worked {hits} of {fired} times. Escalating where possible."
+            ),
+        )?;
+    }
+    Ok(())
+}
+
 /// Whether a switching spiral is underway and worth interrupting: enough
 /// switches inside the rolling window, and long enough since the last nudge
 /// that this is not nagging. Kept pure so the thresholds are testable.
@@ -861,10 +1142,17 @@ fn run_jump_guard(
     lock_state(state).last_jump_guard_at = sample.timestamp;
 
     let minutes = JUMP_GUARD_WINDOW_SECONDS / 60;
-    let message = format!(
-        "You have jumped between apps {switches} times in {minutes} minutes. Pick one thing and stay with it for a few minutes."
+    let tone = lock_state(state).config.tone.clone();
+    let message = toned(
+        &tone,
+        &format!("That's {switches} app changes in {minutes} minutes. No harm done — pick one thing and settle in when you're ready."),
+        &format!("You have jumped between apps {switches} times in {minutes} minutes. Pick one thing and stay with it for a few minutes."),
+        &format!("{switches} jumps in {minutes} minutes. You are not working. Pick one thing."),
     );
-    notify("Lots of jumping", &message);
+    notify(
+        &toned(&tone, "Lots of moving around", "Lots of jumping", "You keep jumping"),
+        &message,
+    );
     append_event(data_dir, "jump_guard", &message)
 }
 
@@ -1281,6 +1569,24 @@ fn human_duration(seconds: u64) -> String {
         "1 second".into()
     } else {
         format!("{seconds} seconds")
+    }
+}
+
+fn normalize_tone(value: &str) -> String {
+    match value.trim().to_lowercase().as_str() {
+        "gentle" => "gentle".into(),
+        "blunt" => "blunt".into(),
+        _ => "neutral".into(),
+    }
+}
+
+/// Rewrites a nudge in the voice the person picked. Same event, same timing;
+/// only the wording changes.
+fn toned(tone: &str, gentle: &str, neutral: &str, blunt: &str) -> String {
+    match tone {
+        "gentle" => gentle.to_string(),
+        "blunt" => blunt.to_string(),
+        _ => neutral.to_string(),
     }
 }
 
@@ -1904,6 +2210,10 @@ fn handle_http(
         let high_focus = params
             .get("highFocus")
             .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"));
+        let adapt = params
+            .get("adapt")
+            .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+            .unwrap_or(true);
         // On unless explicitly switched off.
         let jump_guard = params
             .get("jumpGuard")
@@ -1939,6 +2249,7 @@ fn handle_http(
             high_focus_mode: high_focus,
             locked,
             jump_guard,
+            adapt,
         };
         save_focus(&data_dir, &session)?;
         save_last_focus_settings(&data_dir, &session)?;
@@ -2581,6 +2892,26 @@ fn handle_http(
             "application/json",
             &format!("{{\"ok\":true,\"notifications\":[{}]}}", items),
         )?;
+    } else if path.starts_with("/api/app/tone") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let tone = normalize_tone(params.get("tone").map(String::as_str).unwrap_or("neutral"));
+        let mut config = load_config(&data_dir).unwrap_or_default();
+        config.tone = tone.clone();
+        save_config(&data_dir, &config)?;
+        lock_state(&state).config = config;
+        write_response(
+            &mut stream,
+            "application/json",
+            &format!("{{\"ok\":true,\"tone\":\"{}\"}}", json_escape(&tone)),
+        )?;
+    } else if route == "/api/suggestions" {
+        let config = lock_state(&state).config.clone();
+        write_response(
+            &mut stream,
+            "application/json",
+            &suggestions_json(&data_dir, &config)?,
+        )?;
     } else if route == "/api/report/switches" {
         write_response(
             &mut stream,
@@ -2588,7 +2919,7 @@ fn handle_http(
             &switch_report_json(&data_dir)?,
         )?;
     } else if route == "/api/state" {
-        let (focus, devices, blocks, stopped, recent_jumps) = {
+        let (focus, devices, blocks, stopped, recent_jumps, tone) = {
             let guard = lock_state(&state);
             let cutoff = now() - JUMP_GUARD_WINDOW_SECONDS;
             (
@@ -2597,12 +2928,13 @@ fn handle_http(
                 guard.config.blocked_keywords.clone(),
                 guard.stopped,
                 guard.recent_switch_times.iter().filter(|at| **at > cutoff).count(),
+                guard.config.tone.clone(),
             )
         };
         write_response(
             &mut stream,
             "application/json",
-            &state_json(&data_dir, focus, &devices, &blocks, stopped, recent_jumps),
+            &state_json(&data_dir, focus, &devices, &blocks, stopped, recent_jumps, &tone),
         )?;
     } else if route == "/connect" {
         write_response(
@@ -2714,6 +3046,7 @@ fn remote_path_allowed(route: &str) -> bool {
     route.starts_with("/device")
         || route == "/api/state"
         || route == "/api/report"
+        || route == "/api/suggestions"
         || route == "/api/report/switches"
         // Past archived reports, but not report reset (loopback-only).
         || route == "/api/report/history"
@@ -2926,6 +3259,94 @@ fn report_json(data_dir: &Path) -> io::Result<String> {
 /// attention pattern. Counts a "switch" as any change in the foreground
 /// app or window title between consecutive samples, over the same rolling
 /// report window `report_json` uses.
+/// Everything the app has worked out about this person, in one place, for the
+/// dashboard to offer. Suggestions only — nothing here changes anything.
+fn suggestions_json(data_dir: &Path, config: &Config) -> io::Result<String> {
+    let samples = load_samples(data_dir)?;
+    let rhythm = distraction_by_hour(&samples);
+    let hours = best_and_worst_hours(&rhythm);
+
+    // Longest unbroken stretch on one thing, the same measure the jumps
+    // report shows, over the whole history rather than one window.
+    let mut longest_calm: u64 = 0;
+    let mut run: u64 = 0;
+    let mut previous: Option<&ActivitySample> = None;
+    for sample in &samples {
+        if previous.is_some_and(|prev| prev.app != sample.app || prev.title != sample.title) {
+            longest_calm = longest_calm.max(run);
+            run = 0;
+        }
+        if sample.category != "idle" {
+            run += SAMPLE_SECONDS;
+        }
+        previous = Some(sample);
+    }
+    longest_calm = longest_calm.max(run);
+
+    // Apps and sites worth offering to block: the ones that most often take
+    // attention, minus anything already blocked.
+    let blocked: Vec<String> = config
+        .blocked_keywords
+        .iter()
+        .map(|record| parse_block_rule_record(record).target)
+        .collect();
+    let mut distracting: BTreeMap<String, usize> = BTreeMap::new();
+    for sample in samples.iter().filter(|s| s.category == "distracting") {
+        if is_local_focus_control_activity(sample) {
+            continue;
+        }
+        *distracting.entry(sample.app.clone()).or_default() += 1;
+    }
+    let mut candidates: Vec<(String, usize)> = distracting
+        .into_iter()
+        .filter(|(app, _)| {
+            let normalized = normalize_match_text(app);
+            !blocked.iter().any(|target| normalize_match_text(target) == normalized)
+        })
+        .collect();
+    candidates.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    let candidates_json = candidates
+        .into_iter()
+        .take(5)
+        .map(|(app, count)| {
+            format!(
+                "{{\"target\":\"{}\",\"minutes\":{}}}",
+                json_escape(&app),
+                count as u64 * SAMPLE_SECONDS / 60
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let rhythm_json = rhythm
+        .iter()
+        .map(|(hour, total, rate)| {
+            format!(
+                "{{\"hour\":{},\"samples\":{},\"distractingRate\":{:.3}}}",
+                hour, total, rate
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let as_number = |value: Option<u64>| {
+        value
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "null".into())
+    };
+
+    Ok(format!(
+        "{{\"bestHour\":{},\"worstHour\":{},\"longestCalmSeconds\":{},\"sessionMinutes\":{},\"warnMinutes\":{},\"blockCandidates\":[{}],\"byHour\":[{}]}}",
+        as_number(hours.map(|(best, _)| best as u64)),
+        as_number(hours.map(|(_, worst)| worst as u64)),
+        longest_calm,
+        as_number(suggested_session_minutes(longest_calm)),
+        as_number(suggested_warn_minutes(longest_calm)),
+        candidates_json,
+        rhythm_json
+    ))
+}
+
 fn switch_report_json(data_dir: &Path) -> io::Result<String> {
     let samples = load_samples(data_dir)?;
     let since = report_window_start(data_dir)?.max(now() - 24 * 60 * 60);
@@ -3867,7 +4288,25 @@ fn state_json(
     blocks: &[String],
     stopped: bool,
     recent_jumps: usize,
+    tone: &str,
 ) -> String {
+    let stats = load_intervention_stats(data_dir);
+    let interventions_json = format!(
+        "[{}]",
+        stats
+            .iter()
+            .map(|(kind, (fired, worked))| {
+                format!(
+                    "{{\"kind\":\"{}\",\"fired\":{},\"worked\":{},\"failing\":{}}}",
+                    json_escape(kind),
+                    fired,
+                    worked,
+                    intervention_is_failing(*fired, *worked)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     let lan_url = local_network_url().unwrap_or_else(|| "http://127.0.0.1:4799".into());
     let device_connect_url = format!("{lan_url}/device");
     let device_install_url = format!("{lan_url}/connect");
@@ -3924,7 +4363,7 @@ fn state_json(
             let elapsed = focus_elapsed_seconds(&focus, now());
             let remaining = ((focus.duration_minutes * 60) as i64 - elapsed).max(0);
             format!(
-                "{{\"stopped\":{},\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"paused\":{},\"remainingSeconds\":{},\"locked\":{},\"lockActive\":{},\"jumpGuard\":{},\"recentJumps\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"journal\":{},\"onboarded\":{},\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
+                "{{\"stopped\":{},\"focus\":{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"paused\":{},\"remainingSeconds\":{},\"locked\":{},\"lockActive\":{},\"jumpGuard\":{},\"adapt\":{},\"recentJumps\":{}}},\"devices\":[{}],\"blockedRules\":[{}],\"journal\":{},\"tone\":\"{}\",\"interventions\":{},\"onboarded\":{},\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
                 stopped,
                 json_escape(&focus.task),
                 json_escape(&focus.target),
@@ -3941,10 +4380,13 @@ fn state_json(
                 focus.locked,
                 focus_lock_is_active(&focus, now()),
                 focus.jump_guard,
+                focus.adapt,
                 recent_jumps,
                 devices_json,
                 blocks_json,
                 journal_json,
+                json_escape(&tone),
+                interventions_json,
                 onboarding_is_done(data_dir),
                 json_escape(&device_connect_url),
                 json_escape(&device_install_url),
@@ -3953,11 +4395,13 @@ fn state_json(
             )
         }
         None => format!(
-            "{{\"stopped\":{},\"focus\":null,\"devices\":[{}],\"blockedRules\":[{}],\"journal\":{},\"onboarded\":{},\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
+            "{{\"stopped\":{},\"focus\":null,\"devices\":[{}],\"blockedRules\":[{}],\"journal\":{},\"tone\":\"{}\",\"interventions\":{},\"onboarded\":{},\"deviceConnectUrl\":\"{}\",\"deviceInstallUrl\":\"{}\",\"androidAppUrl\":\"{}\",\"macAppUrl\":\"{}\"}}",
             stopped,
             devices_json,
             blocks_json,
             journal_json,
+            json_escape(&tone),
+            interventions_json,
             onboarding_is_done(data_dir),
             json_escape(&device_connect_url),
             json_escape(&device_install_url),
@@ -4065,6 +4509,13 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
 .onboarding-actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:6px; }
 .onboarding-skip { border:0; background:transparent; color:var(--muted); font-weight:700; cursor:pointer; box-shadow:none; }
 .onboarding-skip:hover { color:var(--ink); }
+.suggestion { float:right; font-size:11px; font-weight:800; color:var(--accent); cursor:pointer; }
+.suggestion:hover { text-decoration:underline; }
+.suggestion[hidden] { display:none; }
+.rhythm-note { border-left:3px solid var(--accent); background:color-mix(in srgb, var(--accent) 8%, transparent); border-radius:8px; padding:10px 12px; font-size:13px; }
+.block-suggestions { display:flex; flex-wrap:wrap; gap:8px; }
+.block-suggestion { border:1px dashed var(--line); border-radius:999px; padding:6px 12px; background:transparent; color:var(--ink); font-size:12px; font-weight:700; cursor:pointer; }
+.block-suggestion:hover { border-color:var(--accent); color:var(--accent); }
 .help-dot { display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; min-width:18px; padding:0; margin-left:6px; border-radius:999px; border:1px solid var(--line); background:var(--panel); color:var(--muted); font-size:11px; font-weight:800; line-height:1; cursor:help; vertical-align:middle; box-shadow:none; }
 .help-dot:hover, .help-dot[aria-expanded="true"] { border-color:var(--accent); color:var(--accent); background:color-mix(in srgb, var(--accent) 12%, var(--panel)); }
 .help-text { grid-column:1 / -1; margin:6px 0 2px; padding:10px 12px; border-radius:8px; border-left:3px solid var(--accent); background:color-mix(in srgb, var(--accent) 8%, transparent); color:var(--ink); font-size:12px; line-height:1.5; font-weight:500; }
@@ -4313,6 +4764,11 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
       <option value="professional">💼 Professional</option>
     </select>
     <div id="focusState" class="status-chip"></div>
+    <select id="tonePicker" aria-label="How blunt should the nudges be" title="Nudge tone" onchange="setTone(this.value)">
+      <option value="gentle">Gentle</option>
+      <option value="neutral">Neutral</option>
+      <option value="blunt">Blunt</option>
+    </select>
     <button id="explainToggle" class="help-dot" onclick="toggleExplain()" aria-expanded="false" aria-label="What do these reports mean?">?</button>
   </div>
 </header>
@@ -4355,6 +4811,7 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
         <button id="focusDetailsToggle" class="focus-details-toggle" onclick="toggleFocusDetails()" aria-expanded="false">Show focus details</button>
       </div>
     </div>
+    <div id="rhythmNote" class="rhythm-note" hidden></div>
     <div id="focusDetails" class="focus-details"></div>
     <div id="focusEditor" class="focus-layout">
       <div class="focus-form">
@@ -4368,8 +4825,8 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
           <div id="targetListEditor" class="target-list-editor empty" aria-live="polite"></div>
           <input id="target" type="hidden" aria-label="Focus targets">
         </div>
-        <div class="field"><label for="minutes">Session length (minutes) <button type="button" class="help-dot" data-help="sessionLength" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></label><input id="minutes" type="number" min="1" max="180" value="25" aria-label="Session length in minutes"></div>
-        <div class="field"><label for="alertMinutes">Warn me after (minutes off task) <button type="button" class="help-dot" data-help="warnAfter" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></label><input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Warn me after this many minutes off task" title="Warn me once I have been off task this long, then repeat every interval"></div>
+        <div class="field"><span id="minutesHint" class="suggestion" hidden></span><label for="minutes">Session length (minutes) <button type="button" class="help-dot" data-help="sessionLength" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></label><input id="minutes" type="number" min="1" max="180" value="25" aria-label="Session length in minutes"></div>
+        <div class="field"><span id="alertHint" class="suggestion" hidden></span><label for="alertMinutes">Warn me after (minutes off task) <button type="button" class="help-dot" data-help="warnAfter" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></label><input id="alertMinutes" type="number" min="1" max="60" value="1" aria-label="Warn me after this many minutes off task" title="Warn me once I have been off task this long, then repeat every interval"></div>
         <div class="field"><label for="alertAction">If I stay off task <button type="button" class="help-dot" data-help="offTaskAction" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></label><select id="alertAction" aria-label="What to do if I stay off task" title="What happens once the off-task timer runs out">
           <option value="alert">Just warn me</option>
           <option value="switch">Switch me to an app</option>
@@ -4422,6 +4879,13 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
         <span id="jumpGuardHint" class="muted">A nudge when you switch apps over and over.</span>
       </div>
       <div class="high-focus-row">
+        <label class="high-focus-check" for="adaptSession">
+          <input id="adaptSession" type="checkbox" checked>
+          Change tack when something is not working <button type="button" class="help-dot" data-help="adapt" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button>
+        </label>
+        <span id="adaptHint" class="muted">Learns which nudges actually work on you.</span>
+      </div>
+      <div class="high-focus-row">
         <label class="high-focus-check" for="highFocusMode">
           <input id="highFocusMode" type="checkbox" onchange="toggleHighFocusMode()" disabled>
           High focus mode
@@ -4455,6 +4919,10 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
         </thead>
         <tbody id="blockRows"></tbody>
       </table>
+    </div>
+    <div id="blockSuggestionsWrap" hidden>
+      <strong>Often pulls you away</strong>
+      <div id="blockSuggestions" class="block-suggestions"></div>
     </div>
     <div class="focus-actions">
       <button type="button" onclick="addBlockRow()">Add row</button>
@@ -4577,6 +5045,13 @@ button:disabled { cursor:not-allowed; opacity:.55; box-shadow:none; }
   </section>
   </div>
   <div class="view" id="view-devices" role="tabpanel" aria-label="Devices">
+  <section id="interventionCard" class="control-shell" aria-label="What actually works on you">
+    <div>
+      <h2>What actually works on you <button type="button" class="help-dot" data-help="interventionScore" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></h2>
+      <div class="muted">How often each nudge got you back on task within two minutes. Worked out from your own history, on this device.</div>
+    </div>
+    <div id="interventionList" class="switch-targets muted">Nothing measured yet. This fills in as Local Focus nudges you.</div>
+  </section>
   <section id="devicesCard" class="control-shell" aria-label="Connect to device">
     <div>
       <h2>Connect to device <button type="button" class="help-dot" data-help="devices" onclick="toggleHelp(this)" aria-expanded="false" aria-label="What is this?">?</button></h2>
@@ -4692,6 +5167,8 @@ const HELP = {
   switchApp: 'The app to bring back to the front when Local Focus switches you back.',
   warningMessage: 'The wording of the warning. {delay} is how long you have been off task, {targets} your focus list, {app} the current app, {title} the window title and {url} the page.',
   lockSession: 'Commit to the session. While it is locked you cannot pause it, stop it, or change your block rules — the whole point being that the person who set the block cannot undo it five minutes later. It unlocks itself when the timer ends.',
+  adapt: 'Local Focus watches what happens in the two minutes after each nudge and keeps score, on this device only. If a warning has been ignored enough times to be sure, it stops relying on it and switches you back to your app instead. It never escalates as far as closing apps on its own — that stays your choice.',
+  interventionScore: 'How often each nudge actually got you back on task, from your own history. Anything under a fifth of the time is not working, and Local Focus will stop leaning on it.',
   jumpGuard: 'Watches for jumping between apps over and over. If you switch twelve times in five minutes it tells you once, then stays quiet for ten minutes. Most people do not notice they are doing this, which is the reason it exists.',
   highFocus: 'Blocks everything outside your focus list, not just the sites on your block list. The Local Focus window stays available so you can always turn it off.',
   sessionTimer: 'Time left in this session. The ring empties as it counts down. It turns amber when paused and green when the time is up.',
@@ -4790,8 +5267,10 @@ async function startFocus() {
   const lock = lockInput && lockInput.checked ? '1' : '0';
   const jumpGuardInput = document.querySelector('#jumpGuard');
   const jumpGuard = !jumpGuardInput || jumpGuardInput.checked ? '1' : '0';
+  const adaptInput = document.querySelector('#adaptSession');
+  const adapt = !adaptInput || adaptInput.checked ? '1' : '0';
   if (lock === '1' && !confirm(`Lock this session for ${document.querySelector('#minutes').value || '25'} minutes?\n\nYou will not be able to pause it, stop it, or change your block rules until the timer ends.`)) return;
-  await fetch(`/api/focus/start?task=${task}&target=${target}&minutes=${mins}&alertSeconds=${alertSeconds}&actionSeconds=${actionSeconds}&alertAction=${alertAction}&alertMessage=${alertMessage}&redirectApp=${redirectApp}&lock=${lock}&jumpGuard=${jumpGuard}`);
+  await fetch(`/api/focus/start?task=${task}&target=${target}&minutes=${mins}&alertSeconds=${alertSeconds}&actionSeconds=${actionSeconds}&alertAction=${alertAction}&alertMessage=${alertMessage}&redirectApp=${redirectApp}&lock=${lock}&jumpGuard=${jumpGuard}&adapt=${adapt}`);
   refresh();
 }
 async function saveFocusEdits() {
@@ -4993,6 +5472,105 @@ function fillQuietHours(hours) {
     series.push({ start, switches: counts.get(start) || 0 });
   }
   return series;
+}
+// Suggestions are offered, never applied on their own: each one is a link
+// that fills the field in, so nothing changes behind the person's back.
+let suggestions = null;
+function hourLabel(hour) {
+  return new Date(2000, 0, 1, hour).toLocaleTimeString([], { hour: 'numeric' });
+}
+function applySuggestion(id, value) {
+  const input = document.querySelector(id);
+  if (!input) return;
+  input.value = value;
+  saveFocusDraft();
+  renderSuggestions();
+}
+async function setTone(tone) {
+  await fetch(`/api/app/tone?tone=${encodeURIComponent(tone)}`);
+  refresh();
+}
+function renderSuggestions() {
+  if (!suggestions) return;
+  const running = Boolean(activeFocusSession);
+  const hint = (id, target, value, text) => {
+    const el = document.querySelector(id);
+    if (!el) return;
+    const current = Number((document.querySelector(target) || {}).value || 0);
+    // Only offer it when it differs from what is already set, and only while
+    // the fields can actually be edited.
+    if (running || !value || current === value) { el.hidden = true; return; }
+    el.hidden = false;
+    el.textContent = text;
+    el.onclick = () => applySuggestion(target, value);
+  };
+  hint('#minutesHint', '#minutes', suggestions.sessionMinutes, `try ${suggestions.sessionMinutes}`);
+  hint('#alertHint', '#alertMinutes', suggestions.warnMinutes, `try ${suggestions.warnMinutes}`);
+
+  const note = document.querySelector('#rhythmNote');
+  if (note) {
+    if (suggestions.bestHour === null || suggestions.bestHour === undefined) {
+      note.hidden = true;
+    } else {
+      note.hidden = false;
+      const calm = suggestions.longestCalmSeconds
+        ? ` Your longest unbroken stretch so far is ${formatDuration(suggestions.longestCalmSeconds)}.`
+        : '';
+      note.textContent = `From your own history: ${hourLabel(suggestions.bestHour)} is when you drift least, and ${hourLabel(suggestions.worstHour)} is when you drift most.${calm}`;
+    }
+  }
+
+  const wrap = document.querySelector('#blockSuggestionsWrap');
+  const list = document.querySelector('#blockSuggestions');
+  const candidates = suggestions.blockCandidates || [];
+  if (wrap && list) {
+    wrap.hidden = candidates.length === 0;
+    setHtml(list, candidates.map(c =>
+      `<button type="button" class="block-suggestion" onclick="blockSuggested('${escapeTextAttr(c.target)}')">${escapeHtml(c.target)} <span class="muted">${c.minutes}m</span></button>`
+    ).join(''));
+  }
+}
+async function blockSuggested(target) {
+  const params = new URLSearchParams();
+  params.set('keyword', target);
+  params.set('mode', 'full');
+  await fetch(`/api/block/add?${params.toString()}`);
+  await loadSuggestions();
+  await refresh();
+  renderBlockTable(true);
+}
+async function loadSuggestions() {
+  try {
+    suggestions = await (await fetch('/api/suggestions')).json();
+  } catch (e) { suggestions = null; }
+  renderSuggestions();
+}
+const INTERVENTION_LABELS = {
+  alert: 'Warning you',
+  switch: 'Switching you back',
+  block: 'Blocking the site or app',
+  high_focus: 'High Focus closing it'
+};
+function renderInterventionReport(rows) {
+  const list = document.querySelector('#interventionList');
+  if (!list) return;
+  if (!rows.length) {
+    setHtml(list, '<div class="muted">Nothing measured yet. This fills in as Local Focus nudges you.</div>');
+    return;
+  }
+  setHtml(list, rows.map(row => {
+    const fired = row.fired || 0;
+    const worked = row.worked || 0;
+    const pct = fired ? Math.round((worked / fired) * 100) : 0;
+    const label = INTERVENTION_LABELS[row.kind] || row.kind;
+    const note = row.failing ? ' &middot; not working, so Local Focus is easing off it' : '';
+    return `<div class="switch-target-row">
+      <span>${escapeHtml(label)}</span>
+      <div class="switch-target-track"><div class="switch-target-fill" style="width:${Math.max(3, pct)}%; ${row.failing ? 'background:var(--bad);' : ''}"></div></div>
+      <span class="switch-target-count">${pct}%</span>
+    </div>
+    <div class="muted" style="font-size:12px; margin-top:-4px;">worked ${worked} of ${fired} times${note}</div>`;
+  }).join(''));
 }
 function renderSwitchReport(switches) {
   const total = switches.totalSwitches || 0;
@@ -5722,6 +6300,10 @@ async function refresh() {
     <div class="metric"><span class="muted">Distracted</span><strong>${formatDuration(report.distractingMinutes * 60)}</strong></div>
     <div class="metric"><span class="muted">Idle</span><strong>${formatDuration((report.idleMinutes || 0) * 60)}</strong></div>`);
   renderSwitchReport(switches);
+  renderInterventionReport(state.interventions || []);
+  const tonePicker = document.querySelector('#tonePicker');
+  if (tonePicker && state.tone) tonePicker.value = state.tone;
+  renderSuggestions();
   setHtml('#timeline', timeline.slice(-80).reverse().map((item, index) => {
     const longAttention = item.durationSeconds > 15 * 60 && (item.category === 'idle' || item.category === 'distracting');
     const longClass = longAttention ? ` long-attention ${item.category === 'idle' ? 'long-idle' : 'long-distracting'}` : '';
@@ -5957,6 +6539,11 @@ function updateFocusButtons(focus, stopped) {
     jumpInput.disabled = Boolean(focus) || Boolean(stopped);
     if (focus) jumpInput.checked = Boolean(focus.jumpGuard);
   }
+  const adaptInput = document.querySelector('#adaptSession');
+  if (adaptInput) {
+    adaptInput.disabled = Boolean(focus) || Boolean(stopped);
+    if (focus) adaptInput.checked = Boolean(focus.adapt);
+  }
   const jumpHint = document.querySelector('#jumpGuardHint');
   if (jumpHint) {
     const recent = focus ? (focus.recentJumps || 0) : 0;
@@ -6032,6 +6619,10 @@ activeReportWeek = isoWeekNumber(selectedReportDate);
 renderReportCalendar();
 setFocusTaskWindow('day', calendarPeriodWindow('day', selectedReportDate));
 refresh();
+loadSuggestions();
+// Suggestions come from weeks of history, so they move slowly; no need to
+// recompute them on the 10s cycle.
+setInterval(loadSuggestions, 5 * 60 * 1000);
 setInterval(refresh, 10000);
 </script>
 </body>
@@ -6311,6 +6902,7 @@ fn load_config(data_dir: &Path) -> io::Result<Config> {
             "distracting" => config.distracting_keywords = config_values(value, true),
             "blocked" => config.blocked_keywords = config_values(value, false),
             "devices" => config.network_devices = config_values(value, false),
+            "tone" => config.tone = normalize_tone(value),
             _ => {}
         }
     }
@@ -6389,11 +6981,12 @@ fn save_config(data_dir: &Path, config: &Config) -> io::Result<()> {
     fs::write(
         data_dir.join("config.txt"),
         format!(
-            "productive={}\ndistracting={}\nblocked={}\ndevices={}\n",
+            "productive={}\ndistracting={}\nblocked={}\ndevices={}\ntone={}\n",
             config.productive_keywords.join(","),
             config.distracting_keywords.join(","),
             config.blocked_keywords.join(","),
-            config.network_devices.join(",")
+            config.network_devices.join(","),
+            config.tone
         ),
     )
 }
@@ -6410,7 +7003,7 @@ fn save_focus(data_dir: &Path, focus: &FocusSession) -> io::Result<()> {
     fs::write(
         data_dir.join("focus.json"),
         format!(
-            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"locked\":{},\"jumpGuard\":{}}}",
+            "{{\"task\":\"{}\",\"target\":\"{}\",\"startedAt\":{},\"durationMinutes\":{},\"breakMinutes\":{},\"pausedAt\":{},\"pausedTotalSeconds\":{},\"pomodoroAlertedAt\":{},\"alertDelaySeconds\":{},\"actionDelaySeconds\":{},\"alertAction\":\"{}\",\"alertMessage\":\"{}\",\"redirectApp\":\"{}\",\"highFocusMode\":{},\"locked\":{},\"jumpGuard\":{},\"adapt\":{}}}",
             json_escape(&focus.task),
             json_escape(&focus.target),
             focus.started_at,
@@ -6426,7 +7019,8 @@ fn save_focus(data_dir: &Path, focus: &FocusSession) -> io::Result<()> {
             json_escape(&focus.redirect_app),
             focus.high_focus_mode,
             focus.locked,
-            focus.jump_guard
+            focus.jump_guard,
+            focus.adapt
         ),
     )
 }
@@ -6505,6 +7099,7 @@ fn load_focus(data_dir: &Path) -> Option<FocusSession> {
         high_focus_mode: json_bool(&value, "highFocusMode").unwrap_or(false),
         locked: json_bool(&value, "locked").unwrap_or(false),
         jump_guard: json_bool(&value, "jumpGuard").unwrap_or(true),
+        adapt: json_bool(&value, "adapt").unwrap_or(true),
     })
 }
 
@@ -7624,6 +8219,7 @@ mod tests {
             high_focus_mode: true,
             locked: false,
             jump_guard: true,
+            adapt: true,
         }
     }
 
@@ -7799,6 +8395,173 @@ mod tests {
         );
         let _ = fs::remove_dir_all(dir);
     }
+    #[test]
+    fn session_length_is_suggested_from_what_the_person_actually_manages() {
+        // Nothing to go on yet: suggest nothing rather than guessing.
+        assert_eq!(suggested_session_minutes(0), None);
+        assert_eq!(suggested_session_minutes(30), None);
+
+        // Someone who lasts about 10 minutes should not be handed 25.
+        assert_eq!(suggested_session_minutes(10 * 60), Some(15));
+        // Someone who lasts 5 gets something they can finish.
+        assert_eq!(suggested_session_minutes(5 * 60), Some(10));
+        // Someone already going half an hour is stretched, not capped.
+        assert_eq!(suggested_session_minutes(30 * 60), Some(45));
+
+        // The warning lands about halfway through a typical stretch, rather
+        // than at a fixed minute.
+        assert_eq!(suggested_warn_minutes(0), None);
+        assert_eq!(suggested_warn_minutes(20 * 60), Some(10));
+        // Always at least a minute, never more than a quarter of an hour.
+        assert_eq!(suggested_warn_minutes(90), Some(1));
+        assert_eq!(suggested_warn_minutes(120 * 60), Some(15));
+    }
+
+    #[test]
+    fn rhythm_needs_real_evidence_before_naming_a_best_hour() {
+        // Too few hours to compare.
+        assert_eq!(best_and_worst_hours(&[(9, 100, 0.1), (10, 100, 0.9)]), None);
+
+        // A clear difference across enough hours.
+        let clear = vec![(6, 200, 0.05), (13, 200, 0.4), (1, 200, 0.79)];
+        assert_eq!(best_and_worst_hours(&clear), Some((6, 1)));
+
+        // Enough hours, but all much the same: naming a "best" would be noise.
+        let flat = vec![(6, 200, 0.40), (13, 200, 0.45), (1, 200, 0.48)];
+        assert_eq!(best_and_worst_hours(&flat), None);
+    }
+
+    #[test]
+    fn hours_without_enough_history_are_left_out_of_the_rhythm() {
+        let mut samples = Vec::new();
+        let base = (now() / 86_400) * 86_400; // midnight-ish anchor
+        // One hour with plenty of samples, another with only a handful.
+        for i in 0..(MIN_SAMPLES_PER_HOUR + 10) {
+            samples.push(ActivitySample {
+                timestamp: base + i as i64,
+                app: "Chrome".into(),
+                title: "x".into(),
+                source: "local".into(),
+                category: "distracting".into(),
+            });
+        }
+        for i in 0..5 {
+            samples.push(ActivitySample {
+                timestamp: base + 7200 + i as i64,
+                app: "Pages".into(),
+                title: "y".into(),
+                source: "local".into(),
+                category: "productive".into(),
+            });
+        }
+        let rhythm = distraction_by_hour(&samples);
+        // Only the well-evidenced hour survives.
+        assert_eq!(rhythm.len(), 1);
+        assert!(rhythm[0].1 >= MIN_SAMPLES_PER_HOUR);
+        assert!((rhythm[0].2 - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn tone_only_changes_wording() {
+        assert_eq!(normalize_tone("GENTLE"), "gentle");
+        assert_eq!(normalize_tone("blunt"), "blunt");
+        // Anything unrecognised falls back rather than erroring.
+        assert_eq!(normalize_tone("shouty"), "neutral");
+        assert_eq!(normalize_tone(""), "neutral");
+
+        assert_eq!(toned("gentle", "soft", "plain", "hard"), "soft");
+        assert_eq!(toned("neutral", "soft", "plain", "hard"), "plain");
+        assert_eq!(toned("blunt", "soft", "plain", "hard"), "hard");
+        assert_eq!(toned("nonsense", "soft", "plain", "hard"), "plain");
+    }
+
+    #[test]
+    fn an_intervention_is_only_judged_once_there_is_enough_evidence() {
+        // Nothing tried yet, or barely tried: never judged, so one bad
+        // afternoon cannot rewrite how the app behaves.
+        assert!(!intervention_is_failing(0, 0));
+        assert!(!intervention_is_failing(MIN_INTERVENTIONS_TO_JUDGE - 1, 0));
+        // Tried enough and almost never working.
+        assert!(intervention_is_failing(MIN_INTERVENTIONS_TO_JUDGE, 0));
+        assert!(intervention_is_failing(100, 2));
+        // Tried enough and working: left alone.
+        assert!(!intervention_is_failing(100, 50));
+        // Exactly at the threshold counts as working.
+        assert!(!intervention_is_failing(100, 20));
+        assert!(intervention_is_failing(100, 19));
+    }
+
+    #[test]
+    fn a_failing_warning_escalates_to_switching_but_no_further() {
+        let mut stats = BTreeMap::new();
+        // The real numbers from this machine: warned constantly, almost never
+        // worked.
+        stats.insert("alert".to_string(), (1566u32, 30u32));
+
+        // Escalates to switching once there is somewhere to switch to.
+        assert_eq!(adapted_alert_action("alert", &stats, "Pages", true), "switch");
+        // With no app to switch to there is nothing to escalate to.
+        assert_eq!(adapted_alert_action("alert", &stats, "", true), "alert");
+        // Turned off, it stays exactly as configured.
+        assert_eq!(adapted_alert_action("alert", &stats, "Pages", false), "alert");
+        // Switching never escalates further on its own — closing apps stays a
+        // deliberate choice.
+        assert_eq!(adapted_alert_action("switch", &stats, "Pages", true), "switch");
+
+        // A warning that works is left alone.
+        let mut good = BTreeMap::new();
+        good.insert("alert".to_string(), (100u32, 60u32));
+        assert_eq!(adapted_alert_action("alert", &good, "Pages", true), "alert");
+    }
+
+    #[test]
+    fn intervention_outcomes_are_scored_from_what_happens_next() {
+        let mut state = AppState::default();
+        let base = now();
+
+        // Fires, then the person comes back inside the window: a win.
+        note_intervention_fired(&mut state, "alert", base);
+        assert!(resolve_pending_intervention(&mut state, false, base + 5).is_none());
+        let resolved = resolve_pending_intervention(&mut state, true, base + 30);
+        assert_eq!(resolved, Some(("alert".to_string(), true)));
+        assert_eq!(state.intervention_stats.get("alert"), Some(&(1, 1)));
+
+        // Fires, and the window runs out with them still off task: a miss.
+        note_intervention_fired(&mut state, "alert", base + 100);
+        let resolved = resolve_pending_intervention(
+            &mut state,
+            false,
+            base + 100 + RECOVERY_WINDOW_SECONDS,
+        );
+        assert_eq!(resolved, Some(("alert".to_string(), false)));
+        assert_eq!(state.intervention_stats.get("alert"), Some(&(2, 1)));
+
+        // A new one firing while another is pending counts the old one as a
+        // miss, rather than leaving it unresolved forever.
+        note_intervention_fired(&mut state, "alert", base + 300);
+        note_intervention_fired(&mut state, "switch", base + 310);
+        assert_eq!(state.intervention_stats.get("alert"), Some(&(3, 1)));
+    }
+
+    #[test]
+    fn intervention_stats_survive_a_restart() {
+        let dir = temp_test_dir("intervention-stats");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let mut stats = BTreeMap::new();
+        stats.insert("alert".to_string(), (1566u32, 30u32));
+        stats.insert("switch".to_string(), (317u32, 3u32));
+        save_intervention_stats(&dir, &stats).expect("save");
+
+        let loaded = load_intervention_stats(&dir);
+        assert_eq!(loaded.get("alert"), Some(&(1566, 30)));
+        assert_eq!(loaded.get("switch"), Some(&(317, 3)));
+        // Nothing invented for rungs that have never fired.
+        assert_eq!(loaded.get("high_focus"), None);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn jump_guard_fires_only_on_a_spiral_and_not_repeatedly() {
         // Below the threshold: no nudge, however long it has been.
